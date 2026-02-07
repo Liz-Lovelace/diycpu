@@ -682,7 +682,7 @@ impl App {
             return;
         }
 
-        let zoom_factor = if scroll_delta > 0.0 { 1.1 } else { 1.0 / 1.1 };
+        let zoom_factor = if scroll_delta > 0.0 { 1.02 } else { 1.0 / 1.02 };
         let new_zoom = (self.zoom * zoom_factor).clamp(MIN_ZOOM, MAX_ZOOM);
 
         // Zoom towards the pointer position so the point under the cursor stays fixed
@@ -1020,7 +1020,7 @@ impl App {
         pointer_position: egui::Pos2,
         canvas_origin: egui::Pos2,
     ) -> bool {
-        let hit_radius = WAYPOINT_HANDLE_SIZE * self.zoom * 1.5;
+        let hit_radius = WAYPOINT_HANDLE_SIZE * self.zoom * 3.0;
         let components = self.active_components().clone();
 
         for (comp_idx, component) in components.iter().enumerate() {
@@ -1145,7 +1145,7 @@ impl App {
         _component_rects: &[egui::Rect],
         canvas_origin: egui::Pos2,
     ) {
-        let hit_radius = WAYPOINT_HANDLE_SIZE * self.zoom * 2.0;
+        let hit_radius = WAYPOINT_HANDLE_SIZE * self.zoom * 3.0;
         let components = self.active_components().clone();
 
         for (comp_idx, component) in components.iter().enumerate() {

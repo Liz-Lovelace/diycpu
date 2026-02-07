@@ -30,6 +30,7 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         handle_keyboard_shortcuts(self, ctx);
         draw_top_menu_bar(self, ctx);
+        draw_breadcrumb_bar(self, ctx);
         self.draw_simulation_playback_bar(ctx);
         handle_escape_cancel_wire(self, ctx);
         draw_right_side_panel(self, ctx);
@@ -179,14 +180,54 @@ fn draw_top_menu_bar(app: &mut App, ctx: &egui::Context) {
     });
 }
 
+// ── Breadcrumb navigation bar ───────────────────────────────────────────
+
+fn draw_breadcrumb_bar(app: &mut App, ctx: &egui::Context) {
+    if app.editing_abstraction_index.is_none() {
+        return;
+    }
+
+    egui::TopBottomPanel::top("breadcrumb").show(ctx, |ui| {
+        ui.horizontal(|ui| {
+            if ui.link("Main Circuit").clicked() {
+                app.editing_abstraction_index = None;
+                app.selected_component = None;
+                app.status_message = "Back to main circuit".into();
+            }
+            ui.label(">");
+            if let Some(abs_idx) = app.editing_abstraction_index {
+                if abs_idx < app.circuit.abstractions.len() {
+                    ui.strong(&app.circuit.abstractions[abs_idx].name);
+                }
+            }
+            ui.label("  (Esc or Backspace to go back)");
+        });
+    });
+}
+
 // ── Escape key handling ─────────────────────────────────────────────────────
 
 fn handle_escape_cancel_wire(app: &mut App, ctx: &egui::Context) {
     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         if app.wire_state.source_component_index.is_some() {
             app.wire_state.source_component_index = None;
+            app.wire_state.source_output_name = None;
             app.status_message = "Wire cancelled".into();
+        } else if app.editing_abstraction_index.is_some() {
+            app.editing_abstraction_index = None;
+            app.selected_component = None;
+            app.status_message = "Back to main circuit".into();
         }
+    }
+
+    // Backspace also goes back to main circuit when no text field is focused
+    if ctx.input(|i| i.key_pressed(egui::Key::Backspace))
+        && ctx.memory(|m| m.focused().is_none())
+        && app.editing_abstraction_index.is_some()
+    {
+        app.editing_abstraction_index = None;
+        app.selected_component = None;
+        app.status_message = "Back to main circuit".into();
     }
 }
 

@@ -36,6 +36,10 @@ pub struct ComponentDef {
     /// Visual position for GUI editor (not used by simulation).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pos: Option<[f32; 2]>,
+    /// Wire routing waypoints per input port (GUI only).
+    /// Maps input_key -> list of [x, y] world-coordinate waypoints.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wire_waypoints: Option<HashMap<String, Vec<[f32; 2]>>>,
 }
 
 impl ComponentDef {

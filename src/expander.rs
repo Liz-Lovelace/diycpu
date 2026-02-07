@@ -380,6 +380,7 @@ fn expand_instance(
                     Some(resolved_inputs)
                 },
                 pos: None,
+                wire_waypoints: None,
             });
         }
     }

@@ -1,9 +1,9 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 
 /// Top-level circuit definition, deserialized from YAML.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CircuitDef {
     pub name: String,
     pub steps: usize,
@@ -13,7 +13,7 @@ pub struct CircuitDef {
 }
 
 /// An abstraction (reusable subcircuit template).
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AbstractionDef {
     pub name: String,
     pub inputs: Vec<String>,
@@ -24,7 +24,7 @@ pub struct AbstractionDef {
 
 /// A single component. For primitives (clk, nand, dff), the compiler validates
 /// the inputs. For abstraction instances, the expander resolves them.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ComponentDef {
     #[serde(rename = "type")]
     pub component_type: String,
@@ -33,6 +33,9 @@ pub struct ComponentDef {
     pub init: Option<bool>,
     #[serde(default)]
     pub inputs: Option<HashMap<String, String>>,
+    /// Visual position for GUI editor (not used by simulation).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pos: Option<[f32; 2]>,
 }
 
 impl ComponentDef {

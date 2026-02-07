@@ -354,6 +354,7 @@ fn expand_instance(
                 } else {
                     Some(resolved_inputs)
                 },
+                pos: None,
             });
         }
     }

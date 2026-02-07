@@ -3,6 +3,19 @@ name = "diycpu"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+gui = ["dep:eframe"]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
+eframe = { version = "0.33", optional = true, default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
+
+[[bin]]
+name = "diycpu"
+path = "src/main.rs"
+
+[[bin]]
+name = "diycpu-gui"
+path = "src/bin/gui.rs"
+required-features = ["gui"]

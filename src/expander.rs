@@ -85,62 +85,72 @@ pub struct ExpandedCircuit {
 }
 
 /// Expand all abstraction instances into flat primitives.
-pub fn expand(def: &CircuitDef) -> Result<ExpandedCircuit, ExpandError> {
-    if def.abstractions.is_empty() {
+pub fn expand(circuit_def: &CircuitDef) -> Result<ExpandedCircuit, ExpandError> {
+    if circuit_def.abstractions.is_empty() {
         // Still validate that all component types are primitives.
-        for comp in &def.components {
-            if !is_primitive(&comp.component_type) {
+        for component in &circuit_def.components {
+            if !is_primitive(&component.component_type) {
                 return Err(ExpandError::UnknownType {
-                    component: comp.name.clone(),
-                    type_name: comp.component_type.clone(),
+                    component: component.name.clone(),
+                    type_name: component.component_type.clone(),
                 });
             }
         }
         return Ok(ExpandedCircuit {
-            def: def.clone(),
+            def: circuit_def.clone(),
             aliases: HashMap::new(),
         });
     }
 
-    let abs_map: HashMap<&str, &AbstractionDef> = def
+    let abstraction_map: HashMap<&str, &AbstractionDef> = circuit_def
         .abstractions
         .iter()
-        .map(|a| (a.name.as_str(), a))
+        .map(|abstraction| (abstraction.name.as_str(), abstraction))
         .collect();
 
-    validate_abstractions(&def.abstractions, &abs_map)?;
+    validate_abstractions(&circuit_def.abstractions, &abstraction_map)?;
 
-    let mut flat = Vec::new();
+    let mut flat_components = Vec::new();
     let mut aliases: HashMap<String, String> = HashMap::new();
 
-    for comp in &def.components {
-        if is_primitive(&comp.component_type) {
-            flat.push(comp.clone());
-        } else if let Some(abs) = abs_map.get(comp.component_type.as_str()) {
-            let input_bindings = comp.inputs.as_ref().cloned().unwrap_or_default();
+    for component in &circuit_def.components {
+        if is_primitive(&component.component_type) {
+            flat_components.push(component.clone());
+        } else if let Some(abstraction) =
+            abstraction_map.get(component.component_type.as_str())
+        {
+            let input_bindings = component.inputs.as_ref().cloned().unwrap_or_default();
 
-            validate_instance_inputs(&comp.name, abs, &input_bindings)?;
+            validate_instance_inputs(&component.name, abstraction, &input_bindings)?;
 
-            let output_map =
-                expand_instance(&comp.name, abs, &input_bindings, &abs_map, &mut flat)?;
+            let output_mapping = expand_instance(
+                &component.name,
+                abstraction,
+                &input_bindings,
+                &abstraction_map,
+                &mut flat_components,
+            )?;
 
-            for (out_name, out_flat) in output_map {
-                aliases.insert(format!("{}.{}", comp.name, out_name), out_flat);
+            for (output_name, flat_target_name) in output_mapping {
+                aliases.insert(
+                    format!("{}.{}", component.name, output_name),
+                    flat_target_name,
+                );
             }
         } else {
             return Err(ExpandError::UnknownType {
-                component: comp.name.clone(),
-                type_name: comp.component_type.clone(),
+                component: component.name.clone(),
+                type_name: component.component_type.clone(),
             });
         }
     }
 
     // Resolve dot-notation references in all flat components.
-    for comp in &mut flat {
-        if let Some(inputs) = &mut comp.inputs {
-            for val in inputs.values_mut() {
-                if let Some(resolved) = aliases.get(val.as_str()) {
-                    *val = resolved.clone();
+    for component in &mut flat_components {
+        if let Some(inputs) = &mut component.inputs {
+            for input_value in inputs.values_mut() {
+                if let Some(resolved) = aliases.get(input_value.as_str()) {
+                    *input_value = resolved.clone();
                 }
             }
         }
@@ -148,10 +158,10 @@ pub fn expand(def: &CircuitDef) -> Result<ExpandedCircuit, ExpandError> {
 
     Ok(ExpandedCircuit {
         def: CircuitDef {
-            name: def.name.clone(),
-            steps: def.steps,
+            name: circuit_def.name.clone(),
+            steps: circuit_def.steps,
             abstractions: vec![],
-            components: flat,
+            components: flat_components,
         },
         aliases,
     })
@@ -159,121 +169,128 @@ pub fn expand(def: &CircuitDef) -> Result<ExpandedCircuit, ExpandError> {
 
 fn validate_abstractions(
     abstractions: &[AbstractionDef],
-    abs_map: &HashMap<&str, &AbstractionDef>,
+    abstraction_map: &HashMap<&str, &AbstractionDef>,
 ) -> Result<(), ExpandError> {
     // Check for duplicate names.
-    let mut seen = HashSet::new();
-    for abs in abstractions {
-        if !seen.insert(&abs.name) {
-            return Err(ExpandError::DuplicateAbstraction(abs.name.clone()));
+    let mut seen_names = HashSet::new();
+    for abstraction in abstractions {
+        if !seen_names.insert(&abstraction.name) {
+            return Err(ExpandError::DuplicateAbstraction(abstraction.name.clone()));
         }
     }
 
     // Check for CLK inside abstractions.
-    for abs in abstractions {
-        check_no_clk(abs, abs_map)?;
+    for abstraction in abstractions {
+        check_no_clk_in_abstraction(abstraction)?;
     }
 
     // Check for self-references and circular dependencies.
-    check_abstraction_cycles(abstractions, abs_map)?;
+    check_abstraction_cycles(abstractions, abstraction_map)?;
 
     Ok(())
 }
 
-/// Recursively check that no CLK component exists inside an abstraction
-/// (including inside nested abstraction components).
-fn check_no_clk(
-    abs: &AbstractionDef,
-    _abs_map: &HashMap<&str, &AbstractionDef>,
-) -> Result<(), ExpandError> {
-    for comp in &abs.components {
-        if comp.component_type == "clk" {
-            return Err(ExpandError::ClkInAbstraction(abs.name.clone()));
+/// Check that no CLK component exists directly inside an abstraction.
+fn check_no_clk_in_abstraction(abstraction: &AbstractionDef) -> Result<(), ExpandError> {
+    for component in &abstraction.components {
+        if component.component_type == "clk" {
+            return Err(ExpandError::ClkInAbstraction(abstraction.name.clone()));
         }
     }
     Ok(())
 }
 
+/// Verify that the abstraction dependency graph is acyclic using Kahn's algorithm.
 fn check_abstraction_cycles(
     abstractions: &[AbstractionDef],
-    abs_map: &HashMap<&str, &AbstractionDef>,
+    abstraction_map: &HashMap<&str, &AbstractionDef>,
 ) -> Result<(), ExpandError> {
-    let abs_names: HashSet<&str> = abs_map.keys().copied().collect();
+    let abstraction_names: HashSet<&str> = abstraction_map.keys().copied().collect();
 
     // Build dependency graph: abstraction -> set of abstractions it uses.
-    let mut in_degree: HashMap<&str, usize> = HashMap::new();
-    let mut dependents: HashMap<&str, Vec<&str>> = HashMap::new();
+    let mut incoming_dependency_count: HashMap<&str, usize> = HashMap::new();
+    let mut downstream_dependents: HashMap<&str, Vec<&str>> = HashMap::new();
 
-    for abs in abstractions {
-        in_degree.entry(abs.name.as_str()).or_insert(0);
-        dependents.entry(abs.name.as_str()).or_default();
+    for abstraction in abstractions {
+        incoming_dependency_count
+            .entry(abstraction.name.as_str())
+            .or_insert(0);
+        downstream_dependents
+            .entry(abstraction.name.as_str())
+            .or_default();
 
-        for comp in &abs.components {
-            if abs_names.contains(comp.component_type.as_str()) {
-                if comp.component_type == abs.name {
-                    return Err(ExpandError::SelfReferencingAbstraction(abs.name.clone()));
+        for component in &abstraction.components {
+            if abstraction_names.contains(component.component_type.as_str()) {
+                if component.component_type == abstraction.name {
+                    return Err(ExpandError::SelfReferencingAbstraction(
+                        abstraction.name.clone(),
+                    ));
                 }
-                *in_degree.entry(abs.name.as_str()).or_insert(0) += 1;
-                dependents
-                    .entry(comp.component_type.as_str())
+                *incoming_dependency_count
+                    .entry(abstraction.name.as_str())
+                    .or_insert(0) += 1;
+                downstream_dependents
+                    .entry(component.component_type.as_str())
                     .or_default()
-                    .push(abs.name.as_str());
+                    .push(abstraction.name.as_str());
             }
         }
     }
 
-    // Kahn's algorithm.
-    let mut queue: VecDeque<&str> = in_degree
+    // Kahn's algorithm to detect cycles.
+    let mut ready_queue: VecDeque<&str> = incoming_dependency_count
         .iter()
-        .filter(|(_, &deg)| deg == 0)
+        .filter(|(_, &count)| count == 0)
         .map(|(&name, _)| name)
         .collect();
 
-    let mut sorted = 0;
-    while let Some(name) = queue.pop_front() {
-        sorted += 1;
-        if let Some(deps) = dependents.get(name) {
-            for &dep in deps {
-                let deg = in_degree.get_mut(dep).unwrap();
-                *deg -= 1;
-                if *deg == 0 {
-                    queue.push_back(dep);
+    let mut sorted_count = 0;
+    while let Some(current_name) = ready_queue.pop_front() {
+        sorted_count += 1;
+        if let Some(dependents) = downstream_dependents.get(current_name) {
+            for &dependent_name in dependents {
+                let count = incoming_dependency_count.get_mut(dependent_name).unwrap();
+                *count -= 1;
+                if *count == 0 {
+                    ready_queue.push_back(dependent_name);
                 }
             }
         }
     }
 
-    if sorted != abstractions.len() {
+    if sorted_count != abstractions.len() {
         return Err(ExpandError::CircularAbstractions);
     }
 
     Ok(())
 }
 
+/// Validate that an instance provides exactly the inputs declared by its abstraction.
 fn validate_instance_inputs(
     instance_name: &str,
-    abs: &AbstractionDef,
+    abstraction: &AbstractionDef,
     input_bindings: &HashMap<String, String>,
 ) -> Result<(), ExpandError> {
     // Check all declared inputs are provided.
-    for input in &abs.inputs {
-        if !input_bindings.contains_key(input) {
+    for declared_input in &abstraction.inputs {
+        if !input_bindings.contains_key(declared_input) {
             return Err(ExpandError::MissingAbstractionInput {
                 instance: instance_name.to_string(),
-                abstraction: abs.name.clone(),
-                input: input.clone(),
+                abstraction: abstraction.name.clone(),
+                input: declared_input.clone(),
             });
         }
     }
 
-    // Check no extra inputs.
-    let declared: HashSet<&str> = abs.inputs.iter().map(|s| s.as_str()).collect();
-    for key in input_bindings.keys() {
-        if !declared.contains(key.as_str()) {
+    // Check no extra inputs are provided.
+    let declared_input_names: HashSet<&str> =
+        abstraction.inputs.iter().map(|s| s.as_str()).collect();
+    for provided_key in input_bindings.keys() {
+        if !declared_input_names.contains(provided_key.as_str()) {
             return Err(ExpandError::ExtraAbstractionInput {
                 instance: instance_name.to_string(),
-                abstraction: abs.name.clone(),
-                input: key.clone(),
+                abstraction: abstraction.name.clone(),
+                input: provided_key.clone(),
             });
         }
     }
@@ -281,74 +298,82 @@ fn validate_instance_inputs(
     Ok(())
 }
 
-/// Expand one abstraction instance. Returns output_name -> flat_component_name mapping.
+/// Expand one abstraction instance into flat primitives.
+/// Returns a mapping of output_name -> flat_component_name for the instance's outputs.
 fn expand_instance(
-    prefix: &str,
-    abs: &AbstractionDef,
+    name_prefix: &str,
+    abstraction: &AbstractionDef,
     input_bindings: &HashMap<String, String>,
-    abs_map: &HashMap<&str, &AbstractionDef>,
-    flat: &mut Vec<ComponentDef>,
+    abstraction_map: &HashMap<&str, &AbstractionDef>,
+    flat_components: &mut Vec<ComponentDef>,
 ) -> Result<HashMap<String, String>, ExpandError> {
     // Phase 1: Register all internal component flat names.
-    let mut internal_map: HashMap<String, String> = HashMap::new();
-    for comp in &abs.components {
-        internal_map.insert(comp.name.clone(), format!("{prefix}/{}", comp.name));
+    let mut internal_name_map: HashMap<String, String> = HashMap::new();
+    for component in &abstraction.components {
+        internal_name_map.insert(
+            component.name.clone(),
+            format!("{name_prefix}/{}", component.name),
+        );
     }
 
     // Phase 2: Expand sub-abstraction instances (in definition order)
     // to learn their output aliases.
-    for comp in &abs.components {
-        if !is_primitive(&comp.component_type) {
-            let sub_abs = abs_map.get(comp.component_type.as_str()).ok_or_else(|| {
-                ExpandError::UnknownType {
-                    component: format!("{prefix}/{}", comp.name),
-                    type_name: comp.component_type.clone(),
-                }
-            })?;
+    for component in &abstraction.components {
+        if !is_primitive(&component.component_type) {
+            let sub_abstraction =
+                abstraction_map
+                    .get(component.component_type.as_str())
+                    .ok_or_else(|| ExpandError::UnknownType {
+                        component: format!("{name_prefix}/{}", component.name),
+                        type_name: component.component_type.clone(),
+                    })?;
 
             let sub_input_bindings = resolve_input_map(
-                &format!("{prefix}/{}", comp.name),
-                comp.inputs.as_ref(),
+                &format!("{name_prefix}/{}", component.name),
+                component.inputs.as_ref(),
                 input_bindings,
-                &internal_map,
+                &internal_name_map,
             )?;
 
             validate_instance_inputs(
-                &format!("{prefix}/{}", comp.name),
-                sub_abs,
+                &format!("{name_prefix}/{}", component.name),
+                sub_abstraction,
                 &sub_input_bindings,
             )?;
 
-            let sub_outputs = expand_instance(
-                &format!("{prefix}/{}", comp.name),
-                sub_abs,
+            let sub_output_mapping = expand_instance(
+                &format!("{name_prefix}/{}", component.name),
+                sub_abstraction,
                 &sub_input_bindings,
-                abs_map,
-                flat,
+                abstraction_map,
+                flat_components,
             )?;
 
             // Register sub-output aliases: "comp_name.out_name" -> flat name.
-            for (out_name, out_flat) in sub_outputs {
-                internal_map.insert(format!("{}.{}", comp.name, out_name), out_flat);
+            for (output_name, flat_target_name) in sub_output_mapping {
+                internal_name_map.insert(
+                    format!("{}.{}", component.name, output_name),
+                    flat_target_name,
+                );
             }
         }
     }
 
     // Phase 3: Add primitive components with resolved inputs.
-    for comp in &abs.components {
-        if is_primitive(&comp.component_type) {
-            let flat_name = format!("{prefix}/{}", comp.name);
+    for component in &abstraction.components {
+        if is_primitive(&component.component_type) {
+            let flat_name = format!("{name_prefix}/{}", component.name);
             let resolved_inputs = resolve_input_map(
                 &flat_name,
-                comp.inputs.as_ref(),
+                component.inputs.as_ref(),
                 input_bindings,
-                &internal_map,
+                &internal_name_map,
             )?;
 
-            flat.push(ComponentDef {
-                component_type: comp.component_type.clone(),
+            flat_components.push(ComponentDef {
+                component_type: component.component_type.clone(),
                 name: flat_name,
-                init: comp.init,
+                init: component.init,
                 inputs: if resolved_inputs.is_empty() {
                     None
                 } else {
@@ -359,51 +384,55 @@ fn expand_instance(
         }
     }
 
-    // Phase 4: Resolve output mapping.
-    let mut output_map = HashMap::new();
-    for (out_name, internal_ref) in &abs.outputs {
-        let resolved = resolve_ref(
-            &format!("{prefix} output \"{out_name}\""),
-            internal_ref,
+    // Phase 4: Resolve the abstraction's output mapping.
+    let mut output_mapping = HashMap::new();
+    for (output_name, internal_reference) in &abstraction.outputs {
+        let resolved = resolve_reference(
+            &format!("{name_prefix} output \"{output_name}\""),
+            internal_reference,
             input_bindings,
-            &internal_map,
+            &internal_name_map,
         )?;
-        output_map.insert(out_name.clone(), resolved);
+        output_mapping.insert(output_name.clone(), resolved);
     }
 
-    Ok(output_map)
+    Ok(output_mapping)
 }
 
+/// Resolve all inputs of a component, mapping each reference to its flat name.
 fn resolve_input_map(
     context: &str,
     inputs: Option<&HashMap<String, String>>,
     input_bindings: &HashMap<String, String>,
-    internal_map: &HashMap<String, String>,
+    internal_name_map: &HashMap<String, String>,
 ) -> Result<HashMap<String, String>, ExpandError> {
     let Some(inputs) = inputs else {
         return Ok(HashMap::new());
     };
     inputs
         .iter()
-        .map(|(k, v)| {
-            let resolved = resolve_ref(context, v, input_bindings, internal_map)?;
-            Ok((k.clone(), resolved))
+        .map(|(input_key, input_reference)| {
+            let resolved =
+                resolve_reference(context, input_reference, input_bindings, internal_name_map)?;
+            Ok((input_key.clone(), resolved))
         })
         .collect()
 }
 
-fn resolve_ref(
+/// Resolve a single reference: first check abstraction input parameters,
+/// then check internal component names and sub-output aliases.
+fn resolve_reference(
     context: &str,
     reference: &str,
     input_bindings: &HashMap<String, String>,
-    internal_map: &HashMap<String, String>,
+    internal_name_map: &HashMap<String, String>,
 ) -> Result<String, ExpandError> {
     // First: is it an abstraction input parameter?
     if let Some(resolved) = input_bindings.get(reference) {
         return Ok(resolved.clone());
     }
     // Second: is it an internal component or sub-output alias?
-    if let Some(resolved) = internal_map.get(reference) {
+    if let Some(resolved) = internal_name_map.get(reference) {
         return Ok(resolved.clone());
     }
     Err(ExpandError::UnknownReference {
@@ -585,7 +614,7 @@ components:
 
     #[test]
     fn expand_simple_not() {
-        let ec = expand_ok(
+        let expanded = expand_ok(
             r#"
 name: test
 steps: 1
@@ -606,19 +635,19 @@ components:
     inputs: { x: a }
 "#,
         );
-        assert_eq!(ec.def.components.len(), 2); // dff + expanded nand
-        let nand = &ec.def.components[1];
+        assert_eq!(expanded.def.components.len(), 2); // dff + expanded nand
+        let nand = &expanded.def.components[1];
         assert_eq!(nand.name, "inv/gate");
         assert_eq!(nand.component_type, "nand");
         let inputs = nand.inputs.as_ref().unwrap();
         assert_eq!(inputs["a"], "a");
         assert_eq!(inputs["b"], "a");
-        assert_eq!(ec.aliases["inv.out"], "inv/gate");
+        assert_eq!(expanded.aliases["inv.out"], "inv/gate");
     }
 
     #[test]
     fn expand_nested_and() {
-        let ec = expand_ok(
+        let expanded = expand_ok(
             r#"
 name: test
 steps: 1
@@ -653,19 +682,24 @@ components:
 "#,
         );
         // Should have: dff x, dff y, nand my_and/nand_ab, nand my_and/inv/gate
-        assert_eq!(ec.def.components.len(), 4);
+        assert_eq!(expanded.def.components.len(), 4);
 
-        let names: Vec<&str> = ec.def.components.iter().map(|c| c.name.as_str()).collect();
+        let names: Vec<&str> = expanded
+            .def
+            .components
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect();
         assert!(names.contains(&"my_and/nand_ab"));
         assert!(names.contains(&"my_and/inv/gate"));
 
         // Check alias resolution
-        assert_eq!(ec.aliases["my_and.out"], "my_and/inv/gate");
+        assert_eq!(expanded.aliases["my_and.out"], "my_and/inv/gate");
     }
 
     #[test]
     fn expand_preserves_init() {
-        let ec = expand_ok(
+        let expanded = expand_ok(
             r#"
 name: test
 steps: 1
@@ -689,18 +723,18 @@ components:
     inputs: { d: data, clk: clock }
 "#,
         );
-        let ff = ec
+        let flip_flop = expanded
             .def
             .components
             .iter()
             .find(|c| c.name == "my_reg/ff")
             .unwrap();
-        assert_eq!(ff.init, Some(true));
+        assert_eq!(flip_flop.init, Some(true));
     }
 
     #[test]
     fn no_abstractions_passthrough() {
-        let ec = expand_ok(
+        let expanded = expand_ok(
             r#"
 name: test
 steps: 1
@@ -713,13 +747,13 @@ components:
     inputs: { a: a, b: a }
 "#,
         );
-        assert_eq!(ec.def.components.len(), 2);
-        assert!(ec.aliases.is_empty());
+        assert_eq!(expanded.def.components.len(), 2);
+        assert!(expanded.aliases.is_empty());
     }
 
     #[test]
     fn expand_with_dot_reference_in_top_level() {
-        let ec = expand_ok(
+        let expanded = expand_ok(
             r#"
 name: test
 steps: 1
@@ -744,7 +778,7 @@ components:
 "#,
         );
         // The "inv.out" reference in result should be resolved to "inv/gate"
-        let result = ec
+        let result = expanded
             .def
             .components
             .iter()
@@ -757,7 +791,7 @@ components:
 
     #[test]
     fn expand_three_levels_deep() {
-        let ec = expand_ok(
+        let expanded = expand_ok(
             r#"
 name: test
 steps: 0
@@ -807,13 +841,13 @@ components:
         // or contains: not na, not nb, nand nand_notab
         // Each not expands to one nand
         // So total: dff x, dff y, nand my_or/na/gate, nand my_or/nb/gate, nand my_or/nand_notab
-        assert_eq!(ec.def.components.len(), 5);
-        assert_eq!(ec.aliases["my_or.out"], "my_or/nand_notab");
+        assert_eq!(expanded.def.components.len(), 5);
+        assert_eq!(expanded.aliases["my_or.out"], "my_or/nand_notab");
     }
 
     #[test]
     fn abstraction_with_no_inputs() {
-        let ec = expand_ok(
+        let expanded = expand_ok(
             r#"
 name: test
 steps: 0
@@ -830,8 +864,8 @@ components:
     name: one
 "#,
         );
-        assert_eq!(ec.def.components.len(), 1);
-        assert_eq!(ec.def.components[0].name, "one/val");
-        assert_eq!(ec.aliases["one.out"], "one/val");
+        assert_eq!(expanded.def.components.len(), 1);
+        assert_eq!(expanded.def.components[0].name, "one/val");
+        assert_eq!(expanded.aliases["one.out"], "one/val");
     }
 }

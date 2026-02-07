@@ -74,204 +74,229 @@ pub enum CompiledComponent {
 pub struct CompiledCircuit {
     pub name: String,
     pub steps: usize,
-    pub names: Vec<String>,
+    pub component_names: Vec<String>,
     pub components: Vec<CompiledComponent>,
-    pub eval_order: Vec<usize>,
-    pub clk_idx: Option<usize>,
+    pub evaluation_order: Vec<usize>,
+    pub clock_index: Option<usize>,
     pub dff_indices: Vec<usize>,
 }
 
-pub fn compile(def: &CircuitDef) -> Result<CompiledCircuit, CompileError> {
-    let mut name_to_idx: HashMap<&str, usize> = HashMap::new();
-    let mut names = Vec::new();
-    let mut clk_count = 0;
-    let mut clk_idx = None;
+pub fn compile(circuit_def: &CircuitDef) -> Result<CompiledCircuit, CompileError> {
+    let mut name_to_index: HashMap<&str, usize> = HashMap::new();
+    let mut component_names = Vec::new();
+    let mut clock_count = 0;
+    let mut clock_index = None;
     let mut dff_indices = Vec::new();
 
-    // First pass: register all names.
-    for (i, comp) in def.components.iter().enumerate() {
-        let name = comp.name();
-        if name_to_idx.contains_key(name) {
-            return Err(CompileError::DuplicateName(name.to_string()));
+    // First pass: register all component names and validate uniqueness.
+    for (component_index, component) in circuit_def.components.iter().enumerate() {
+        let component_name = component.name();
+        if name_to_index.contains_key(component_name) {
+            return Err(CompileError::DuplicateName(component_name.to_string()));
         }
-        if comp.component_type == "clk" {
-            clk_count += 1;
-            if clk_count > 1 {
+        if component.component_type == "clk" {
+            clock_count += 1;
+            if clock_count > 1 {
                 return Err(CompileError::MultipleClocks);
             }
-            clk_idx = Some(i);
+            clock_index = Some(component_index);
         }
-        if comp.component_type == "dff" {
-            dff_indices.push(i);
+        if component.component_type == "dff" {
+            dff_indices.push(component_index);
         }
-        name_to_idx.insert(name, i);
-        names.push(name.to_string());
+        name_to_index.insert(component_name, component_index);
+        component_names.push(component_name.to_string());
     }
 
-    // Second pass: build compiled components.
-    let mut components = Vec::new();
-    for comp in &def.components {
-        let compiled = build_component(comp, &name_to_idx)?;
-        components.push(compiled);
+    // Second pass: build compiled components with resolved input indices.
+    let mut compiled_components = Vec::new();
+    for component in &circuit_def.components {
+        let compiled = build_compiled_component(component, &name_to_index)?;
+        compiled_components.push(compiled);
     }
 
-    let eval_order = topological_sort(&components, clk_idx, &dff_indices)?;
+    let evaluation_order =
+        topological_sort(&compiled_components, clock_index, &dff_indices)?;
 
     Ok(CompiledCircuit {
-        name: def.name.clone(),
-        steps: def.steps,
-        names,
-        components,
-        eval_order,
-        clk_idx,
+        name: circuit_def.name.clone(),
+        steps: circuit_def.steps,
+        component_names,
+        components: compiled_components,
+        evaluation_order,
+        clock_index,
         dff_indices,
     })
 }
 
-fn build_component(
-    comp: &ComponentDef,
-    name_to_idx: &HashMap<&str, usize>,
+fn build_compiled_component(
+    component: &ComponentDef,
+    name_to_index: &HashMap<&str, usize>,
 ) -> Result<CompiledComponent, CompileError> {
-    match comp.component_type.as_str() {
+    match component.component_type.as_str() {
         "clk" => Ok(CompiledComponent::Clk),
         "nand" => {
-            let inputs = comp.inputs.as_ref().ok_or_else(|| CompileError::MissingInput {
-                component: comp.name.clone(),
-                input: "a, b".to_string(),
-            })?;
-            let a_name = inputs
-                .get("a")
+            let inputs = component
+                .inputs
+                .as_ref()
                 .ok_or_else(|| CompileError::MissingInput {
-                    component: comp.name.clone(),
-                    input: "a".to_string(),
+                    component: component.name.clone(),
+                    input: "a, b".to_string(),
                 })?;
-            let b_name = inputs
-                .get("b")
-                .ok_or_else(|| CompileError::MissingInput {
-                    component: comp.name.clone(),
-                    input: "b".to_string(),
-                })?;
-            let a = resolve_input(&comp.name, a_name, name_to_idx)?;
-            let b = resolve_input(&comp.name, b_name, name_to_idx)?;
-            let self_idx = name_to_idx[comp.name.as_str()];
-            if a == self_idx || b == self_idx {
+
+            let input_a_name =
+                inputs
+                    .get("a")
+                    .ok_or_else(|| CompileError::MissingInput {
+                        component: component.name.clone(),
+                        input: "a".to_string(),
+                    })?;
+            let input_b_name =
+                inputs
+                    .get("b")
+                    .ok_or_else(|| CompileError::MissingInput {
+                        component: component.name.clone(),
+                        input: "b".to_string(),
+                    })?;
+
+            let input_a_index =
+                resolve_input_reference(&component.name, input_a_name, name_to_index)?;
+            let input_b_index =
+                resolve_input_reference(&component.name, input_b_name, name_to_index)?;
+
+            let own_index = name_to_index[component.name.as_str()];
+            if input_a_index == own_index || input_b_index == own_index {
                 return Err(CompileError::SelfReference {
-                    component: comp.name.clone(),
+                    component: component.name.clone(),
                 });
             }
+
             Ok(CompiledComponent::Nand {
-                input_a: a,
-                input_b: b,
+                input_a: input_a_index,
+                input_b: input_b_index,
             })
         }
         "dff" => {
-            let (input_d, input_clk) = match &comp.inputs {
+            let (input_d, input_clk) = match &component.inputs {
                 Some(inputs) => {
-                    let d = inputs
+                    let data_input = inputs
                         .get("d")
-                        .map(|name| resolve_input(&comp.name, name, name_to_idx))
+                        .map(|name| {
+                            resolve_input_reference(&component.name, name, name_to_index)
+                        })
                         .transpose()?;
-                    let clk = inputs
+                    let clock_input = inputs
                         .get("clk")
-                        .map(|name| resolve_input(&comp.name, name, name_to_idx))
+                        .map(|name| {
+                            resolve_input_reference(&component.name, name, name_to_index)
+                        })
                         .transpose()?;
-                    (d, clk)
+                    (data_input, clock_input)
                 }
                 None => (None, None),
             };
             Ok(CompiledComponent::Dff {
-                init: comp.init.unwrap_or(false),
+                init: component.init.unwrap_or(false),
                 input_d,
                 input_clk,
             })
         }
-        other => Err(CompileError::UnknownType {
-            component: comp.name.clone(),
-            type_name: other.to_string(),
+        unknown_type => Err(CompileError::UnknownType {
+            component: component.name.clone(),
+            type_name: unknown_type.to_string(),
         }),
     }
 }
 
-fn resolve_input(
-    component: &str,
+/// Look up a component name and return its index. Returns an error if the name
+/// doesn't match any registered component.
+fn resolve_input_reference(
+    component_name: &str,
     input_name: &str,
-    name_to_idx: &HashMap<&str, usize>,
+    name_to_index: &HashMap<&str, usize>,
 ) -> Result<usize, CompileError> {
-    name_to_idx
+    name_to_index
         .get(input_name)
         .copied()
         .ok_or_else(|| CompileError::UnknownInput {
-            component: component.to_string(),
+            component: component_name.to_string(),
             input_name: input_name.to_string(),
         })
 }
 
+/// Compute the evaluation order using Kahn's topological sort algorithm.
+/// CLK and DFF components are evaluated first (they provide stable values).
+/// NAND gates are then sorted by their dependency graph.
 fn topological_sort(
     components: &[CompiledComponent],
-    clk_idx: Option<usize>,
+    clock_index: Option<usize>,
     dff_indices: &[usize],
 ) -> Result<Vec<usize>, CompileError> {
-    let n = components.len();
-    let mut in_degree = vec![0usize; n];
-    let mut dependents: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let component_count = components.len();
+    let mut incoming_edge_count = vec![0usize; component_count];
+    let mut downstream_dependents: Vec<Vec<usize>> = vec![Vec::new(); component_count];
 
-    for (i, comp) in components.iter().enumerate() {
-        if let CompiledComponent::Nand { input_a, input_b } = comp {
-            let a = *input_a;
-            let b = *input_b;
+    // Build the dependency graph among NAND gates only.
+    for (component_index, component) in components.iter().enumerate() {
+        if let CompiledComponent::Nand { input_a, input_b } = component {
+            let source_a = *input_a;
+            let source_b = *input_b;
 
-            if matches!(components[a], CompiledComponent::Nand { .. }) {
-                in_degree[i] += 1;
-                dependents[a].push(i);
+            if matches!(components[source_a], CompiledComponent::Nand { .. }) {
+                incoming_edge_count[component_index] += 1;
+                downstream_dependents[source_a].push(component_index);
             }
-            if matches!(components[b], CompiledComponent::Nand { .. }) && a != b {
-                in_degree[i] += 1;
-                dependents[b].push(i);
+            if matches!(components[source_b], CompiledComponent::Nand { .. }) && source_a != source_b
+            {
+                incoming_edge_count[component_index] += 1;
+                downstream_dependents[source_b].push(component_index);
             }
         }
     }
 
-    let mut eval_order = Vec::with_capacity(n);
+    let mut evaluation_order = Vec::with_capacity(component_count);
 
-    // Sources first: CLK, then DFFs.
-    if let Some(idx) = clk_idx {
-        eval_order.push(idx);
+    // Sources first: CLK, then DFFs (they don't depend on NAND gates).
+    if let Some(index) = clock_index {
+        evaluation_order.push(index);
     }
-    for &idx in dff_indices {
-        eval_order.push(idx);
+    for &index in dff_indices {
+        evaluation_order.push(index);
     }
 
-    // Kahn's algorithm for NAND gates.
-    let mut queue: VecDeque<usize> = VecDeque::new();
-    for (i, comp) in components.iter().enumerate() {
-        if matches!(comp, CompiledComponent::Nand { .. }) && in_degree[i] == 0 {
-            queue.push_back(i);
+    // Kahn's algorithm: start with NAND gates that have no NAND inputs.
+    let mut ready_queue: VecDeque<usize> = VecDeque::new();
+    for (component_index, component) in components.iter().enumerate() {
+        if matches!(component, CompiledComponent::Nand { .. })
+            && incoming_edge_count[component_index] == 0
+        {
+            ready_queue.push_back(component_index);
         }
     }
 
-    let nand_count = components
+    let total_nand_count = components
         .iter()
-        .filter(|c| matches!(c, CompiledComponent::Nand { .. }))
+        .filter(|component| matches!(component, CompiledComponent::Nand { .. }))
         .count();
-    let mut sorted_count = 0;
+    let mut sorted_nand_count = 0;
 
-    while let Some(idx) = queue.pop_front() {
-        eval_order.push(idx);
-        sorted_count += 1;
+    while let Some(current_index) = ready_queue.pop_front() {
+        evaluation_order.push(current_index);
+        sorted_nand_count += 1;
 
-        for &dep in &dependents[idx] {
-            in_degree[dep] -= 1;
-            if in_degree[dep] == 0 {
-                queue.push_back(dep);
+        for &dependent_index in &downstream_dependents[current_index] {
+            incoming_edge_count[dependent_index] -= 1;
+            if incoming_edge_count[dependent_index] == 0 {
+                ready_queue.push_back(dependent_index);
             }
         }
     }
 
-    if sorted_count != nand_count {
+    if sorted_nand_count != total_nand_count {
         return Err(CompileError::CyclicGraph);
     }
 
-    Ok(eval_order)
+    Ok(evaluation_order)
 }
 
 #[cfg(test)]
@@ -307,10 +332,10 @@ components:
         )
         .unwrap();
 
-        assert_eq!(circuit.names, vec!["clock", "reg", "gate"]);
-        assert_eq!(circuit.clk_idx, Some(0));
+        assert_eq!(circuit.component_names, vec!["clock", "reg", "gate"]);
+        assert_eq!(circuit.clock_index, Some(0));
         assert_eq!(circuit.dff_indices, vec![1]);
-        assert_eq!(circuit.eval_order, vec![0, 1, 2]);
+        assert_eq!(circuit.evaluation_order, vec![0, 1, 2]);
     }
 
     #[test]
@@ -426,7 +451,7 @@ components:
 "#,
         )
         .unwrap();
-        assert_eq!(circuit.names, vec!["clock", "reg"]);
+        assert_eq!(circuit.component_names, vec!["clock", "reg"]);
     }
 
     #[test]
@@ -453,10 +478,10 @@ components:
         .unwrap();
 
         let nand_order: Vec<&str> = circuit
-            .eval_order
+            .evaluation_order
             .iter()
             .filter(|&&i| matches!(circuit.components[i], CompiledComponent::Nand { .. }))
-            .map(|&i| circuit.names[i].as_str())
+            .map(|&i| circuit.component_names[i].as_str())
             .collect();
         assert_eq!(nand_order, vec!["nand1", "nand2", "nand3"]);
     }
@@ -477,7 +502,7 @@ components:
 "#,
         )
         .unwrap();
-        assert!(circuit.clk_idx.is_none());
+        assert!(circuit.clock_index.is_none());
     }
 
     #[test]

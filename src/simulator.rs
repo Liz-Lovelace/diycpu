@@ -2,172 +2,190 @@ use std::collections::HashMap;
 
 use crate::compiler::{CompiledCircuit, CompiledComponent};
 
+/// Holds the live state of a simulation: current output values for every
+/// component and previous clock-input values for DFF edge detection.
 pub struct Simulator<'a> {
     circuit: &'a CompiledCircuit,
-    /// Current output value for each component.
-    values: Vec<bool>,
+    /// Current output value for each component, indexed by component position.
+    component_values: Vec<bool>,
     /// Previous clock-input value for each DFF (indexed by position in dff_indices).
-    prev_clk: Vec<bool>,
+    previous_dff_clock_values: Vec<bool>,
 }
 
 impl<'a> Simulator<'a> {
     pub fn new(circuit: &'a CompiledCircuit) -> Self {
-        let n = circuit.components.len();
-        let mut values = vec![false; n];
+        let component_count = circuit.components.len();
+        let mut component_values = vec![false; component_count];
 
-        // Initialize DFF outputs to their init values.
-        for &idx in &circuit.dff_indices {
-            if let CompiledComponent::Dff { init, .. } = &circuit.components[idx] {
-                values[idx] = *init;
-            }
-        }
-        // CLK starts at 0 (already false).
+        initialise_dff_outputs(circuit, &mut component_values);
 
-        // Do an initial evaluation to establish NAND values.
-        evaluate(circuit, &mut values);
+        // CLK starts at 0 (already false by default).
 
-        // Record initial clock-input values for each DFF.
-        let prev_clk = circuit
-            .dff_indices
-            .iter()
-            .map(|&idx| dff_clk_input(circuit, &values, idx))
-            .collect();
+        // Run an initial evaluation so NAND outputs are consistent with inputs.
+        evaluate_combinational_logic(circuit, &mut component_values);
+
+        // Snapshot each DFF's clock input so we can detect edges on the first step.
+        let previous_dff_clock_values = snapshot_dff_clock_inputs(circuit, &component_values);
 
         Simulator {
             circuit,
-            values,
-            prev_clk,
+            component_values,
+            previous_dff_clock_values,
         }
     }
 
-    /// Advance one simulation step: toggle CLK, evaluate, latch DFFs, re-evaluate.
+    /// Advance one simulation step: toggle CLK, evaluate, latch DFFs on rising
+    /// edges, then re-evaluate so displayed values are consistent.
     pub fn step(&mut self) {
-        // Toggle CLK.
-        if let Some(clk_idx) = self.circuit.clk_idx {
-            self.values[clk_idx] = !self.values[clk_idx];
-        }
+        self.toggle_clock();
 
         // Pass 1: evaluate combinational logic with old DFF values.
-        evaluate(self.circuit, &mut self.values);
+        evaluate_combinational_logic(self.circuit, &mut self.component_values);
 
-        // Edge detection and latching.
+        // Detect rising edges and latch DFF data inputs.
+        let any_dff_latched =
+            self.latch_dffs_on_rising_edges();
+
+        // Pass 2: re-evaluate with new DFF values so the display is consistent.
+        if any_dff_latched {
+            evaluate_combinational_logic(self.circuit, &mut self.component_values);
+        }
+
+        // Record clock inputs for next step's edge detection.
+        self.previous_dff_clock_values =
+            snapshot_dff_clock_inputs(self.circuit, &self.component_values);
+    }
+
+    /// Return the current output value of every named component.
+    pub fn current_state(&self) -> HashMap<String, bool> {
+        self.circuit
+            .component_names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (name.clone(), self.component_values[index]))
+            .collect()
+    }
+
+    // ── Private helpers ──────────────────────────────────────────────────
+
+    fn toggle_clock(&mut self) {
+        if let Some(clock_index) = self.circuit.clock_index {
+            self.component_values[clock_index] = !self.component_values[clock_index];
+        }
+    }
+
+    /// Check each DFF for a 0→1 (rising) edge on its clock input. If found,
+    /// latch the current data-input value. Returns true if any DFF latched.
+    fn latch_dffs_on_rising_edges(&mut self) -> bool {
         let mut any_latched = false;
-        for (dff_pos, &idx) in self.circuit.dff_indices.iter().enumerate() {
-            let new_clk = dff_clk_input(self.circuit, &self.values, idx);
-            let old_clk = self.prev_clk[dff_pos];
 
-            if !old_clk && new_clk {
-                // Rising edge: latch the current data input.
-                let d_val = dff_d_input(self.circuit, &self.values, idx);
-                self.values[idx] = d_val;
+        for (dff_position, &component_index) in self.circuit.dff_indices.iter().enumerate() {
+            let current_clock = read_dff_clock_input(
+                self.circuit,
+                &self.component_values,
+                component_index,
+            );
+            let previous_clock = self.previous_dff_clock_values[dff_position];
+
+            let is_rising_edge = !previous_clock && current_clock;
+            if is_rising_edge {
+                let data_value = read_dff_data_input(
+                    self.circuit,
+                    &self.component_values,
+                    component_index,
+                );
+                self.component_values[component_index] = data_value;
                 any_latched = true;
             }
         }
 
-        // Pass 2: re-evaluate with new DFF values (for consistent display).
-        if any_latched {
-            evaluate(self.circuit, &mut self.values);
-        }
-
-        // Record clock inputs for next step's edge detection.
-        for (dff_pos, &idx) in self.circuit.dff_indices.iter().enumerate() {
-            self.prev_clk[dff_pos] = dff_clk_input(self.circuit, &self.values, idx);
-        }
-    }
-
-    /// Get the current state of all named components.
-    pub fn current_state(&self) -> HashMap<String, bool> {
-        self.circuit
-            .names
-            .iter()
-            .enumerate()
-            .map(|(i, name)| (name.clone(), self.values[i]))
-            .collect()
+        any_latched
     }
 }
 
-/// Evaluate all components in topological order. CLK and DFF values are
-/// already set in `values`; only NAND gates are computed.
-fn evaluate(circuit: &CompiledCircuit, values: &mut [bool]) {
-    for &idx in &circuit.eval_order {
-        if let CompiledComponent::Nand { input_a, input_b } = &circuit.components[idx] {
-            values[idx] = !(values[*input_a] && values[*input_b]);
+// ── Free functions ───────────────────────────────────────────────────────────
+
+/// Set each DFF's output to its declared init value (defaults to false).
+fn initialise_dff_outputs(circuit: &CompiledCircuit, component_values: &mut [bool]) {
+    for &dff_index in &circuit.dff_indices {
+        if let CompiledComponent::Dff { init, .. } = &circuit.components[dff_index] {
+            component_values[dff_index] = *init;
         }
     }
 }
 
-/// Get the current clock-input value for a DFF. Returns false if unconnected.
-fn dff_clk_input(circuit: &CompiledCircuit, values: &[bool], idx: usize) -> bool {
-    match &circuit.components[idx] {
+/// Record the current clock-input value for every DFF, so the next step
+/// can detect rising edges.
+fn snapshot_dff_clock_inputs(
+    circuit: &CompiledCircuit,
+    component_values: &[bool],
+) -> Vec<bool> {
+    circuit
+        .dff_indices
+        .iter()
+        .map(|&dff_index| read_dff_clock_input(circuit, component_values, dff_index))
+        .collect()
+}
+
+/// Walk the evaluation order and compute every NAND gate output.
+/// CLK and DFF values must already be set in `component_values`.
+fn evaluate_combinational_logic(circuit: &CompiledCircuit, component_values: &mut [bool]) {
+    for &component_index in &circuit.evaluation_order {
+        if let CompiledComponent::Nand { input_a, input_b } =
+            &circuit.components[component_index]
+        {
+            component_values[component_index] =
+                !(component_values[*input_a] && component_values[*input_b]);
+        }
+    }
+}
+
+/// Read the current clock-input value for a DFF. Returns false if unconnected.
+fn read_dff_clock_input(
+    circuit: &CompiledCircuit,
+    component_values: &[bool],
+    dff_index: usize,
+) -> bool {
+    match &circuit.components[dff_index] {
         CompiledComponent::Dff {
-            input_clk: Some(clk_idx),
+            input_clk: Some(clock_source_index),
             ..
-        } => values[*clk_idx],
+        } => component_values[*clock_source_index],
         _ => false,
     }
 }
 
-/// Get the current data-input value for a DFF. Returns false if unconnected.
-fn dff_d_input(circuit: &CompiledCircuit, values: &[bool], idx: usize) -> bool {
-    match &circuit.components[idx] {
+/// Read the current data-input value for a DFF. Returns false if unconnected.
+fn read_dff_data_input(
+    circuit: &CompiledCircuit,
+    component_values: &[bool],
+    dff_index: usize,
+) -> bool {
+    match &circuit.components[dff_index] {
         CompiledComponent::Dff {
-            input_d: Some(d_idx),
+            input_d: Some(data_source_index),
             ..
-        } => values[*d_idx],
+        } => component_values[*data_source_index],
         _ => false,
     }
 }
 
-/// Run the full simulation, returning state at each step (step 0 = initial state).
+/// Run the full simulation for all steps, returning a Vec of state snapshots.
+/// Index 0 is the initial state before any clock toggles.
 pub fn simulate(circuit: &CompiledCircuit) -> Vec<HashMap<String, bool>> {
-    let mut sim = Simulator::new(circuit);
+    let mut simulator = Simulator::new(circuit);
     let mut results = Vec::with_capacity(circuit.steps + 1);
 
-    // Step 0: initial state.
-    results.push(sim.current_state());
+    // Step 0: initial state before any toggles.
+    results.push(simulator.current_state());
 
-    // Steps 1..=N.
+    // Steps 1..=N: one clock toggle per step.
     for _ in 0..circuit.steps {
-        sim.step();
-        results.push(sim.current_state());
+        simulator.step();
+        results.push(simulator.current_state());
     }
 
     results
-}
-
-/// Format simulation results as a text table.
-pub fn format_table(circuit: &CompiledCircuit, results: &[HashMap<String, bool>]) -> String {
-    let names = &circuit.names;
-    let step_width = results.len().to_string().len().max(4);
-    let col_widths: Vec<usize> = names.iter().map(|n| n.len().max(1)).collect();
-
-    let mut out = String::new();
-
-    // Header.
-    out.push_str(&format!("{:>width$}", "Step", width = step_width));
-    for (i, name) in names.iter().enumerate() {
-        out.push_str(&format!(" | {:>width$}", name, width = col_widths[i]));
-    }
-    out.push('\n');
-
-    // Separator.
-    out.push_str(&"-".repeat(step_width));
-    for w in &col_widths {
-        out.push_str(&format!("-+-{}", "-".repeat(*w)));
-    }
-    out.push('\n');
-
-    // Rows.
-    for (step, state) in results.iter().enumerate() {
-        out.push_str(&format!("{:>width$}", step, width = step_width));
-        for (i, name) in names.iter().enumerate() {
-            let val = if state[name] { 1 } else { 0 };
-            out.push_str(&format!(" | {:>width$}", val, width = col_widths[i]));
-        }
-        out.push('\n');
-    }
-
-    out
 }
 
 #[cfg(test)]
@@ -177,16 +195,18 @@ mod tests {
     use crate::expander::expand;
     use crate::types::CircuitDef;
 
+    /// Parse YAML, expand abstractions, compile, simulate, and inject output aliases.
     fn run(yaml: &str) -> Vec<HashMap<String, bool>> {
-        let def: CircuitDef = serde_yaml::from_str(yaml).unwrap();
-        let expanded = expand(&def).unwrap();
-        let circuit = compile(&expanded.def).unwrap();
-        let mut results = simulate(&circuit);
-        // Inject output aliases.
-        for step in &mut results {
-            for (alias, target) in &expanded.aliases {
-                if let Some(&val) = step.get(target) {
-                    step.insert(alias.clone(), val);
+        let circuit_def: CircuitDef = serde_yaml::from_str(yaml).unwrap();
+        let expanded = expand(&circuit_def).unwrap();
+        let compiled_circuit = compile(&expanded.def).unwrap();
+        let mut results = simulate(&compiled_circuit);
+
+        // Inject output aliases so abstraction outputs are accessible by dot-notation.
+        for step_state in &mut results {
+            for (alias_name, flat_target) in &expanded.aliases {
+                if let Some(&value) = step_state.get(flat_target) {
+                    step_state.insert(alias_name.clone(), value);
                 }
             }
         }
@@ -208,9 +228,9 @@ components:
     init: false
 "#,
         );
-        for step in &results {
-            assert_eq!(step["high"], true);
-            assert_eq!(step["low"], false);
+        for step_state in &results {
+            assert_eq!(step_state["high"], true);
+            assert_eq!(step_state["low"], false);
         }
     }
 
@@ -230,9 +250,9 @@ components:
 "#,
         );
         // NAND(1,1) = 0
-        for step in &results {
-            assert_eq!(step["input"], true);
-            assert_eq!(step["output"], false);
+        for step_state in &results {
+            assert_eq!(step_state["input"], true);
+            assert_eq!(step_state["output"], false);
         }
     }
 
@@ -262,7 +282,7 @@ components:
         assert_eq!(results[0]["state"], false);
         assert_eq!(results[0]["not_state"], true);
 
-        // Step 1: CLK=1 (rising edge), state latches not_state=1 -> state=1, not_state=0
+        // Step 1: CLK=1 (rising edge), state latches not_state=1
         assert_eq!(results[1]["clk"], true);
         assert_eq!(results[1]["state"], true);
         assert_eq!(results[1]["not_state"], false);
@@ -272,7 +292,7 @@ components:
         assert_eq!(results[2]["state"], true);
         assert_eq!(results[2]["not_state"], false);
 
-        // Step 3: CLK=1 (rising edge), state latches not_state=0 -> state=0, not_state=1
+        // Step 3: CLK=1 (rising edge), state latches not_state=0
         assert_eq!(results[3]["clk"], true);
         assert_eq!(results[3]["state"], false);
         assert_eq!(results[3]["not_state"], true);
@@ -306,13 +326,11 @@ components:
     inputs: { a: nand_ab, b: nand_ab }
 "#,
         );
-        // AND(1,1) = 1
         assert_eq!(results[0]["and_ab"], true);
     }
 
     #[test]
     fn and_gate_false_cases() {
-        // AND(1,0) = 0
         let results = run(
             r#"
 name: and_10
@@ -360,7 +378,6 @@ components:
     inputs: { a: not_a, b: not_b }
 "#,
         );
-        // OR(0,1) = 1
         assert_eq!(results[0]["or_ab"], true);
     }
 
@@ -388,13 +405,11 @@ components:
     inputs: { a: not_a, b: not_b }
 "#,
         );
-        // OR(0,0) = 0
         assert_eq!(results[0]["or_ab"], false);
     }
 
     #[test]
     fn no_clk_circuit() {
-        // Circuit with no CLK: just constant DFFs feeding NANDs.
         let results = run(
             r#"
 name: no_clk
@@ -411,9 +426,9 @@ components:
     inputs: { a: one, b: zero }
 "#,
         );
-        // NAND(1,0) = 1 (stable across all steps)
-        for step in &results {
-            assert_eq!(step["result"], true);
+        // NAND(1,0) = 1, stable across all steps.
+        for step_state in &results {
+            assert_eq!(step_state["result"], true);
         }
     }
 
@@ -434,15 +449,14 @@ components:
       d: source
 "#,
         );
-        // target has d=source but no clk, so it never latches. Stays false.
-        for step in &results {
-            assert_eq!(step["target"], false);
+        // target has d=source but no clk, so it never latches.
+        for step_state in &results {
+            assert_eq!(step_state["target"], false);
         }
     }
 
     #[test]
     fn rising_edge_only() {
-        // Verify DFF only latches on 0->1 transition, not 1->0.
         let results = run(
             r#"
 name: edge_test
@@ -461,15 +475,10 @@ components:
       clk: clk
 "#,
         );
-        // Step 0: clk=0, reg=0
         assert_eq!(results[0]["reg"], false);
-        // Step 1: clk=1 (rising edge), reg latches d=one=1 -> reg=1
-        assert_eq!(results[1]["reg"], true);
-        // Step 2: clk=0 (falling edge), no latch, reg stays 1
-        assert_eq!(results[2]["reg"], true);
-        // Step 3: clk=1 (rising edge), reg latches d=1 -> still 1
+        assert_eq!(results[1]["reg"], true); // rising edge latches
+        assert_eq!(results[2]["reg"], true); // falling edge, no change
         assert_eq!(results[3]["reg"], true);
-        // All subsequent: stays 1
         assert_eq!(results[4]["reg"], true);
         assert_eq!(results[5]["reg"], true);
     }
@@ -505,17 +514,15 @@ components:
     inputs: { d: not_b, clk: clk }
 "#,
         );
-        // Step 0: not_a=0, not_b=1, reg_a=0, reg_b=0
         assert_eq!(results[0]["reg_a"], false);
         assert_eq!(results[0]["reg_b"], false);
-        // Step 1: rising edge. reg_a latches not_a=0, reg_b latches not_b=1
+        // Rising edge: reg_a latches NOT(a)=0, reg_b latches NOT(b)=1.
         assert_eq!(results[1]["reg_a"], false);
         assert_eq!(results[1]["reg_b"], true);
     }
 
     #[test]
     fn dff_self_reference_holds_value() {
-        // DFF whose data input is its own output: latches itself, never changes.
         let results = run(
             r#"
 name: self_hold
@@ -531,16 +538,16 @@ components:
       clk: clk
 "#,
         );
-        for step in &results {
-            assert_eq!(step["reg"], true);
+        for step_state in &results {
+            assert_eq!(step_state["reg"], true);
         }
     }
 
     #[test]
     fn xor_gate() {
-        // XOR(a,b) = NAND(NAND(a, NAND(a,b)), NAND(b, NAND(a,b)))
-        // Test all four input combinations.
-        for (a_init, b_init, expected) in [(false, false, false), (false, true, true), (true, false, true), (true, true, false)] {
+        for (a_init, b_init, expected) in
+            [(false, false, false), (false, true, true), (true, false, true), (true, true, false)]
+        {
             let yaml = format!(
                 r#"
 name: xor
@@ -548,10 +555,10 @@ steps: 0
 components:
   - type: dff
     name: a
-    init: {a}
+    init: {a_init}
   - type: dff
     name: b
-    init: {b}
+    init: {b_init}
   - type: nand
     name: nand_ab
     inputs: {{ a: a, b: b }}
@@ -565,8 +572,6 @@ components:
     name: xor
     inputs: {{ a: nand_a_nab, b: nand_b_nab }}
 "#,
-                a = a_init,
-                b = b_init,
             );
             let results = run(&yaml);
             assert_eq!(
@@ -578,14 +583,6 @@ components:
 
     #[test]
     fn two_bit_counter() {
-        // bit0 toggles every rising edge, bit1 toggles when bit0 is 1.
-        // bit0 = DFF with d=NOT(bit0), clk=CLK
-        // bit1 = DFF with d=XOR(bit0, bit1), clk=CLK
-        // XOR(a,b) via NANDs:
-        //   nand_ab = NAND(a,b)
-        //   nand_a_nab = NAND(a, nand_ab)
-        //   nand_b_nab = NAND(b, nand_ab)
-        //   xor = NAND(nand_a_nab, nand_b_nab)
         let results = run(
             r#"
 name: counter
@@ -619,9 +616,6 @@ components:
 "#,
         );
 
-        // Expected 2-bit counter sequence (bit1:bit0):
-        // After each rising edge (odd steps): 00 -> 01 -> 10 -> 11 -> 00 ...
-        // Rising edges happen at steps 1, 3, 5, 7, 9, 11, 13, 15.
         let expected_bit0 = [
             false, true, true, false, false, true, true, false, false, true, true, false, false,
             true, true, false, false,
@@ -631,14 +625,14 @@ components:
             true, true, false, false,
         ];
 
-        for (step, state) in results.iter().enumerate() {
+        for (step_number, step_state) in results.iter().enumerate() {
             assert_eq!(
-                state["bit0"], expected_bit0[step],
-                "bit0 mismatch at step {step}"
+                step_state["bit0"], expected_bit0[step_number],
+                "bit0 mismatch at step {step_number}"
             );
             assert_eq!(
-                state["bit1"], expected_bit1[step],
-                "bit1 mismatch at step {step}"
+                step_state["bit1"], expected_bit1[step_number],
+                "bit1 mismatch at step {step_number}"
             );
         }
     }
@@ -684,12 +678,12 @@ components: []
 "#,
         );
         assert_eq!(results.len(), 4);
-        for step in &results {
-            assert!(step.is_empty());
+        for step_state in &results {
+            assert!(step_state.is_empty());
         }
     }
 
-    // ---- Abstraction end-to-end tests ----
+    // ── Abstraction end-to-end tests ─────────────────────────────────────
 
     fn abs_prelude() -> &'static str {
         r#"
@@ -745,7 +739,7 @@ abstractions:
 
     #[test]
     fn abs_not_gate() {
-        for (input, expected) in [(false, true), (true, false)] {
+        for (input_value, expected_output) in [(false, true), (true, false)] {
             let yaml = format!(
                 r#"
 name: abs_not
@@ -754,7 +748,7 @@ steps: 0
 components:
   - type: dff
     name: x
-    init: {input}
+    init: {input_value}
   - type: not
     name: inv
     inputs: {{ x: x }}
@@ -763,8 +757,8 @@ components:
             );
             let results = run(&yaml);
             assert_eq!(
-                results[0]["inv.out"], expected,
-                "NOT({input}) should be {expected}"
+                results[0]["inv.out"], expected_output,
+                "NOT({input_value}) should be {expected_output}"
             );
         }
     }
@@ -894,7 +888,6 @@ components:
             prelude = abs_prelude(),
         );
         let results = run(&yaml);
-        // Same pattern as raw toggle flip-flop.
         assert_eq!(results[0]["state"], false);
         assert_eq!(results[1]["state"], true);
         assert_eq!(results[2]["state"], true);
@@ -941,14 +934,14 @@ components:
             true, true, false, false,
         ];
 
-        for (step, state) in results.iter().enumerate() {
+        for (step_number, step_state) in results.iter().enumerate() {
             assert_eq!(
-                state["bit0"], expected_bit0[step],
-                "bit0 mismatch at step {step}"
+                step_state["bit0"], expected_bit0[step_number],
+                "bit0 mismatch at step {step_number}"
             );
             assert_eq!(
-                state["bit1"], expected_bit1[step],
-                "bit1 mismatch at step {step}"
+                step_state["bit1"], expected_bit1[step_number],
+                "bit1 mismatch at step {step_number}"
             );
         }
     }
@@ -977,11 +970,8 @@ components:
     inputs: { d: one, clk: clk }
 "#;
         let results = run(yaml);
-        // Step 0: my_reg/ff starts at 0 (default init)
         assert_eq!(results[0]["my_reg.q"], false);
-        // Step 1: rising edge, latches d=one=1
-        assert_eq!(results[1]["my_reg.q"], true);
-        // Stays 1
+        assert_eq!(results[1]["my_reg.q"], true); // rising edge latches d=one=1
         assert_eq!(results[2]["my_reg.q"], true);
         assert_eq!(results[3]["my_reg.q"], true);
     }
@@ -1026,8 +1016,7 @@ components:
 
     #[test]
     fn abs_full_adder() {
-        // Full adder: sum = a XOR b XOR cin, cout = (a AND b) OR (cin AND (a XOR b))
-        let yaml_template = |a: bool, b: bool, cin: bool| {
+        let build_full_adder_yaml = |a: bool, b: bool, cin: bool| {
             format!(
                 r#"
 name: full_adder
@@ -1117,8 +1106,7 @@ components:
             )
         };
 
-        // Truth table for full adder.
-        for (a, b, cin, sum, cout) in [
+        for (a, b, cin, expected_sum, expected_cout) in [
             (false, false, false, false, false),
             (false, false, true, true, false),
             (false, true, false, true, false),
@@ -1128,14 +1116,14 @@ components:
             (true, true, false, false, true),
             (true, true, true, true, true),
         ] {
-            let results = run(&yaml_template(a, b, cin));
+            let results = run(&build_full_adder_yaml(a, b, cin));
             assert_eq!(
-                results[0]["fa.sum"], sum,
-                "full_add({a},{b},{cin}).sum should be {sum}"
+                results[0]["fa.sum"], expected_sum,
+                "full_add({a},{b},{cin}).sum should be {expected_sum}"
             );
             assert_eq!(
-                results[0]["fa.cout"], cout,
-                "full_add({a},{b},{cin}).cout should be {cout}"
+                results[0]["fa.cout"], expected_cout,
+                "full_add({a},{b},{cin}).cout should be {expected_cout}"
             );
         }
     }

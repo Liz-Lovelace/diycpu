@@ -1,8 +1,9 @@
 use std::process;
 
 use diycpu::compiler::compile;
+use diycpu::display::format_table;
 use diycpu::expander::expand;
-use diycpu::simulator::{format_table, simulate};
+use diycpu::simulator::simulate;
 use diycpu::types::CircuitDef;
 
 fn main() {

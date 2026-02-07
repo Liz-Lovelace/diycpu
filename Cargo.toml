@@ -17,5 +17,5 @@ path = "src/main.rs"
 
 [[bin]]
 name = "diycpu-gui"
-path = "src/bin/gui.rs"
+path = "src/bin/gui/main.rs"
 required-features = ["gui"]

@@ -1,0 +1,19 @@
+name: toggle-flip-flop
+steps: 10
+
+components:
+  - type: clk
+    name: clk
+
+  - type: dff
+    name: state
+    init: 0
+    inputs:
+      d: not_state
+      clk: clk
+
+  - type: nand
+    name: not_state
+    inputs:
+      a: state
+      b: state

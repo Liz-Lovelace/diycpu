@@ -1,0 +1,50 @@
+name: 2-bit-counter-with-abstractions
+steps: 16
+
+abstractions:
+  - name: not
+    inputs: [x]
+    outputs: { out: gate }
+    components:
+      - type: nand
+        name: gate
+        inputs: { a: x, b: x }
+
+  - name: xor
+    inputs: [a, b]
+    outputs: { out: result }
+    components:
+      - type: nand
+        name: nab
+        inputs: { a: a, b: b }
+      - type: nand
+        name: na_nab
+        inputs: { a: a, b: nab }
+      - type: nand
+        name: nb_nab
+        inputs: { a: b, b: nab }
+      - type: nand
+        name: result
+        inputs: { a: na_nab, b: nb_nab }
+
+components:
+  - type: clk
+    name: clk
+
+  - type: dff
+    name: bit0
+    init: 0
+    inputs: { d: inv.out, clk: clk }
+
+  - type: dff
+    name: bit1
+    init: 0
+    inputs: { d: x01.out, clk: clk }
+
+  - type: not
+    name: inv
+    inputs: { x: bit0 }
+
+  - type: xor
+    name: x01
+    inputs: { a: bit0, b: bit1 }

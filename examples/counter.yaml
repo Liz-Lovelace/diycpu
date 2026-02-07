@@ -1,0 +1,41 @@
+name: 2-bit-counter
+steps: 16
+
+components:
+  - type: clk
+    name: clk
+
+  # bit0 toggles every rising edge
+  - type: dff
+    name: bit0
+    init: 0
+    inputs:
+      d: not_bit0
+      clk: clk
+
+  # bit1 toggles when bit0 is 1 (XOR of bit0 and bit1)
+  - type: dff
+    name: bit1
+    init: 0
+    inputs:
+      d: xor_01
+      clk: clk
+
+  # NOT(bit0)
+  - type: nand
+    name: not_bit0
+    inputs: { a: bit0, b: bit0 }
+
+  # XOR(bit0, bit1) = NAND(NAND(a, NAND(a,b)), NAND(b, NAND(a,b)))
+  - type: nand
+    name: nand_01
+    inputs: { a: bit0, b: bit1 }
+  - type: nand
+    name: nand_0_n01
+    inputs: { a: bit0, b: nand_01 }
+  - type: nand
+    name: nand_1_n01
+    inputs: { a: bit1, b: nand_01 }
+  - type: nand
+    name: xor_01
+    inputs: { a: nand_0_n01, b: nand_1_n01 }

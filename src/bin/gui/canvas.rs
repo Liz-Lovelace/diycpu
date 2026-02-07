@@ -1,7 +1,7 @@
 use eframe::egui;
 use std::collections::HashMap;
 
-use diycpu::types::ComponentDef;
+use diycpu::types::{is_primitive, ComponentDef};
 
 use super::app::{App, WireState};
 use super::style::*;
@@ -127,8 +127,15 @@ fn draw_all_wires(
                 continue;
             }
 
-            // Find the source component by name
-            let source_index = components.iter().position(|c| c.name == *source_name);
+            // Find the source component by name. For abstraction outputs using
+            // dot-notation (e.g. "inv.out"), match the part before the dot.
+            let source_index = components
+                .iter()
+                .position(|c| c.name == *source_name)
+                .or_else(|| {
+                    let instance_name = source_name.split('.').next()?;
+                    components.iter().position(|c| c.name == instance_name)
+                });
             let Some(source_index) = source_index else {
                 continue;
             };
@@ -566,7 +573,8 @@ impl App {
             for (port_position, port_key) in &ports {
                 if click_position.distance(*port_position) < port_hit_radius {
                     let source_index = self.wire_state.source_component_index.unwrap();
-                    let source_name = self.circuit.components[source_index].name.clone();
+                    let source_reference =
+                        self.build_source_reference(source_index);
                     self.save_undo_checkpoint();
 
                     let destination_component =
@@ -578,11 +586,11 @@ impl App {
                         .inputs
                         .as_mut()
                         .unwrap()
-                        .insert(port_key.clone(), source_name.clone());
+                        .insert(port_key.clone(), source_reference.clone());
 
                     self.wire_state.source_component_index = None;
                     self.status_message = format!(
-                        "Connected {source_name} -> {}.{port_key}",
+                        "Connected {source_reference} -> {}.{port_key}",
                         destination_component.name
                     );
                     connected = true;
@@ -595,6 +603,36 @@ impl App {
             self.wire_state.source_component_index = None;
             self.status_message = "Wire cancelled".into();
         }
+    }
+
+    /// Build the correct source reference for a component when creating a wire.
+    /// For primitives (clk, nand, dff), the reference is just the component name.
+    /// For abstraction instances, it's "instance_name.output_name" (dot-notation).
+    fn build_source_reference(&self, source_index: usize) -> String {
+        let source_component = &self.circuit.components[source_index];
+
+        if is_primitive(&source_component.component_type) {
+            return source_component.name.clone();
+        }
+
+        // Look up the abstraction definition to find its output names.
+        let abstraction = self
+            .circuit
+            .abstractions
+            .iter()
+            .find(|a| a.name == source_component.component_type);
+
+        if let Some(abstraction) = abstraction {
+            // Sort output names for deterministic behavior.
+            let mut output_names: Vec<&String> = abstraction.outputs.keys().collect();
+            output_names.sort();
+            if let Some(output_name) = output_names.first() {
+                return format!("{}.{}", source_component.name, output_name);
+            }
+        }
+
+        // Fallback: just use the component name (shouldn't normally happen).
+        source_component.name.clone()
     }
 
     /// Check if the click is on an output port and start wire drawing mode.

@@ -1,3 +1,8 @@
+mod demo;
+mod microchip;
+mod wire;
+mod workbench;
+
 use femtovg::{renderer::OpenGl, Canvas, Color};
 use glutin::{
     config::ConfigTemplateBuilder,
@@ -16,11 +21,14 @@ use winit::{
     window::{Window, WindowAttributes},
 };
 
+use workbench::Workbench;
+
 struct App {
     context: PossiblyCurrentContext,
     surface: Surface<WindowSurface>,
     window: Window,
     canvas: Canvas<OpenGl>,
+    workbench: Workbench,
 }
 
 impl App {
@@ -55,7 +63,8 @@ impl App {
             .with_context_api(ContextApi::OpenGl(None))
             .build(Some(window.window_handle().unwrap().as_raw()));
 
-        let gl_context = unsafe { gl_display.create_context(&gl_config, &context_attrs).unwrap() };
+        let gl_context =
+            unsafe { gl_display.create_context(&gl_config, &context_attrs).unwrap() };
 
         let size = window.inner_size();
         let surface_attrs = SurfaceAttributesBuilder::<WindowSurface>::new().build(
@@ -72,10 +81,9 @@ impl App {
 
         let context = gl_context.make_current(&surface).unwrap();
 
-        let renderer = unsafe {
-            OpenGl::new_from_function_cstr(|s| gl_display.get_proc_address(s).cast())
-        }
-        .unwrap();
+        let renderer =
+            unsafe { OpenGl::new_from_function_cstr(|s| gl_display.get_proc_address(s).cast()) }
+                .unwrap();
 
         let canvas = Canvas::new(renderer).unwrap();
 
@@ -84,6 +92,7 @@ impl App {
             surface,
             window,
             canvas,
+            workbench: Workbench::new(),
         }
     }
 
@@ -100,7 +109,8 @@ impl App {
             Color::rgbf(0.1, 0.1, 0.12),
         );
 
-        // TODO: all rendering goes here
+        self.workbench.draw_grid(&mut self.canvas, size.width, size.height);
+        demo::draw_demo(&mut self.canvas, &self.workbench);
 
         self.canvas.flush();
         self.surface.swap_buffers(&self.context).unwrap();

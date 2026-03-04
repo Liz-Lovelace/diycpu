@@ -1,0 +1,46 @@
+{
+  "name": "toggle-flip-flop",
+  "steps": 10,
+  "components": [
+    {"id": "clk", "type": "clk", "pos": [0, 0]},
+    {"id": "state", "type": "dff", "init": false, "pos": [200, 0]},
+    {"id": "not_state", "type": "nand", "pos": [400, 0]}
+  ],
+  "wire_nets": [
+    {
+      "id": "w1",
+      "source": {"component_id": "not_state", "port_name": "out"},
+      "sinks": [{"component_id": "state", "port_name": "d"}],
+      "segments": [
+        {"from": {"kind": "Port", "component_id": "not_state", "port_name": "out"},
+         "to": {"kind": "Port", "component_id": "state", "port_name": "d"}}
+      ]
+    },
+    {
+      "id": "w2",
+      "source": {"component_id": "clk", "port_name": "out"},
+      "sinks": [{"component_id": "state", "port_name": "clk"}],
+      "segments": [
+        {"from": {"kind": "Port", "component_id": "clk", "port_name": "out"},
+         "to": {"kind": "Port", "component_id": "state", "port_name": "clk"}}
+      ]
+    },
+    {
+      "id": "w3",
+      "source": {"component_id": "state", "port_name": "out"},
+      "sinks": [
+        {"component_id": "not_state", "port_name": "a"},
+        {"component_id": "not_state", "port_name": "b"}
+      ],
+      "junctions": [{"id": "j1", "pos": [300, 50]}],
+      "segments": [
+        {"from": {"kind": "Port", "component_id": "state", "port_name": "out"},
+         "to": {"kind": "Junction", "junction_id": "j1"}},
+        {"from": {"kind": "Junction", "junction_id": "j1"},
+         "to": {"kind": "Port", "component_id": "not_state", "port_name": "a"}},
+        {"from": {"kind": "Junction", "junction_id": "j1"},
+         "to": {"kind": "Port", "component_id": "not_state", "port_name": "b"}}
+      ]
+    }
+  ]
+}

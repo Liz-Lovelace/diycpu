@@ -1,15 +1,16 @@
 use std::process;
 
 use diycpu::compiler::compile;
+use diycpu::convert::project_to_circuit;
 use diycpu::display::format_table;
 use diycpu::expander::expand;
+use diycpu::project::Project;
 use diycpu::simulator::simulate;
-use diycpu::types::CircuitDef;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 2 {
-        eprintln!("Usage: diycpu <circuit.yaml>");
+        eprintln!("Usage: diycpu <circuit.json>");
         process::exit(1);
     }
 
@@ -22,10 +23,18 @@ fn main() {
         }
     };
 
-    let def: CircuitDef = match serde_yaml::from_str(&contents) {
+    let project: Project = match serde_json::from_str(&contents) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Error parsing JSON: {e}");
+            process::exit(1);
+        }
+    };
+
+    let def = match project_to_circuit(&project) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("Error parsing YAML: {e}");
+            eprintln!("Error converting project: {e}");
             process::exit(1);
         }
     };

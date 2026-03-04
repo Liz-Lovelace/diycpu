@@ -136,23 +136,15 @@ fn build_compiled_component(
     match component.component_type.as_str() {
         "clk" => Ok(CompiledComponent::Clk),
         "nand" => {
-            let inputs = component
-                .inputs
-                .as_ref()
-                .ok_or_else(|| CompileError::MissingInput {
-                    component: component.name.clone(),
-                    input: "a, b".to_string(),
-                })?;
-
             let input_a_name =
-                inputs
+                component.inputs
                     .get("a")
                     .ok_or_else(|| CompileError::MissingInput {
                         component: component.name.clone(),
                         input: "a".to_string(),
                     })?;
             let input_b_name =
-                inputs
+                component.inputs
                     .get("b")
                     .ok_or_else(|| CompileError::MissingInput {
                         component: component.name.clone(),
@@ -177,24 +169,14 @@ fn build_compiled_component(
             })
         }
         "dff" => {
-            let (input_d, input_clk) = match &component.inputs {
-                Some(inputs) => {
-                    let data_input = inputs
-                        .get("d")
-                        .map(|name| {
-                            resolve_input_reference(&component.name, name, name_to_index)
-                        })
-                        .transpose()?;
-                    let clock_input = inputs
-                        .get("clk")
-                        .map(|name| {
-                            resolve_input_reference(&component.name, name, name_to_index)
-                        })
-                        .transpose()?;
-                    (data_input, clock_input)
-                }
-                None => (None, None),
-            };
+            let input_d = component.inputs
+                .get("d")
+                .map(|name| resolve_input_reference(&component.name, name, name_to_index))
+                .transpose()?;
+            let input_clk = component.inputs
+                .get("clk")
+                .map(|name| resolve_input_reference(&component.name, name, name_to_index))
+                .transpose()?;
             Ok(CompiledComponent::Dff {
                 init: component.init.unwrap_or(false),
                 input_d,
@@ -302,35 +284,16 @@ fn topological_sort(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn compile_yaml(yaml: &str) -> Result<CompiledCircuit, CompileError> {
-        let def: CircuitDef = serde_yaml::from_str(yaml).unwrap();
-        compile(&def)
-    }
+    use crate::test_helpers::CircuitBuilder;
 
     #[test]
     fn compile_simple_circuit() {
-        let circuit = compile_yaml(
-            r#"
-name: test
-steps: 1
-components:
-  - type: clk
-    name: clock
-  - type: dff
-    name: reg
-    init: 0
-    inputs:
-      d: gate
-      clk: clock
-  - type: nand
-    name: gate
-    inputs:
-      a: reg
-      b: reg
-"#,
-        )
-        .unwrap();
+        let def = CircuitBuilder::new("test", 1)
+            .clk("clock")
+            .dff("reg").init(false).d("gate").clk("clock").done()
+            .nand("gate", "reg", "reg")
+            .build();
+        let circuit = compile(&def).unwrap();
 
         assert_eq!(circuit.component_names, vec!["clock", "reg", "gate"]);
         assert_eq!(circuit.clock_index, Some(0));
@@ -340,142 +303,72 @@ components:
 
     #[test]
     fn reject_duplicate_names() {
-        let err = compile_yaml(
-            r#"
-name: test
-steps: 1
-components:
-  - type: dff
-    name: dup
-  - type: dff
-    name: dup
-"#,
-        )
-        .unwrap_err();
+        let def = CircuitBuilder::new("test", 1)
+            .dff("dup").done()
+            .dff("dup").done()
+            .build();
+        let err = compile(&def).unwrap_err();
         assert!(matches!(err, CompileError::DuplicateName(n) if n == "dup"));
     }
 
     #[test]
     fn reject_multiple_clocks() {
-        let err = compile_yaml(
-            r#"
-name: test
-steps: 1
-components:
-  - type: clk
-    name: clk1
-  - type: clk
-    name: clk2
-"#,
-        )
-        .unwrap_err();
+        let def = CircuitBuilder::new("test", 1)
+            .clk("clk1")
+            .clk("clk2")
+            .build();
+        let err = compile(&def).unwrap_err();
         assert!(matches!(err, CompileError::MultipleClocks));
     }
 
     #[test]
     fn reject_unknown_input() {
-        let err = compile_yaml(
-            r#"
-name: test
-steps: 1
-components:
-  - type: nand
-    name: gate
-    inputs:
-      a: nonexistent
-      b: nonexistent
-"#,
-        )
-        .unwrap_err();
+        let def = CircuitBuilder::new("test", 1)
+            .nand("gate", "nonexistent", "nonexistent")
+            .build();
+        let err = compile(&def).unwrap_err();
         assert!(matches!(err, CompileError::UnknownInput { .. }));
     }
 
     #[test]
     fn reject_nand_self_reference() {
-        let err = compile_yaml(
-            r#"
-name: test
-steps: 1
-components:
-  - type: dff
-    name: x
-  - type: nand
-    name: bad
-    inputs:
-      a: bad
-      b: x
-"#,
-        )
-        .unwrap_err();
+        let def = CircuitBuilder::new("test", 1)
+            .dff("x").done()
+            .nand("bad", "bad", "x")
+            .build();
+        let err = compile(&def).unwrap_err();
         assert!(matches!(err, CompileError::SelfReference { .. }));
     }
 
     #[test]
     fn reject_cyclic_nand_graph() {
-        let err = compile_yaml(
-            r#"
-name: test
-steps: 1
-components:
-  - type: nand
-    name: a
-    inputs:
-      a: b
-      b: b
-  - type: nand
-    name: b
-    inputs:
-      a: a
-      b: a
-"#,
-        )
-        .unwrap_err();
+        let def = CircuitBuilder::new("test", 1)
+            .nand("a", "b", "b")
+            .nand("b", "a", "a")
+            .build();
+        let err = compile(&def).unwrap_err();
         assert!(matches!(err, CompileError::CyclicGraph));
     }
 
     #[test]
     fn allow_dff_self_reference() {
-        let circuit = compile_yaml(
-            r#"
-name: test
-steps: 1
-components:
-  - type: clk
-    name: clock
-  - type: dff
-    name: reg
-    init: 1
-    inputs:
-      d: reg
-      clk: clock
-"#,
-        )
-        .unwrap();
+        let def = CircuitBuilder::new("test", 1)
+            .clk("clock")
+            .dff("reg").init(true).d("reg").clk("clock").done()
+            .build();
+        let circuit = compile(&def).unwrap();
         assert_eq!(circuit.component_names, vec!["clock", "reg"]);
     }
 
     #[test]
     fn topological_order_chain() {
-        let circuit = compile_yaml(
-            r#"
-name: test
-steps: 1
-components:
-  - type: dff
-    name: x
-    init: 1
-  - type: nand
-    name: nand3
-    inputs: { a: nand2, b: nand2 }
-  - type: nand
-    name: nand2
-    inputs: { a: nand1, b: nand1 }
-  - type: nand
-    name: nand1
-    inputs: { a: x, b: x }
-"#,
-        )
-        .unwrap();
+        let def = CircuitBuilder::new("test", 1)
+            .dff("x").init(true).done()
+            .nand("nand3", "nand2", "nand2")
+            .nand("nand2", "nand1", "nand1")
+            .nand("nand1", "x", "x")
+            .build();
+        let circuit = compile(&def).unwrap();
 
         let nand_order: Vec<&str> = circuit
             .evaluation_order
@@ -488,72 +381,40 @@ components:
 
     #[test]
     fn no_clk_is_valid() {
-        let circuit = compile_yaml(
-            r#"
-name: test
-steps: 1
-components:
-  - type: dff
-    name: a
-    init: 1
-  - type: nand
-    name: not_a
-    inputs: { a: a, b: a }
-"#,
-        )
-        .unwrap();
+        let def = CircuitBuilder::new("test", 1)
+            .dff("a").init(true).done()
+            .nand("not_a", "a", "a")
+            .build();
+        let circuit = compile(&def).unwrap();
         assert!(circuit.clock_index.is_none());
     }
 
     #[test]
     fn reject_three_node_cycle() {
-        let err = compile_yaml(
-            r#"
-name: test
-steps: 1
-components:
-  - type: nand
-    name: a
-    inputs: { a: c, b: c }
-  - type: nand
-    name: b
-    inputs: { a: a, b: a }
-  - type: nand
-    name: c
-    inputs: { a: b, b: b }
-"#,
-        )
-        .unwrap_err();
+        let def = CircuitBuilder::new("test", 1)
+            .nand("a", "c", "c")
+            .nand("b", "a", "a")
+            .nand("c", "b", "b")
+            .build();
+        let err = compile(&def).unwrap_err();
         assert!(matches!(err, CompileError::CyclicGraph));
     }
 
     #[test]
     fn reject_unknown_type() {
-        let err = compile_yaml(
-            r#"
-name: test
-steps: 1
-components:
-  - type: bogus
-    name: x
-"#,
-        )
-        .unwrap_err();
+        let def = CircuitBuilder::new("test", 1)
+            .component("bogus", "x", &[])
+            .build();
+        let err = compile(&def).unwrap_err();
         assert!(matches!(err, CompileError::UnknownType { .. }));
     }
 
     #[test]
     fn reject_nand_missing_inputs() {
-        let err = compile_yaml(
-            r#"
-name: test
-steps: 1
-components:
-  - type: nand
-    name: x
-"#,
-        )
-        .unwrap_err();
+        let def = CircuitBuilder::new("test", 1)
+            .component("nand", "x", &[])
+            .build();
+        let err = compile(&def).unwrap_err();
         assert!(matches!(err, CompileError::MissingInput { .. }));
     }
 }

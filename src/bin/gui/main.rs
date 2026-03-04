@@ -9,7 +9,7 @@ mod undo;
 
 use eframe::egui;
 
-use app::{App, PanelTab};
+use app::{App, InteractionMode, PanelTab};
 use file_dialogs::{open_file_dialog, save_file_dialog};
 
 fn main() -> eframe::Result<()> {
@@ -32,7 +32,7 @@ impl eframe::App for App {
         draw_top_menu_bar(self, ctx);
         draw_breadcrumb_bar(self, ctx);
         self.draw_simulation_playback_bar(ctx);
-        handle_escape_cancel_wire(self, ctx);
+        handle_escape_key(self, ctx);
         draw_right_side_panel(self, ctx);
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -48,11 +48,11 @@ fn handle_keyboard_shortcuts(app: &mut App, ctx: &egui::Context) {
     let is_ctrl_held = modifiers.ctrl || modifiers.mac_cmd;
 
     if is_ctrl_held && ctx.input(|i| i.key_pressed(egui::Key::S)) {
-        app.save_circuit_to_yaml();
+        app.save_to_json();
     }
     if is_ctrl_held && ctx.input(|i| i.key_pressed(egui::Key::O)) {
         if let Some(path) = open_file_dialog() {
-            app.load_circuit_from_yaml(path);
+            app.load_from_json(path);
         }
     }
     if is_ctrl_held && ctx.input(|i| i.key_pressed(egui::Key::N)) {
@@ -75,7 +75,7 @@ fn handle_keyboard_shortcuts(app: &mut App, ctx: &egui::Context) {
     if ctx.input(|i| i.key_pressed(egui::Key::Delete))
         && ctx.memory(|m| m.focused().is_none())
     {
-        app.delete_selected_component();
+        app.delete_selected_components();
     }
 }
 
@@ -91,18 +91,18 @@ fn draw_top_menu_bar(app: &mut App, ctx: &egui::Context) {
                 }
                 if ui.button("Open...      Ctrl+O").clicked() {
                     if let Some(path) = open_file_dialog() {
-                        app.load_circuit_from_yaml(path);
+                        app.load_from_json(path);
                     }
                     ui.close();
                 }
                 if ui.button("Save         Ctrl+S").clicked() {
-                    app.save_circuit_to_yaml();
+                    app.save_to_json();
                     ui.close();
                 }
                 if ui.button("Save As...").clicked() {
                     if let Some(path) = save_file_dialog() {
                         app.file_path = Some(path);
-                        app.save_circuit_to_yaml();
+                        app.save_to_json();
                     }
                     ui.close();
                 }
@@ -139,7 +139,7 @@ fn draw_top_menu_bar(app: &mut App, ctx: &egui::Context) {
 
                 if ui
                     .add_enabled(
-                        app.selected_component.is_some(),
+                        !app.selected_components.is_empty(),
                         egui::Button::new("Duplicate    Ctrl+D"),
                     )
                     .clicked()
@@ -149,12 +149,12 @@ fn draw_top_menu_bar(app: &mut App, ctx: &egui::Context) {
                 }
                 if ui
                     .add_enabled(
-                        app.selected_component.is_some(),
+                        !app.selected_components.is_empty(),
                         egui::Button::new("Delete       Del"),
                     )
                     .clicked()
                 {
-                    app.delete_selected_component();
+                    app.delete_selected_components();
                     ui.close();
                 }
             });
@@ -165,11 +165,11 @@ fn draw_top_menu_bar(app: &mut App, ctx: &egui::Context) {
                 app.run_simulation();
             }
 
-            if app.wire_state.source_component_index.is_some() {
+            if matches!(app.interaction_mode, InteractionMode::DrawingWire { .. }) {
                 ui.separator();
                 ui.colored_label(
                     egui::Color32::YELLOW,
-                    "Wiring... click an input port (Esc to cancel)",
+                    "Wiring... click port/junction/empty space (Esc/right-click to stop)",
                 );
             }
 
@@ -191,13 +191,13 @@ fn draw_breadcrumb_bar(app: &mut App, ctx: &egui::Context) {
         ui.horizontal(|ui| {
             if ui.link("Main Circuit").clicked() {
                 app.editing_abstraction_index = None;
-                app.selected_component = None;
+                app.clear_selection();
                 app.status_message = "Back to main circuit".into();
             }
             ui.label(">");
             if let Some(abs_idx) = app.editing_abstraction_index {
-                if abs_idx < app.circuit.abstractions.len() {
-                    ui.strong(&app.circuit.abstractions[abs_idx].name);
+                if abs_idx < app.project.abstractions.len() {
+                    ui.strong(&app.project.abstractions[abs_idx].name);
                 }
             }
             ui.label("  (Esc or Backspace to go back)");
@@ -207,15 +207,16 @@ fn draw_breadcrumb_bar(app: &mut App, ctx: &egui::Context) {
 
 // ── Escape key handling ─────────────────────────────────────────────────────
 
-fn handle_escape_cancel_wire(app: &mut App, ctx: &egui::Context) {
+fn handle_escape_key(app: &mut App, ctx: &egui::Context) {
     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-        if app.wire_state.source_component_index.is_some() {
-            app.wire_state.source_component_index = None;
-            app.wire_state.source_output_name = None;
-            app.status_message = "Wire cancelled".into();
+        if matches!(app.interaction_mode, InteractionMode::DrawingWire { .. }) {
+            app.cancel_wire_drawing();
+        } else if !app.selected_components.is_empty() || !app.selected_junctions.is_empty() {
+            app.clear_selection();
+            app.status_message = "Selection cleared".into();
         } else if app.editing_abstraction_index.is_some() {
             app.editing_abstraction_index = None;
-            app.selected_component = None;
+            app.clear_selection();
             app.status_message = "Back to main circuit".into();
         }
     }
@@ -226,7 +227,7 @@ fn handle_escape_cancel_wire(app: &mut App, ctx: &egui::Context) {
         && app.editing_abstraction_index.is_some()
     {
         app.editing_abstraction_index = None;
-        app.selected_component = None;
+        app.clear_selection();
         app.status_message = "Back to main circuit".into();
     }
 }

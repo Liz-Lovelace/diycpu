@@ -1,0 +1,115 @@
+{
+  "name": "2-bit-counter",
+  "steps": 16,
+  "abstractions": [
+    {
+      "name": "not",
+      "inputs": ["x"],
+      "outputs": {"out": "gate"},
+      "width": 140,
+      "height": 70,
+      "components": [
+        {"id": "gate", "type": "nand", "pos": [50, 30]}
+      ],
+      "wire_nets": [
+        {
+          "id": "aw1",
+          "source": {"component_id": "INPUT:x", "port_name": "x"},
+          "sinks": [
+            {"component_id": "gate", "port_name": "a"},
+            {"component_id": "gate", "port_name": "b"}
+          ]
+        }
+      ]
+    },
+    {
+      "name": "xor",
+      "inputs": ["a", "b"],
+      "outputs": {"out": "result"},
+      "width": 140,
+      "height": 90,
+      "components": [
+        {"id": "nab", "type": "nand", "pos": [50, 30]},
+        {"id": "na_nab", "type": "nand", "pos": [150, 10]},
+        {"id": "nb_nab", "type": "nand", "pos": [150, 50]},
+        {"id": "result", "type": "nand", "pos": [250, 30]}
+      ],
+      "wire_nets": [
+        {
+          "id": "xw1",
+          "source": {"component_id": "INPUT:a", "port_name": "a"},
+          "sinks": [
+            {"component_id": "nab", "port_name": "a"},
+            {"component_id": "na_nab", "port_name": "a"}
+          ]
+        },
+        {
+          "id": "xw2",
+          "source": {"component_id": "INPUT:b", "port_name": "b"},
+          "sinks": [
+            {"component_id": "nab", "port_name": "b"},
+            {"component_id": "nb_nab", "port_name": "a"}
+          ]
+        },
+        {
+          "id": "xw3",
+          "source": {"component_id": "nab", "port_name": "out"},
+          "sinks": [
+            {"component_id": "na_nab", "port_name": "b"},
+            {"component_id": "nb_nab", "port_name": "b"}
+          ]
+        },
+        {
+          "id": "xw4",
+          "source": {"component_id": "na_nab", "port_name": "out"},
+          "sinks": [{"component_id": "result", "port_name": "a"}]
+        },
+        {
+          "id": "xw5",
+          "source": {"component_id": "nb_nab", "port_name": "out"},
+          "sinks": [{"component_id": "result", "port_name": "b"}]
+        }
+      ]
+    }
+  ],
+  "components": [
+    {"id": "clk", "type": "clk", "pos": [0, 100]},
+    {"id": "bit0", "type": "dff", "init": false, "pos": [200, 0]},
+    {"id": "bit1", "type": "dff", "init": false, "pos": [200, 200]},
+    {"id": "n0", "type": "not", "pos": [400, 0]},
+    {"id": "x01", "type": "xor", "pos": [400, 200]}
+  ],
+  "wire_nets": [
+    {
+      "id": "w_clk_0",
+      "source": {"component_id": "clk", "port_name": "out"},
+      "sinks": [
+        {"component_id": "bit0", "port_name": "clk"},
+        {"component_id": "bit1", "port_name": "clk"}
+      ]
+    },
+    {
+      "id": "w_n0_bit0",
+      "source": {"component_id": "n0", "port_name": "out"},
+      "sinks": [{"component_id": "bit0", "port_name": "d"}]
+    },
+    {
+      "id": "w_x01_bit1",
+      "source": {"component_id": "x01", "port_name": "out"},
+      "sinks": [{"component_id": "bit1", "port_name": "d"}]
+    },
+    {
+      "id": "w_bit0",
+      "source": {"component_id": "bit0", "port_name": "out"},
+      "sinks": [
+        {"component_id": "n0", "port_name": "x"},
+        {"component_id": "x01", "port_name": "a"}
+      ]
+    },
+    {
+      "id": "w_bit1",
+      "source": {"component_id": "bit1", "port_name": "out"},
+      "sinks": [{"component_id": "x01", "port_name": "b"}]
+    }
+  ]
+}

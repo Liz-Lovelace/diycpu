@@ -1,7 +1,7 @@
 use eframe::egui;
 use std::collections::HashMap;
 
-use diycpu::types::AbstractionDef;
+use diycpu::project::ProjectAbstraction;
 
 use super::app::{App, PanelTab};
 
@@ -16,14 +16,14 @@ impl App {
     }
 
     fn draw_abstraction_list(&mut self, ui: &mut egui::Ui) {
-        let abstraction_count = self.circuit.abstractions.len();
+        let abstraction_count = self.project.abstractions.len();
 
         if abstraction_count == 0 {
             ui.label("No abstractions defined.");
         } else {
             for index in 0..abstraction_count {
-                let name = self.circuit.abstractions[index].name.clone();
-                let comp_count = self.circuit.abstractions[index].components.len();
+                let name = self.project.abstractions[index].name.clone();
+                let comp_count = self.project.abstractions[index].components.len();
                 let label = format!("{name} ({comp_count} components)");
                 ui.horizontal(|ui| {
                     let is_selected = self.selected_abstraction_index == Some(index);
@@ -32,7 +32,7 @@ impl App {
                     }
                     if ui.small_button("Edit").clicked() {
                         self.editing_abstraction_index = Some(index);
-                        self.selected_component = None;
+                        self.clear_selection();
                         self.canvas_offset = egui::Vec2::ZERO;
                         self.active_panel_tab = PanelTab::Components;
                         self.status_message = format!("Editing abstraction: {name}");
@@ -46,7 +46,7 @@ impl App {
         let Some(selected_index) = self.selected_abstraction_index else {
             return;
         };
-        if selected_index >= self.circuit.abstractions.len() {
+        if selected_index >= self.project.abstractions.len() {
             self.selected_abstraction_index = None;
             return;
         }
@@ -56,12 +56,12 @@ impl App {
         // Editable name
         ui.horizontal(|ui| {
             ui.label("Name:");
-            let name = &mut self.circuit.abstractions[selected_index].name;
+            let name = &mut self.project.abstractions[selected_index].name;
             ui.text_edit_singleline(name);
         });
 
         // Editable inputs (comma-separated)
-        let inputs_str = self.circuit.abstractions[selected_index].inputs.join(", ");
+        let inputs_str = self.project.abstractions[selected_index].inputs.join(", ");
         let mut editable_inputs = inputs_str;
         ui.horizontal(|ui| {
             ui.label("Inputs:");
@@ -75,14 +75,42 @@ impl App {
                     .filter(|s| !s.is_empty())
                     .collect();
                 self.save_undo_checkpoint();
-                self.circuit.abstractions[selected_index].inputs = parsed;
+                self.project.abstractions[selected_index].inputs = parsed;
+            }
+        });
+
+        // Width / Height
+        ui.horizontal(|ui| {
+            ui.label("Width:");
+            if ui
+                .add(
+                    egui::DragValue::new(
+                        &mut self.project.abstractions[selected_index].width,
+                    )
+                    .range(60.0..=500.0),
+                )
+                .changed()
+            {
+                self.save_undo_checkpoint();
+            }
+            ui.label("Height:");
+            if ui
+                .add(
+                    egui::DragValue::new(
+                        &mut self.project.abstractions[selected_index].height,
+                    )
+                    .range(40.0..=500.0),
+                )
+                .changed()
+            {
+                self.save_undo_checkpoint();
             }
         });
 
         // Editable outputs
         ui.label("Outputs:");
         let outputs: Vec<(String, String)> = {
-            let mut pairs: Vec<_> = self.circuit.abstractions[selected_index]
+            let mut pairs: Vec<_> = self.project.abstractions[selected_index]
                 .outputs
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
@@ -102,7 +130,7 @@ impl App {
         }
         if let Some(key) = output_to_remove {
             self.save_undo_checkpoint();
-            self.circuit.abstractions[selected_index]
+            self.project.abstractions[selected_index]
                 .outputs
                 .remove(&key);
         }
@@ -123,18 +151,17 @@ impl App {
                     .desired_width(50.0)
                     .hint_text("target"),
             );
-            // Note: adding outputs is more practical via the main outputs editor below
         });
 
         // Components list
         ui.label(format!(
             "Components: {}",
-            self.circuit.abstractions[selected_index].components.len()
+            self.project.abstractions[selected_index].components.len()
         ));
-        for component in &self.circuit.abstractions[selected_index].components {
+        for component in &self.project.abstractions[selected_index].components {
             ui.label(format!(
                 "  {} ({})",
-                component.name, component.component_type
+                component.id, component.component_type
             ));
         }
 
@@ -142,19 +169,18 @@ impl App {
         ui.horizontal(|ui| {
             if ui.button("Edit contents").clicked() {
                 self.editing_abstraction_index = Some(selected_index);
-                self.selected_component = None;
+                self.clear_selection();
                 self.canvas_offset = egui::Vec2::ZERO;
                 self.active_panel_tab = PanelTab::Components;
-                let name = self.circuit.abstractions[selected_index].name.clone();
+                let name = self.project.abstractions[selected_index].name.clone();
                 self.status_message = format!("Editing abstraction: {name}");
             }
             if ui.button("Delete").clicked() {
                 self.save_undo_checkpoint();
-                // If currently editing this abstraction, exit first
                 if self.editing_abstraction_index == Some(selected_index) {
                     self.editing_abstraction_index = None;
                 }
-                self.circuit.abstractions.remove(selected_index);
+                self.project.abstractions.remove(selected_index);
                 self.selected_abstraction_index = None;
                 self.status_message = "Abstraction deleted".into();
             }
@@ -211,13 +237,16 @@ impl App {
                 }
             }
 
-            self.circuit.abstractions.push(AbstractionDef {
+            self.project.abstractions.push(ProjectAbstraction {
                 name: self.abstraction_editor_name.clone(),
                 inputs: parsed_inputs,
                 outputs,
+                width: 140.0,
+                height: 70.0,
                 components: vec![],
+                wire_nets: vec![],
             });
-            self.selected_abstraction_index = Some(self.circuit.abstractions.len() - 1);
+            self.selected_abstraction_index = Some(self.project.abstractions.len() - 1);
             self.abstraction_editor_name.clear();
             self.abstraction_editor_inputs.clear();
             self.abstraction_editor_outputs = vec![("out".into(), String::new())];

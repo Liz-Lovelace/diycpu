@@ -8,7 +8,7 @@ gui = ["dep:eframe"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.9"
+serde_json = "1"
 eframe = { version = "0.33", optional = true, default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
 
 [[bin]]

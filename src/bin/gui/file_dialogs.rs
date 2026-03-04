@@ -7,8 +7,8 @@ pub fn open_file_dialog() -> Option<PathBuf> {
     let output = Command::new("zenity")
         .args([
             "--file-selection",
-            "--title=Open Circuit YAML",
-            "--file-filter=YAML files | *.yaml *.yml",
+            "--title=Open Circuit JSON",
+            "--file-filter=JSON files | *.json",
         ])
         .output()
         .ok()?;
@@ -32,8 +32,8 @@ pub fn save_file_dialog() -> Option<PathBuf> {
         .args([
             "--file-selection",
             "--save",
-            "--title=Save Circuit YAML",
-            "--file-filter=YAML files | *.yaml *.yml",
+            "--title=Save Circuit JSON",
+            "--file-filter=JSON files | *.json",
         ])
         .output()
         .ok()?;

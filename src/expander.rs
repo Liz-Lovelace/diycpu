@@ -119,7 +119,7 @@ pub fn expand(circuit_def: &CircuitDef) -> Result<ExpandedCircuit, ExpandError> 
         } else if let Some(abstraction) =
             abstraction_map.get(component.component_type.as_str())
         {
-            let input_bindings = component.inputs.as_ref().cloned().unwrap_or_default();
+            let input_bindings = component.inputs.clone();
 
             validate_instance_inputs(&component.name, abstraction, &input_bindings)?;
 
@@ -147,11 +147,9 @@ pub fn expand(circuit_def: &CircuitDef) -> Result<ExpandedCircuit, ExpandError> 
 
     // Resolve dot-notation references in all flat components.
     for component in &mut flat_components {
-        if let Some(inputs) = &mut component.inputs {
-            for input_value in inputs.values_mut() {
-                if let Some(resolved) = aliases.get(input_value.as_str()) {
-                    *input_value = resolved.clone();
-                }
+        for input_value in component.inputs.values_mut() {
+            if let Some(resolved) = aliases.get(input_value.as_str()) {
+                *input_value = resolved.clone();
             }
         }
     }
@@ -330,7 +328,7 @@ fn expand_instance(
 
             let sub_input_bindings = resolve_input_map(
                 &format!("{name_prefix}/{}", component.name),
-                component.inputs.as_ref(),
+                &component.inputs,
                 input_bindings,
                 &internal_name_map,
             )?;
@@ -365,7 +363,7 @@ fn expand_instance(
             let flat_name = format!("{name_prefix}/{}", component.name);
             let resolved_inputs = resolve_input_map(
                 &flat_name,
-                component.inputs.as_ref(),
+                &component.inputs,
                 input_bindings,
                 &internal_name_map,
             )?;
@@ -374,13 +372,7 @@ fn expand_instance(
                 component_type: component.component_type.clone(),
                 name: flat_name,
                 init: component.init,
-                inputs: if resolved_inputs.is_empty() {
-                    None
-                } else {
-                    Some(resolved_inputs)
-                },
-                pos: None,
-                wire_waypoints: None,
+                inputs: resolved_inputs,
             });
         }
     }
@@ -403,13 +395,10 @@ fn expand_instance(
 /// Resolve all inputs of a component, mapping each reference to its flat name.
 fn resolve_input_map(
     context: &str,
-    inputs: Option<&HashMap<String, String>>,
+    inputs: &HashMap<String, String>,
     input_bindings: &HashMap<String, String>,
     internal_name_map: &HashMap<String, String>,
 ) -> Result<HashMap<String, String>, ExpandError> {
-    let Some(inputs) = inputs else {
-        return Ok(HashMap::new());
-    };
     inputs
         .iter()
         .map(|(input_key, input_reference)| {
@@ -445,426 +434,243 @@ fn resolve_reference(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::{AbstractionBuilder, CircuitBuilder};
 
-    fn parse(yaml: &str) -> CircuitDef {
-        serde_yaml::from_str(yaml).unwrap()
-    }
-
-    fn expand_ok(yaml: &str) -> ExpandedCircuit {
-        let def = parse(yaml);
-        expand(&def).unwrap()
-    }
-
-    fn expand_err(yaml: &str) -> ExpandError {
-        let def = parse(yaml);
-        expand(&def).unwrap_err()
+    fn not_abstraction() -> AbstractionDef {
+        AbstractionBuilder::new("not")
+            .inputs(&["x"])
+            .output("out", "gate")
+            .nand("gate", "x", "x")
+            .build()
     }
 
     #[test]
     fn reject_clk_in_abstraction() {
-        let err = expand_err(
-            r#"
-name: test
-steps: 1
-abstractions:
-  - name: bad
-    inputs: []
-    outputs: {}
-    components:
-      - type: clk
-        name: clock
-components: []
-"#,
-        );
+        let bad_abs = AbstractionDef {
+            name: "bad".into(),
+            inputs: vec![],
+            outputs: HashMap::new(),
+            components: vec![ComponentDef {
+                component_type: "clk".into(),
+                name: "clock".into(),
+                init: None,
+                inputs: HashMap::new(),
+            }],
+        };
+        let def = CircuitBuilder::new("test", 1)
+            .abstraction(bad_abs)
+            .build();
+        let err = expand(&def).unwrap_err();
         assert!(matches!(err, ExpandError::ClkInAbstraction(n) if n == "bad"));
     }
 
     #[test]
     fn reject_self_referencing_abstraction() {
-        let err = expand_err(
-            r#"
-name: test
-steps: 1
-abstractions:
-  - name: bad
-    inputs: [x]
-    outputs: { out: sub.out }
-    components:
-      - type: bad
-        name: sub
-        inputs: { x: x }
-components: []
-"#,
-        );
+        let bad_abs = AbstractionBuilder::new("bad")
+            .inputs(&["x"])
+            .output("out", "sub.out")
+            .component("bad", "sub", &[("x", "x")])
+            .build();
+        let def = CircuitBuilder::new("test", 1)
+            .abstraction(bad_abs)
+            .build();
+        let err = expand(&def).unwrap_err();
         assert!(matches!(err, ExpandError::SelfReferencingAbstraction(n) if n == "bad"));
     }
 
     #[test]
     fn reject_circular_abstractions() {
-        let err = expand_err(
-            r#"
-name: test
-steps: 1
-abstractions:
-  - name: a
-    inputs: [x]
-    outputs: { out: sub.out }
-    components:
-      - type: b
-        name: sub
-        inputs: { x: x }
-  - name: b
-    inputs: [x]
-    outputs: { out: sub.out }
-    components:
-      - type: a
-        name: sub
-        inputs: { x: x }
-components: []
-"#,
-        );
+        let abs_a = AbstractionBuilder::new("a")
+            .inputs(&["x"])
+            .output("out", "sub.out")
+            .component("b", "sub", &[("x", "x")])
+            .build();
+        let abs_b = AbstractionBuilder::new("b")
+            .inputs(&["x"])
+            .output("out", "sub.out")
+            .component("a", "sub", &[("x", "x")])
+            .build();
+        let def = CircuitBuilder::new("test", 1)
+            .abstraction(abs_a)
+            .abstraction(abs_b)
+            .build();
+        let err = expand(&def).unwrap_err();
         assert!(matches!(err, ExpandError::CircularAbstractions));
     }
 
     #[test]
     fn reject_duplicate_abstraction_names() {
-        let err = expand_err(
-            r#"
-name: test
-steps: 1
-abstractions:
-  - name: dup
-    inputs: []
-    outputs: {}
-    components: []
-  - name: dup
-    inputs: []
-    outputs: {}
-    components: []
-components: []
-"#,
-        );
+        let abs1 = AbstractionBuilder::new("dup")
+            .inputs(&[])
+            .build();
+        let abs2 = AbstractionBuilder::new("dup")
+            .inputs(&[])
+            .build();
+        let def = CircuitBuilder::new("test", 1)
+            .abstraction(abs1)
+            .abstraction(abs2)
+            .build();
+        let err = expand(&def).unwrap_err();
         assert!(matches!(err, ExpandError::DuplicateAbstraction(n) if n == "dup"));
     }
 
     #[test]
     fn reject_unknown_type() {
-        let err = expand_err(
-            r#"
-name: test
-steps: 1
-abstractions: []
-components:
-  - type: nonexistent
-    name: bad
-    inputs: { x: y }
-"#,
-        );
+        let def = CircuitBuilder::new("test", 1)
+            .component("nonexistent", "bad", &[("x", "y")])
+            .build();
+        let err = expand(&def).unwrap_err();
         assert!(matches!(err, ExpandError::UnknownType { .. }));
     }
 
     #[test]
     fn reject_missing_abstraction_input() {
-        let err = expand_err(
-            r#"
-name: test
-steps: 1
-abstractions:
-  - name: not
-    inputs: [x]
-    outputs: { out: gate }
-    components:
-      - type: nand
-        name: gate
-        inputs: { a: x, b: x }
-components:
-  - type: dff
-    name: a
-  - type: not
-    name: my_not
-    inputs: {}
-"#,
-        );
+        let def = CircuitBuilder::new("test", 1)
+            .abstraction(not_abstraction())
+            .dff("a").done()
+            .component("not", "my_not", &[])
+            .build();
+        let err = expand(&def).unwrap_err();
         assert!(matches!(err, ExpandError::MissingAbstractionInput { .. }));
     }
 
     #[test]
     fn reject_extra_abstraction_input() {
-        let err = expand_err(
-            r#"
-name: test
-steps: 1
-abstractions:
-  - name: not
-    inputs: [x]
-    outputs: { out: gate }
-    components:
-      - type: nand
-        name: gate
-        inputs: { a: x, b: x }
-components:
-  - type: dff
-    name: a
-  - type: not
-    name: my_not
-    inputs: { x: a, y: a }
-"#,
-        );
+        let def = CircuitBuilder::new("test", 1)
+            .abstraction(not_abstraction())
+            .dff("a").done()
+            .component("not", "my_not", &[("x", "a"), ("y", "a")])
+            .build();
+        let err = expand(&def).unwrap_err();
         assert!(matches!(err, ExpandError::ExtraAbstractionInput { .. }));
     }
 
     #[test]
     fn expand_simple_not() {
-        let expanded = expand_ok(
-            r#"
-name: test
-steps: 1
-abstractions:
-  - name: not
-    inputs: [x]
-    outputs: { out: gate }
-    components:
-      - type: nand
-        name: gate
-        inputs: { a: x, b: x }
-components:
-  - type: dff
-    name: a
-    init: true
-  - type: not
-    name: inv
-    inputs: { x: a }
-"#,
-        );
+        let def = CircuitBuilder::new("test", 1)
+            .abstraction(not_abstraction())
+            .dff("a").init(true).done()
+            .component("not", "inv", &[("x", "a")])
+            .build();
+        let expanded = expand(&def).unwrap();
         assert_eq!(expanded.def.components.len(), 2); // dff + expanded nand
         let nand = &expanded.def.components[1];
         assert_eq!(nand.name, "inv/gate");
         assert_eq!(nand.component_type, "nand");
-        let inputs = nand.inputs.as_ref().unwrap();
-        assert_eq!(inputs["a"], "a");
-        assert_eq!(inputs["b"], "a");
+        assert_eq!(nand.inputs["a"], "a");
+        assert_eq!(nand.inputs["b"], "a");
         assert_eq!(expanded.aliases["inv.out"], "inv/gate");
     }
 
     #[test]
     fn expand_nested_and() {
-        let expanded = expand_ok(
-            r#"
-name: test
-steps: 1
-abstractions:
-  - name: not
-    inputs: [x]
-    outputs: { out: gate }
-    components:
-      - type: nand
-        name: gate
-        inputs: { a: x, b: x }
-  - name: and
-    inputs: [a, b]
-    outputs: { out: inv.out }
-    components:
-      - type: nand
-        name: nand_ab
-        inputs: { a: a, b: b }
-      - type: not
-        name: inv
-        inputs: { x: nand_ab }
-components:
-  - type: dff
-    name: x
-    init: true
-  - type: dff
-    name: y
-    init: true
-  - type: and
-    name: my_and
-    inputs: { a: x, b: y }
-"#,
-        );
-        // Should have: dff x, dff y, nand my_and/nand_ab, nand my_and/inv/gate
+        let and_abs = AbstractionBuilder::new("and")
+            .inputs(&["a", "b"])
+            .output("out", "inv.out")
+            .nand("nand_ab", "a", "b")
+            .component("not", "inv", &[("x", "nand_ab")])
+            .build();
+        let def = CircuitBuilder::new("test", 1)
+            .abstraction(not_abstraction())
+            .abstraction(and_abs)
+            .dff("x").init(true).done()
+            .dff("y").init(true).done()
+            .component("and", "my_and", &[("a", "x"), ("b", "y")])
+            .build();
+        let expanded = expand(&def).unwrap();
+        // dff x, dff y, nand my_and/nand_ab, nand my_and/inv/gate
         assert_eq!(expanded.def.components.len(), 4);
 
-        let names: Vec<&str> = expanded
-            .def
-            .components
-            .iter()
-            .map(|c| c.name.as_str())
-            .collect();
+        let names: Vec<&str> = expanded.def.components.iter().map(|c| c.name.as_str()).collect();
         assert!(names.contains(&"my_and/nand_ab"));
         assert!(names.contains(&"my_and/inv/gate"));
-
-        // Check alias resolution
         assert_eq!(expanded.aliases["my_and.out"], "my_and/inv/gate");
     }
 
     #[test]
     fn expand_preserves_init() {
-        let expanded = expand_ok(
-            r#"
-name: test
-steps: 1
-abstractions:
-  - name: reg
-    inputs: [d, clk]
-    outputs: { q: ff }
-    components:
-      - type: dff
-        name: ff
-        init: true
-        inputs: { d: d, clk: clk }
-components:
-  - type: clk
-    name: clock
-  - type: dff
-    name: data
-    init: true
-  - type: reg
-    name: my_reg
-    inputs: { d: data, clk: clock }
-"#,
-        );
-        let flip_flop = expanded
-            .def
-            .components
-            .iter()
-            .find(|c| c.name == "my_reg/ff")
-            .unwrap();
+        let reg_abs = AbstractionBuilder::new("reg")
+            .inputs(&["d", "clk"])
+            .output("q", "ff")
+            .dff("ff").init(true).d("d").clk("clk").done()
+            .build();
+        let def = CircuitBuilder::new("test", 1)
+            .abstraction(reg_abs)
+            .clk("clock")
+            .dff("data").init(true).done()
+            .component("reg", "my_reg", &[("d", "data"), ("clk", "clock")])
+            .build();
+        let expanded = expand(&def).unwrap();
+        let flip_flop = expanded.def.components.iter().find(|c| c.name == "my_reg/ff").unwrap();
         assert_eq!(flip_flop.init, Some(true));
     }
 
     #[test]
     fn no_abstractions_passthrough() {
-        let expanded = expand_ok(
-            r#"
-name: test
-steps: 1
-components:
-  - type: dff
-    name: a
-    init: true
-  - type: nand
-    name: b
-    inputs: { a: a, b: a }
-"#,
-        );
+        let def = CircuitBuilder::new("test", 1)
+            .dff("a").init(true).done()
+            .nand("b", "a", "a")
+            .build();
+        let expanded = expand(&def).unwrap();
         assert_eq!(expanded.def.components.len(), 2);
         assert!(expanded.aliases.is_empty());
     }
 
     #[test]
     fn expand_with_dot_reference_in_top_level() {
-        let expanded = expand_ok(
-            r#"
-name: test
-steps: 1
-abstractions:
-  - name: not
-    inputs: [x]
-    outputs: { out: gate }
-    components:
-      - type: nand
-        name: gate
-        inputs: { a: x, b: x }
-components:
-  - type: dff
-    name: a
-    init: true
-  - type: not
-    name: inv
-    inputs: { x: a }
-  - type: nand
-    name: result
-    inputs: { a: inv.out, b: inv.out }
-"#,
-        );
-        // The "inv.out" reference in result should be resolved to "inv/gate"
-        let result = expanded
-            .def
-            .components
-            .iter()
-            .find(|c| c.name == "result")
-            .unwrap();
-        let inputs = result.inputs.as_ref().unwrap();
-        assert_eq!(inputs["a"], "inv/gate");
-        assert_eq!(inputs["b"], "inv/gate");
+        let def = CircuitBuilder::new("test", 1)
+            .abstraction(not_abstraction())
+            .dff("a").init(true).done()
+            .component("not", "inv", &[("x", "a")])
+            .nand("result", "inv.out", "inv.out")
+            .build();
+        let expanded = expand(&def).unwrap();
+        let result = expanded.def.components.iter().find(|c| c.name == "result").unwrap();
+        assert_eq!(result.inputs["a"], "inv/gate");
+        assert_eq!(result.inputs["b"], "inv/gate");
     }
 
     #[test]
     fn expand_three_levels_deep() {
-        let expanded = expand_ok(
-            r#"
-name: test
-steps: 0
-abstractions:
-  - name: not
-    inputs: [x]
-    outputs: { out: gate }
-    components:
-      - type: nand
-        name: gate
-        inputs: { a: x, b: x }
-  - name: and
-    inputs: [a, b]
-    outputs: { out: inv.out }
-    components:
-      - type: nand
-        name: nab
-        inputs: { a: a, b: b }
-      - type: not
-        name: inv
-        inputs: { x: nab }
-  - name: or
-    inputs: [a, b]
-    outputs: { out: nand_notab }
-    components:
-      - type: not
-        name: na
-        inputs: { x: a }
-      - type: not
-        name: nb
-        inputs: { x: b }
-      - type: nand
-        name: nand_notab
-        inputs: { a: na.out, b: nb.out }
-components:
-  - type: dff
-    name: x
-    init: true
-  - type: dff
-    name: y
-    init: false
-  - type: or
-    name: my_or
-    inputs: { a: x, b: y }
-"#,
-        );
-        // or contains: not na, not nb, nand nand_notab
-        // Each not expands to one nand
-        // So total: dff x, dff y, nand my_or/na/gate, nand my_or/nb/gate, nand my_or/nand_notab
+        let and_abs = AbstractionBuilder::new("and")
+            .inputs(&["a", "b"])
+            .output("out", "inv.out")
+            .nand("nab", "a", "b")
+            .component("not", "inv", &[("x", "nab")])
+            .build();
+        let or_abs = AbstractionBuilder::new("or")
+            .inputs(&["a", "b"])
+            .output("out", "nand_notab")
+            .component("not", "na", &[("x", "a")])
+            .component("not", "nb", &[("x", "b")])
+            .nand("nand_notab", "na.out", "nb.out")
+            .build();
+        let def = CircuitBuilder::new("test", 0)
+            .abstraction(not_abstraction())
+            .abstraction(and_abs)
+            .abstraction(or_abs)
+            .dff("x").init(true).done()
+            .dff("y").init(false).done()
+            .component("or", "my_or", &[("a", "x"), ("b", "y")])
+            .build();
+        let expanded = expand(&def).unwrap();
+        // dff x, dff y, nand my_or/na/gate, nand my_or/nb/gate, nand my_or/nand_notab
         assert_eq!(expanded.def.components.len(), 5);
         assert_eq!(expanded.aliases["my_or.out"], "my_or/nand_notab");
     }
 
     #[test]
     fn abstraction_with_no_inputs() {
-        let expanded = expand_ok(
-            r#"
-name: test
-steps: 0
-abstractions:
-  - name: const_one
-    inputs: []
-    outputs: { out: val }
-    components:
-      - type: dff
-        name: val
-        init: true
-components:
-  - type: const_one
-    name: one
-"#,
-        );
+        let const_one = AbstractionBuilder::new("const_one")
+            .inputs(&[])
+            .output("out", "val")
+            .dff("val").init(true).done()
+            .build();
+        let def = CircuitBuilder::new("test", 0)
+            .abstraction(const_one)
+            .component("const_one", "one", &[])
+            .build();
+        let expanded = expand(&def).unwrap();
         assert_eq!(expanded.def.components.len(), 1);
         assert_eq!(expanded.def.components[0].name, "one/val");
         assert_eq!(expanded.aliases["one.out"], "one/val");

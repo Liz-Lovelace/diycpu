@@ -4,12 +4,16 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-gui = ["dep:eframe"]
+gui = ["dep:femtovg", "dep:glutin", "dep:glutin-winit", "dep:winit", "dep:raw-window-handle"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-eframe = { version = "0.33", optional = true, default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
+femtovg = { version = "0.9", optional = true }
+glutin = { version = "0.32", optional = true }
+glutin-winit = { version = "0.5", optional = true }
+winit = { version = "0.30", optional = true }
+raw-window-handle = { version = "0.6", optional = true }
 
 [[bin]]
 name = "diycpu"

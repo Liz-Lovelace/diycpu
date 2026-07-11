@@ -35,10 +35,10 @@ pub struct ProjectAbstraction {
     pub name: String,
     pub inputs: Vec<String>,
     pub outputs: HashMap<String, String>,
-    /// Width for instances of this abstraction on the canvas.
+    /// Width for instances of this abstraction on the canvas, in grid units.
     #[serde(default = "default_width")]
     pub width: f32,
-    /// Height for instances of this abstraction on the canvas.
+    /// Height for instances of this abstraction on the canvas, in grid units.
     #[serde(default = "default_height")]
     pub height: f32,
     /// The sub-circuit components.
@@ -49,11 +49,11 @@ pub struct ProjectAbstraction {
 }
 
 fn default_width() -> f32 {
-    140.0
+    4.0
 }
 
 fn default_height() -> f32 {
-    70.0
+    2.0
 }
 
 /// Identifies a specific port on a specific component.

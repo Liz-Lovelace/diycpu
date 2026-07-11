@@ -1,9 +1,14 @@
-mod demo;
-mod microchip;
-mod wire;
-mod workbench;
+mod app;
+mod camera;
+mod render;
+mod sim;
+mod theme;
+mod ui;
 
-use femtovg::{renderer::OpenGl, Canvas, Color};
+use std::path::PathBuf;
+use std::time::Instant;
+
+use femtovg::{renderer::OpenGl, Canvas};
 use glutin::{
     config::ConfigTemplateBuilder,
     context::{ContextApi, ContextAttributesBuilder, PossiblyCurrentContext},
@@ -16,26 +21,71 @@ use raw_window_handle::HasWindowHandle;
 use winit::{
     application::ApplicationHandler,
     dpi::PhysicalSize,
-    event::WindowEvent,
+    event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent},
     event_loop::{ActiveEventLoop, EventLoop},
-    window::{Window, WindowAttributes},
+    keyboard::{Key, NamedKey},
+    window::{CursorIcon, Window, WindowAttributes},
 };
 
-use workbench::Workbench;
+use app::{App, Gesture, PanOrCancel};
+use diycpu::layout::Hit;
+use render::Renderer;
+use ui::{ui_layout, ButtonId};
 
-struct App {
+struct CliArgs {
+    project: Option<PathBuf>,
+    screenshot: Option<PathBuf>,
+    run_steps: Option<usize>,
+    sheet: Option<String>,
+    size: (u32, u32),
+}
+
+fn parse_args() -> CliArgs {
+    let mut args = CliArgs {
+        project: None,
+        screenshot: None,
+        run_steps: None,
+        sheet: None,
+        size: (1280, 800),
+    };
+    let mut it = std::env::args().skip(1);
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--screenshot" => args.screenshot = it.next().map(PathBuf::from),
+            "--run" => args.run_steps = it.next().and_then(|s| s.parse().ok()),
+            "--sheet" => args.sheet = it.next(),
+            "--size" => {
+                if let Some(s) = it.next() {
+                    if let Some((w, h)) = s.split_once('x') {
+                        if let (Ok(w), Ok(h)) = (w.parse(), h.parse()) {
+                            args.size = (w, h);
+                        }
+                    }
+                }
+            }
+            other if !other.starts_with("--") => args.project = Some(PathBuf::from(other)),
+            other => eprintln!("Unknown flag: {other}"),
+        }
+    }
+    args
+}
+
+struct Shell {
     context: PossiblyCurrentContext,
     surface: Surface<WindowSurface>,
     window: Window,
     canvas: Canvas<OpenGl>,
-    workbench: Workbench,
+    renderer: Renderer,
+    app: App,
+    screenshot: Option<PathBuf>,
+    last_press: Option<(Instant, [f32; 2])>,
 }
 
-impl App {
-    fn new(event_loop: &ActiveEventLoop) -> Self {
+impl Shell {
+    fn new(event_loop: &ActiveEventLoop, args: &CliArgs) -> Self {
         let window_attrs = WindowAttributes::default()
             .with_title("diycpu")
-            .with_inner_size(PhysicalSize::new(1280, 720));
+            .with_inner_size(PhysicalSize::new(args.size.0, args.size.1));
 
         let config_template = ConfigTemplateBuilder::new()
             .with_alpha_size(8)
@@ -45,13 +95,7 @@ impl App {
             .with_window_attributes(Some(window_attrs))
             .build(event_loop, config_template, |configs| {
                 configs
-                    .reduce(|a, b| {
-                        if a.num_samples() > b.num_samples() {
-                            a
-                        } else {
-                            b
-                        }
-                    })
+                    .reduce(|a, b| if a.num_samples() > b.num_samples() { a } else { b })
                     .unwrap()
             })
             .unwrap();
@@ -69,8 +113,8 @@ impl App {
         let size = window.inner_size();
         let surface_attrs = SurfaceAttributesBuilder::<WindowSurface>::new().build(
             window.window_handle().unwrap().as_raw(),
-            size.width.try_into().unwrap(),
-            size.height.try_into().unwrap(),
+            size.width.max(1).try_into().unwrap(),
+            size.height.max(1).try_into().unwrap(),
         );
 
         let surface = unsafe {
@@ -81,51 +125,180 @@ impl App {
 
         let context = gl_context.make_current(&surface).unwrap();
 
-        let renderer =
+        let gl_renderer =
             unsafe { OpenGl::new_from_function_cstr(|s| gl_display.get_proc_address(s).cast()) }
                 .unwrap();
 
-        let canvas = Canvas::new(renderer).unwrap();
+        let mut canvas = Canvas::new(gl_renderer).unwrap();
+        let renderer = Renderer::new(&mut canvas);
 
-        App {
+        let mut app = App::new(args.project.clone());
+        app.window_size = [size.width as f32, size.height as f32];
+        if let Some(sheet_name) = &args.sheet {
+            if let Some(i) = app
+                .editor
+                .project
+                .abstractions
+                .iter()
+                .position(|a| &a.name == sheet_name)
+            {
+                let _ = app
+                    .editor
+                    .open_sheet(diycpu::editor::SheetRef::Abstraction(i));
+            }
+        }
+        if let Some(steps) = args.run_steps {
+            app.action_run_toggle();
+            for _ in 0..steps {
+                app.action_step_forward();
+            }
+        }
+
+        Shell {
             context,
             surface,
             window,
             canvas,
-            workbench: Workbench::new(),
+            renderer,
+            app,
+            screenshot: args.screenshot.clone(),
+            last_press: None,
         }
     }
 
-    fn render(&mut self) {
+    fn render(&mut self, event_loop: &ActiveEventLoop) {
         let size = self.window.inner_size();
-        let dpi = self.window.scale_factor() as f32;
+        self.app.window_size = [size.width as f32, size.height as f32];
+        if self.app.pending_fit {
+            self.app.fit_view();
+            self.app.pending_fit = false;
+        }
 
-        self.canvas.set_size(size.width, size.height, dpi);
-        self.canvas.clear_rect(
-            0,
-            0,
-            size.width,
-            size.height,
-            Color::rgbf(0.1, 0.1, 0.12),
-        );
-
-        self.workbench.draw_grid(&mut self.canvas, size.width, size.height);
-        demo::draw_demo(&mut self.canvas, &self.workbench);
-
+        self.canvas
+            .set_size(size.width, size.height, self.window.scale_factor() as f32);
+        self.app.recompute_hover();
+        let ui = ui_layout(&self.app);
+        self.renderer.draw(&mut self.canvas, &self.app, &ui);
         self.canvas.flush();
+
+        if let Some(path) = self.screenshot.take() {
+            match self.save_screenshot(&path) {
+                Ok(()) => println!("Wrote {}", path.display()),
+                Err(e) => {
+                    eprintln!("Screenshot failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+            event_loop.exit();
+            return;
+        }
+
         self.surface.swap_buffers(&self.context).unwrap();
+    }
+
+    fn save_screenshot(&mut self, path: &std::path::Path) -> Result<(), String> {
+        let img = self.canvas.screenshot().map_err(|e| format!("{e:?}"))?;
+        let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
+        let mut encoder = png::Encoder::new(
+            std::io::BufWriter::new(file),
+            img.width() as u32,
+            img.height() as u32,
+        );
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
+        let mut data = Vec::with_capacity(img.width() * img.height() * 4);
+        for row in img.rows() {
+            for px in row {
+                data.extend_from_slice(&[px.r, px.g, px.b, px.a]);
+            }
+        }
+        writer.write_image_data(&data).map_err(|e| e.to_string())
+    }
+
+    fn update_cursor_icon(&self) {
+        let icon = match &self.app.gesture {
+            Gesture::Panning { .. } => CursorIcon::Grabbing,
+            Gesture::Placing { .. } | Gesture::DrawingWire { .. } => CursorIcon::Crosshair,
+            Gesture::DraggingComponents { .. } => CursorIcon::Move,
+            _ => match self.app.hover {
+                Hit::Port { .. } => CursorIcon::Crosshair,
+                Hit::Component { .. } => CursorIcon::Pointer,
+                _ => CursorIcon::Default,
+            },
+        };
+        self.window.set_cursor(icon);
+    }
+
+    /// Left press: chrome first, then canvas (with double-click detection).
+    fn left_pressed(&mut self) {
+        let cursor = self.app.cursor;
+        let ui = ui_layout(&self.app);
+
+        for button in &ui.buttons {
+            if button.rect.contains(cursor) {
+                if !button.enabled {
+                    return;
+                }
+                match button.id {
+                    ButtonId::RunToggle => self.app.action_run_toggle(),
+                    ButtonId::Rewind => self.app.action_rewind(),
+                    ButtonId::StepBack => self.app.action_step_back(),
+                    ButtonId::StepForward => self.app.action_step_forward(),
+                    ButtonId::Fit => self.app.fit_view(),
+                    ButtonId::Save => self.app.save(),
+                    ButtonId::NewAbstraction => self.app.action_new_abstraction(),
+                    ButtonId::AddInputPin => {
+                        self.app.action_add_pin(diycpu::layout::PortKind::Input)
+                    }
+                    ButtonId::AddOutputPin => {
+                        self.app.action_add_pin(diycpu::layout::PortKind::Output)
+                    }
+                    ButtonId::BackToTop => self.app.action_back_to_top(),
+                }
+                return;
+            }
+        }
+
+        for item in &ui.palette_items {
+            if item.rect.contains(cursor) {
+                if item.enabled {
+                    self.app.palette_clicked(&item.type_name);
+                }
+                return;
+            }
+        }
+
+        // Double-click detection (only meaningful on the canvas).
+        let now = Instant::now();
+        let is_double = self
+            .last_press
+            .map(|(t, p)| {
+                now.duration_since(t).as_millis() < 350
+                    && (p[0] - cursor[0]).abs() < 6.0
+                    && (p[1] - cursor[1]).abs() < 6.0
+            })
+            .unwrap_or(false);
+
+        if is_double && matches!(self.app.gesture, Gesture::Idle) {
+            self.last_press = None;
+            self.app.double_clicked();
+        } else {
+            self.last_press = Some((now, cursor));
+            self.app.left_pressed();
+        }
     }
 }
 
 enum AppState {
-    Uninitialized,
-    Running(App),
+    Uninitialized(CliArgs),
+    Running(Shell),
 }
 
 impl ApplicationHandler for AppState {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if matches!(self, AppState::Uninitialized) {
-            *self = AppState::Running(App::new(event_loop));
+        if let AppState::Uninitialized(args) = self {
+            *self = AppState::Running(Shell::new(event_loop, args));
         }
     }
 
@@ -135,21 +308,100 @@ impl ApplicationHandler for AppState {
         _window_id: winit::window::WindowId,
         event: WindowEvent,
     ) {
-        let AppState::Running(app) = self else {
+        let AppState::Running(shell) = self else {
             return;
         };
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
-            WindowEvent::Resized(_) => app.window.request_redraw(),
-            WindowEvent::RedrawRequested => app.render(),
+            WindowEvent::Resized(size) => {
+                if size.width > 0 && size.height > 0 {
+                    self_surface_resize(shell, size);
+                }
+                shell.window.request_redraw();
+            }
+            WindowEvent::RedrawRequested => shell.render(event_loop),
+            WindowEvent::CursorMoved { position, .. } => {
+                shell
+                    .app
+                    .mouse_moved([position.x as f32, position.y as f32]);
+                shell.update_cursor_icon();
+                shell.window.request_redraw();
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                match (button, state) {
+                    (MouseButton::Left, ElementState::Pressed) => shell.left_pressed(),
+                    (MouseButton::Left, ElementState::Released) => shell.app.left_released(),
+                    (MouseButton::Middle | MouseButton::Right, ElementState::Pressed) => {
+                        match shell.app.middle_or_right_pressed() {
+                            PanOrCancel::Panning | PanOrCancel::Cancelled => {}
+                        }
+                    }
+                    (MouseButton::Middle | MouseButton::Right, ElementState::Released) => {
+                        shell.app.pan_released()
+                    }
+                    _ => {}
+                }
+                shell.update_cursor_icon();
+                shell.window.request_redraw();
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let amount = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y * 120.0,
+                    MouseScrollDelta::PixelDelta(p) => p.y as f32,
+                };
+                shell.app.scrolled(amount);
+                shell.window.request_redraw();
+            }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                shell.app.ctrl =
+                    modifiers.state().control_key() || modifiers.state().super_key();
+                shell.app.shift = modifiers.state().shift_key();
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if event.state != ElementState::Pressed {
+                    return;
+                }
+                let key = match &event.logical_key {
+                    Key::Named(NamedKey::Escape) => Some(app::KeyInput::Escape),
+                    Key::Named(NamedKey::Delete) => Some(app::KeyInput::Delete),
+                    Key::Named(NamedKey::Backspace) => Some(app::KeyInput::Backspace),
+                    Key::Named(NamedKey::Enter) => Some(app::KeyInput::Enter),
+                    Key::Named(NamedKey::ArrowRight) => Some(app::KeyInput::ArrowRight),
+                    Key::Named(NamedKey::ArrowLeft) => Some(app::KeyInput::ArrowLeft),
+                    Key::Named(NamedKey::Home) => Some(app::KeyInput::Home),
+                    Key::Named(NamedKey::Space) if !event.repeat => {
+                        Some(app::KeyInput::Space)
+                    }
+                    Key::Character(c) => Some(app::KeyInput::Char(c.as_str())),
+                    _ => None,
+                };
+                if let Some(key) = key {
+                    shell.app.handle_key(key);
+                }
+                shell.update_cursor_icon();
+                shell.window.request_redraw();
+            }
+            WindowEvent::Focused(false) => {
+                shell.app.focus_lost();
+                shell.window.request_redraw();
+            }
             _ => {}
         }
     }
 }
 
+fn self_surface_resize(shell: &Shell, size: PhysicalSize<u32>) {
+    shell.surface.resize(
+        &shell.context,
+        size.width.try_into().unwrap(),
+        size.height.try_into().unwrap(),
+    );
+}
+
 fn main() {
+    let args = parse_args();
     let event_loop = EventLoop::new().unwrap();
-    let mut app = AppState::Uninitialized;
-    event_loop.run_app(&mut app).unwrap();
+    let mut state = AppState::Uninitialized(args);
+    event_loop.run_app(&mut state).unwrap();
 }

@@ -1,8 +1,0 @@
-WORKBENCH
-The main working area of our application should be a "workbench", which is a square grid that is an infinite canvas on which we can place things. Everything we place will have whole number coordinates based on the workbench grid.
-
-VISUAL ABSTRACTIONS
-These are functions we can call to conveniently draw an element on the canvas. They abstract away the way things look, and don't contain state - they take parameters as input, and simply draw something where the caller wants it, and with what variants and data the caller wants.
-
-- microchip should draw a black-gray rectangle with parameterized width and height (specified as always in terms of workbench grid units, not pixels)
-- wire should draw a line from point `start` to `end` with little arrows on it that show its direction. It should also have an energized parameter which is true/false, which determines if it's yellow or gray

@@ -2,9 +2,9 @@
   "name": "toggle-flip-flop",
   "steps": 10,
   "components": [
-    {"id": "clk", "type": "clk", "pos": [0, 0]},
-    {"id": "state", "type": "dff", "init": false, "pos": [200, 0]},
-    {"id": "not_state", "type": "nand", "pos": [400, 0]}
+    {"id": "clk", "type": "clk", "pos": [0, 5]},
+    {"id": "state", "type": "dff", "init": false, "pos": [7, 2]},
+    {"id": "not_state", "type": "nand", "pos": [15, 2]}
   ],
   "wire_nets": [
     {
@@ -32,7 +32,7 @@
         {"component_id": "not_state", "port_name": "a"},
         {"component_id": "not_state", "port_name": "b"}
       ],
-      "junctions": [{"id": "j1", "pos": [300, 50]}],
+      "junctions": [{"id": "j1", "pos": [12.5, 3]}],
       "segments": [
         {"from": {"kind": "Port", "component_id": "state", "port_name": "out"},
          "to": {"kind": "Junction", "junction_id": "j1"}},

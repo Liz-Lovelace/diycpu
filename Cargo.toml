@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-gui = ["dep:femtovg", "dep:glutin", "dep:glutin-winit", "dep:winit", "dep:raw-window-handle"]
+gui = ["dep:femtovg", "dep:glutin", "dep:glutin-winit", "dep:winit", "dep:raw-window-handle", "dep:png"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -14,6 +14,7 @@ glutin = { version = "0.32", optional = true }
 glutin-winit = { version = "0.5", optional = true }
 winit = { version = "0.30", optional = true }
 raw-window-handle = { version = "0.6", optional = true }
+png = { version = "0.17", optional = true }
 
 [[bin]]
 name = "diycpu"

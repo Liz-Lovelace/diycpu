@@ -6,10 +6,10 @@
       "name": "not",
       "inputs": ["x"],
       "outputs": {"out": "gate"},
-      "width": 140,
-      "height": 70,
+      "width": 4,
+      "height": 2,
       "components": [
-        {"id": "gate", "type": "nand", "pos": [50, 30]}
+        {"id": "gate", "type": "nand", "pos": [6, 2]}
       ],
       "wire_nets": [
         {
@@ -26,13 +26,13 @@
       "name": "xor",
       "inputs": ["a", "b"],
       "outputs": {"out": "result"},
-      "width": 140,
-      "height": 90,
+      "width": 4,
+      "height": 2,
       "components": [
-        {"id": "nab", "type": "nand", "pos": [50, 30]},
-        {"id": "na_nab", "type": "nand", "pos": [150, 10]},
-        {"id": "nb_nab", "type": "nand", "pos": [150, 50]},
-        {"id": "result", "type": "nand", "pos": [250, 30]}
+        {"id": "nab", "type": "nand", "pos": [4, 3]},
+        {"id": "na_nab", "type": "nand", "pos": [10, 0]},
+        {"id": "nb_nab", "type": "nand", "pos": [10, 6]},
+        {"id": "result", "type": "nand", "pos": [16, 3]}
       ],
       "wire_nets": [
         {
@@ -73,11 +73,11 @@
     }
   ],
   "components": [
-    {"id": "clk", "type": "clk", "pos": [0, 100]},
-    {"id": "bit0", "type": "dff", "init": false, "pos": [200, 0]},
-    {"id": "bit1", "type": "dff", "init": false, "pos": [200, 200]},
-    {"id": "n0", "type": "not", "pos": [400, 0]},
-    {"id": "x01", "type": "xor", "pos": [400, 200]}
+    {"id": "clk", "type": "clk", "pos": [0, 4]},
+    {"id": "bit0", "type": "dff", "init": false, "pos": [6, 0]},
+    {"id": "bit1", "type": "dff", "init": false, "pos": [6, 7]},
+    {"id": "n0", "type": "not", "pos": [13, 0]},
+    {"id": "x01", "type": "xor", "pos": [13, 7]}
   ],
   "wire_nets": [
     {

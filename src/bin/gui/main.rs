@@ -70,6 +70,9 @@ fn parse_args() -> CliArgs {
     args
 }
 
+/// Wall-clock time between clock steps while the simulation plays.
+const PLAY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(300);
+
 struct Shell {
     context: PossiblyCurrentContext,
     surface: Surface<WindowSurface>,
@@ -79,6 +82,7 @@ struct Shell {
     app: App,
     screenshot: Option<PathBuf>,
     last_press: Option<(Instant, [f32; 2])>,
+    next_play_tick: Instant,
 }
 
 impl Shell {
@@ -163,6 +167,7 @@ impl Shell {
             app,
             screenshot: args.screenshot.clone(),
             last_press: None,
+            next_play_tick: Instant::now(),
         }
     }
 
@@ -174,8 +179,10 @@ impl Shell {
             self.app.pending_fit = false;
         }
 
-        self.canvas
-            .set_size(size.width, size.height, self.window.scale_factor() as f32);
+        // dpi is fixed at 1.0: we draw in physical pixels ourselves, and a
+        // higher value would make femtovg rasterize glyphs oversized and
+        // scale them back down — blurry text on HiDPI screens.
+        self.canvas.set_size(size.width, size.height, 1.0);
         self.app.recompute_hover();
         let ui = ui_layout(&self.app);
         self.renderer.draw(&mut self.canvas, &self.app, &ui);
@@ -221,8 +228,10 @@ impl Shell {
             Gesture::Panning { .. } => CursorIcon::Grabbing,
             Gesture::Placing { .. } | Gesture::DrawingWire { .. } => CursorIcon::Crosshair,
             Gesture::DraggingComponents { .. } => CursorIcon::Move,
+            Gesture::DraggingJunction { .. } => CursorIcon::Grabbing,
             _ => match self.app.hover {
                 Hit::Port { .. } => CursorIcon::Crosshair,
+                Hit::Junction { .. } => CursorIcon::Grab,
                 Hit::Component { .. } => CursorIcon::Pointer,
                 _ => CursorIcon::Default,
             },
@@ -242,6 +251,7 @@ impl Shell {
                 }
                 match button.id {
                     ButtonId::RunToggle => self.app.action_run_toggle(),
+                    ButtonId::PlayPause => self.app.action_play_toggle(),
                     ButtonId::Rewind => self.app.action_rewind(),
                     ButtonId::StepBack => self.app.action_step_back(),
                     ButtonId::StepForward => self.app.action_step_forward(),
@@ -300,6 +310,31 @@ impl ApplicationHandler for AppState {
         if let AppState::Uninitialized(args) = self {
             *self = AppState::Running(Shell::new(event_loop, args));
         }
+    }
+
+    fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: winit::event::StartCause) {
+        // The autoplay timer fired: advance the clock and schedule the next.
+        if matches!(cause, winit::event::StartCause::ResumeTimeReached { .. }) {
+            if let AppState::Running(shell) = self {
+                if shell.app.playing {
+                    shell.app.play_tick();
+                    shell.next_play_tick = Instant::now() + PLAY_INTERVAL;
+                    shell.window.request_redraw();
+                }
+            }
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if let AppState::Running(shell) = self {
+            if shell.app.playing {
+                event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
+                    shell.next_play_tick,
+                ));
+                return;
+            }
+        }
+        event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
     }
 
     fn window_event(

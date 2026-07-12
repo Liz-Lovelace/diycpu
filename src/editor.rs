@@ -44,6 +44,13 @@ pub enum EditError {
     NameTaken(String),
     NotAnAbstractionSheet,
     PassthroughNotAllowed,
+    UnknownJunction(String),
+    TwoSources(String),
+    InputDoublyWired(String),
+    /// The requested wire already exists / connects a point to itself —
+    /// harmless, callers usually ignore it silently.
+    NoopWire,
+    OutputPinNeedsSource,
 }
 
 impl fmt::Display for EditError {
@@ -76,6 +83,17 @@ impl fmt::Display for EditError {
             }
             Self::PassthroughNotAllowed => {
                 write!(f, "Route inputs to outputs through at least one component")
+            }
+            Self::UnknownJunction(id) => write!(f, "That wire node ({id}) no longer exists"),
+            Self::TwoSources(existing) => {
+                write!(f, "This wire is already driven by {existing}")
+            }
+            Self::InputDoublyWired(port) => {
+                write!(f, "{port} is already connected to this wire")
+            }
+            Self::NoopWire => write!(f, "Those points are already connected"),
+            Self::OutputPinNeedsSource => {
+                write!(f, "This wire has no output driving it yet — connect one first")
             }
         }
     }
@@ -303,6 +321,7 @@ impl Editor {
         }
         let ids = ids.to_vec();
         self.mutate(move |project, sheet| {
+            let ctx = KindCtx::new(project, sheet)?;
             let (components, wire_nets) =
                 sheet_mut(project, sheet).ok_or(EditError::BadSheet)?;
             for id in &ids {
@@ -313,23 +332,14 @@ impl Editor {
             components.retain(|c| !ids.contains(&c.id));
 
             for net in wire_nets.iter_mut() {
-                if net
-                    .source
-                    .as_ref()
-                    .is_some_and(|s| ids.contains(&s.component_id))
-                {
-                    net.source = None;
-                }
-                net.sinks.retain(|s| !ids.contains(&s.component_id));
                 net.segments.retain(|seg| {
                     ![&seg.from, &seg.to].iter().any(|e| match e {
                         Endpoint::Port { component_id, .. } => ids.contains(component_id),
                         Endpoint::Junction { .. } => false,
                     })
                 });
-                prune_net_geometry(net);
             }
-            gc_nets(wire_nets);
+            repair_nets(wire_nets, components, &ctx)?;
 
             // Output pins that pointed at a deleted component become unwired.
             if let SheetRef::Abstraction(i) = sheet {
@@ -349,13 +359,11 @@ impl Editor {
     /// Connect two ports with a wire, optionally bending through `bends`
     /// (grid points, in order from `a` to `b`). One port must be an output
     /// and the other an input, in either argument order. If the input is
-    /// already driven, the old connection is replaced. Fan-out merges into
-    /// the output's existing net.
+    /// already driven, the old connection is replaced.
     ///
-    /// Inside an abstraction sheet, `INPUT:<name>` pseudo-ports (input pins)
-    /// act as outputs, and `OUTPUT:<name>` pseudo-ports (output pins) act as
-    /// inputs — connecting to an output pin sets the abstraction's `outputs`
-    /// map entry rather than creating a net.
+    /// This is a convenience over [`Editor::add_wire`]: the whole path is
+    /// one undo step. Inside an abstraction sheet, `INPUT:<name>` pins act
+    /// as outputs and `OUTPUT:<name>` pins as inputs.
     pub fn connect(
         &mut self,
         a: PortRef,
@@ -364,48 +372,14 @@ impl Editor {
     ) -> Result<(), EditError> {
         let bends = bends.to_vec();
         self.mutate(move |project, sheet| {
+            let ctx = KindCtx::new(project, sheet)?;
             let (components, _) = sheet_of(project, sheet).ok_or(EditError::BadSheet)?;
-            let interface = match sheet {
-                SheetRef::Abstraction(i) => project.abstractions.get(i),
-                SheetRef::Top => None,
-            };
 
-            let kind_of = |port: &PortRef| -> Result<PortKind, EditError> {
-                if let Some(name) = port.component_id.strip_prefix(crate::convert::INPUT_PREFIX)
-                {
-                    let def = interface.ok_or(EditError::NotAnAbstractionSheet)?;
-                    return if def.inputs.iter().any(|i| i == name) {
-                        Ok(PortKind::Output) // input pins drive wires
-                    } else {
-                        Err(EditError::UnknownComponent(port.component_id.clone()))
-                    };
-                }
-                if let Some(name) = port.component_id.strip_prefix(layout::OUTPUT_PREFIX) {
-                    let def = interface.ok_or(EditError::NotAnAbstractionSheet)?;
-                    return if def.outputs.contains_key(name) {
-                        Ok(PortKind::Input) // output pins are fed by wires
-                    } else {
-                        Err(EditError::UnknownComponent(port.component_id.clone()))
-                    };
-                }
-                let comp = components
-                    .iter()
-                    .find(|c| c.id == port.component_id)
-                    .ok_or_else(|| EditError::UnknownComponent(port.component_id.clone()))?;
-                layout::type_ports(&project.abstractions, &comp.component_type)
-                    .and_then(|ports| {
-                        ports.into_iter().find(|p| p.name == port.port_name)
-                    })
-                    .map(|p| p.kind)
-                    .ok_or_else(|| {
-                        EditError::UnknownPort(
-                            port.component_id.clone(),
-                            port.port_name.clone(),
-                        )
-                    })
-            };
-
-            let (output, input, bends) = match (kind_of(&a)?, kind_of(&b)?) {
+            // Draw from the output side so bend order matches wire flow.
+            let (from, to, bends) = match (
+                ctx.kind_of(components, &a)?,
+                ctx.kind_of(components, &b)?,
+            ) {
                 (PortKind::Output, PortKind::Input) => (a, b, bends),
                 (PortKind::Input, PortKind::Output) => {
                     let mut rev = bends.clone();
@@ -415,92 +389,99 @@ impl Editor {
                 _ => return Err(EditError::NotAnInputAndOutput),
             };
 
-            // Wiring into an output pin: record the connection in the
-            // abstraction's outputs map. Its wire is drawn derived from that
-            // map, so there is no net (and no stored bends) to maintain.
-            if let Some(pin_name) = input.component_id.strip_prefix(layout::OUTPUT_PREFIX) {
-                if output.component_id.starts_with(crate::convert::INPUT_PREFIX) {
-                    return Err(EditError::PassthroughNotAllowed);
-                }
-                let source_comp = components
-                    .iter()
-                    .find(|c| c.id == output.component_id)
-                    .ok_or_else(|| EditError::UnknownComponent(output.component_id.clone()))?;
-                let target = if crate::types::is_primitive(&source_comp.component_type) {
-                    source_comp.id.clone()
-                } else {
-                    format!("{}.{}", output.component_id, output.port_name)
-                };
-                let pin_name = pin_name.to_string();
-                let SheetRef::Abstraction(i) = sheet else {
-                    return Err(EditError::NotAnAbstractionSheet);
-                };
-                project.abstractions[i].outputs.insert(pin_name, target);
-                return Ok(());
-            }
-
-            let (_, wire_nets) = sheet_mut(project, sheet).ok_or(EditError::BadSheet)?;
-
-            // An input has exactly one driver: replace any existing one.
-            remove_sink(wire_nets, &input);
-
-            // One net per source: merge fan-out into the existing net.
-            let net_index = match wire_nets
-                .iter()
-                .position(|n| n.source.as_ref() == Some(&output))
-            {
-                Some(i) => i,
-                None => {
-                    let id = generate_net_id(wire_nets);
-                    wire_nets.push(WireNet {
-                        id,
-                        source: Some(output.clone()),
-                        sinks: vec![],
-                        junctions: vec![],
-                        segments: vec![],
-                    });
-                    wire_nets.len() - 1
-                }
-            };
-            let net = &mut wire_nets[net_index];
-
-            // Build the visual path: output → bends… → input.
-            let mut previous = Endpoint::Port {
-                component_id: output.component_id.clone(),
-                port_name: output.port_name.clone(),
-            };
+            let mut anchor = WirePoint::Port(from);
             for bend in &bends {
-                let junction_id = generate_junction_id(net);
-                net.junctions.push(Junction {
-                    id: junction_id.clone(),
-                    pos: *bend,
-                });
-                let junction = Endpoint::Junction { junction_id };
-                net.segments.push(crate::project::Segment {
-                    from: previous,
-                    to: junction.clone(),
-                });
-                previous = junction;
+                let attach = attach_wire(project, sheet, &anchor, &WirePoint::New(*bend))?;
+                anchor = WirePoint::Junction {
+                    net_id: attach.net_id,
+                    junction_id: attach
+                        .new_junction
+                        .expect("New points always create a junction"),
+                };
             }
-            net.segments.push(crate::project::Segment {
-                from: previous,
-                to: Endpoint::Port {
-                    component_id: input.component_id.clone(),
-                    port_name: input.port_name.clone(),
-                },
-            });
-
-            net.sinks.push(input);
+            attach_wire(project, sheet, &anchor, &WirePoint::Port(to))?;
             Ok(())
         })
     }
 
-    /// Remove one input's connection (the rest of the net stays).
-    pub fn disconnect_sink(&mut self, sink: PortRef) -> Result<(), EditError> {
+    /// One wire-drawing step: join two points with a straight segment.
+    /// Points can be ports, existing wire nodes, or a new node at a grid
+    /// position. Nets are created, extended and merged as needed; wiring an
+    /// already-connected input replaces its old connection. Each call is one
+    /// undo step, so Ctrl+Z peels wires back click by click.
+    pub fn add_wire(&mut self, from: WirePoint, to: WirePoint) -> Result<WireAttach, EditError> {
+        self.mutate(move |project, sheet| attach_wire(project, sheet, &from, &to))
+    }
+
+    /// Move a wire node to a new grid position.
+    pub fn move_junction(
+        &mut self,
+        net_id: &str,
+        junction_id: &str,
+        pos: [f32; 2],
+    ) -> Result<(), EditError> {
+        {
+            // A no-op move should not spend an undo step.
+            let (_, wire_nets) = self.sheet_data();
+            let current = wire_nets
+                .iter()
+                .find(|n| n.id == net_id)
+                .and_then(|n| n.junctions.iter().find(|j| j.id == junction_id))
+                .map(|j| j.pos);
+            if current == Some(pos) {
+                return Ok(());
+            }
+        }
+        let net_id = net_id.to_string();
+        let junction_id = junction_id.to_string();
         self.mutate(move |project, sheet| {
             let (_, wire_nets) = sheet_mut(project, sheet).ok_or(EditError::BadSheet)?;
-            remove_sink(wire_nets, &sink);
-            gc_nets(wire_nets);
+            let junction = wire_nets
+                .iter_mut()
+                .find(|n| n.id == net_id)
+                .and_then(|n| n.junctions.iter_mut().find(|j| j.id == junction_id))
+                .ok_or_else(|| EditError::UnknownJunction(junction_id.clone()))?;
+            junction.pos = pos;
+            Ok(())
+        })
+    }
+
+    /// Delete a wire node together with the segments that met there. If that
+    /// cuts the net into disconnected pieces, each piece becomes its own net.
+    pub fn delete_junction(&mut self, net_id: &str, junction_id: &str) -> Result<(), EditError> {
+        let net_id = net_id.to_string();
+        let junction_id = junction_id.to_string();
+        self.mutate(move |project, sheet| {
+            let ctx = KindCtx::new(project, sheet)?;
+            let (components, wire_nets) =
+                sheet_mut(project, sheet).ok_or(EditError::BadSheet)?;
+            let net = wire_nets
+                .iter_mut()
+                .find(|n| n.id == net_id)
+                .ok_or_else(|| EditError::UnknownJunction(junction_id.clone()))?;
+            if !net.junctions.iter().any(|j| j.id == junction_id) {
+                return Err(EditError::UnknownJunction(junction_id.clone()));
+            }
+            net.junctions.retain(|j| j.id != junction_id);
+            net.segments.retain(|seg| {
+                ![&seg.from, &seg.to].iter().any(|e| {
+                    matches!(e, Endpoint::Junction { junction_id: id } if *id == junction_id)
+                })
+            });
+            repair_nets(wire_nets, components, &ctx)?;
+            Ok(())
+        })
+    }
+
+    /// Remove one input's connection (the rest of the net stays, including
+    /// any nodes that now dangle as reusable stubs).
+    pub fn disconnect_sink(&mut self, sink: PortRef) -> Result<(), EditError> {
+        self.mutate(move |project, sheet| {
+            let ctx = KindCtx::new(project, sheet)?;
+            let (components, wire_nets) =
+                sheet_mut(project, sheet).ok_or(EditError::BadSheet)?;
+            detach_port(wire_nets, &sink);
+            repair_nets(wire_nets, components, &ctx)?;
             Ok(())
         })
     }
@@ -655,6 +636,7 @@ impl Editor {
             let SheetRef::Abstraction(i) = sheet else {
                 return Err(EditError::NotAnAbstractionSheet);
             };
+            let abstractions_snapshot = project.abstractions.clone();
             let def = project.abstractions.get_mut(i).ok_or(EditError::BadSheet)?;
             match kind {
                 PortKind::Input => {
@@ -667,22 +649,20 @@ impl Editor {
                     def.inputs.retain(|x| x != &name);
                     let pseudo_id = format!("{}{name}", crate::convert::INPUT_PREFIX);
                     for net in def.wire_nets.iter_mut() {
-                        if net
-                            .source
-                            .as_ref()
-                            .is_some_and(|s| s.component_id == pseudo_id)
-                        {
-                            net.source = None;
-                        }
                         net.segments.retain(|seg| {
                             ![&seg.from, &seg.to].iter().any(|e| {
                                 matches!(e, Endpoint::Port { component_id, .. }
                                     if *component_id == pseudo_id)
                             })
                         });
-                        prune_net_geometry(net);
                     }
-                    gc_nets(&mut def.wire_nets);
+                    let ctx = KindCtx {
+                        abstractions: abstractions_snapshot,
+                        interface_inputs: Some(def.inputs.clone()),
+                        interface_outputs: Some(def.outputs.keys().cloned().collect()),
+                    };
+                    let components = def.components.clone();
+                    repair_nets(&mut def.wire_nets, &components, &ctx)?;
                 }
                 PortKind::Output => {
                     if def.outputs.remove(&name).is_none() {
@@ -789,64 +769,555 @@ fn generate_junction_id(net: &WireNet) -> String {
     unreachable!()
 }
 
-// ── Net surgery helpers ──────────────────────────────────────────────────────
+// ── The wire graph model ─────────────────────────────────────────────────────
+//
+// A net's SEGMENTS are the truth: a net is one connected graph of port
+// endpoints and junctions ("nodes"). The logical `source`/`sinks` fields the
+// backend reads are derived from the segment endpoints by `sync_net_logic`
+// after every mutation. Wires behave like placed objects — stubs and
+// unfinished branches are legitimate document state, not junk.
 
-/// Remove `sink` from whichever net drives it, along with the visual path
-/// that led to it. Nets left without sinks are handled by `gc_nets`.
-fn remove_sink(wire_nets: &mut [WireNet], sink: &PortRef) {
-    for net in wire_nets.iter_mut() {
-        if !net.sinks.contains(sink) {
-            continue;
+/// A point a wire-drawing step can start or end on.
+#[derive(Debug, Clone, PartialEq)]
+pub enum WirePoint {
+    Port(PortRef),
+    Junction {
+        net_id: String,
+        junction_id: String,
+    },
+    /// Create a new node at this grid position.
+    New([f32; 2]),
+}
+
+/// What an [`Editor::add_wire`] step produced.
+#[derive(Debug, Clone)]
+pub struct WireAttach {
+    /// The net the segment landed in. Empty for output-pin connections
+    /// (those live in the abstraction's outputs map, not in a net).
+    pub net_id: String,
+    /// The node created for a `WirePoint::New` target.
+    pub new_junction: Option<String>,
+}
+
+/// Port-kind resolution context, captured up front so operations can hold
+/// mutable borrows of the sheet while classifying ports.
+struct KindCtx {
+    abstractions: Vec<crate::project::ProjectAbstraction>,
+    interface_inputs: Option<Vec<String>>,
+    interface_outputs: Option<Vec<String>>,
+}
+
+impl KindCtx {
+    fn new(project: &Project, sheet: SheetRef) -> Result<Self, EditError> {
+        let (interface_inputs, interface_outputs) = match sheet {
+            SheetRef::Top => (None, None),
+            SheetRef::Abstraction(i) => {
+                let def = project.abstractions.get(i).ok_or(EditError::BadSheet)?;
+                (
+                    Some(def.inputs.clone()),
+                    Some(def.outputs.keys().cloned().collect()),
+                )
+            }
+        };
+        Ok(KindCtx {
+            abstractions: project.abstractions.clone(),
+            interface_inputs,
+            interface_outputs,
+        })
+    }
+
+    /// Wire-direction kind of a port, including interface pseudo-ports.
+    fn kind_of(
+        &self,
+        components: &[ProjectComponent],
+        port: &PortRef,
+    ) -> Result<PortKind, EditError> {
+        if let Some(name) = port.component_id.strip_prefix(crate::convert::INPUT_PREFIX) {
+            let inputs = self
+                .interface_inputs
+                .as_ref()
+                .ok_or(EditError::NotAnAbstractionSheet)?;
+            return if inputs.iter().any(|i| i == name) {
+                Ok(PortKind::Output) // input pins drive wires
+            } else {
+                Err(EditError::UnknownComponent(port.component_id.clone()))
+            };
         }
-        net.sinks.retain(|s| s != sink);
-        net.segments.retain(|seg| {
-            ![&seg.from, &seg.to].iter().any(|e| {
-                matches!(e, Endpoint::Port { component_id, port_name }
-                    if *component_id == sink.component_id && *port_name == sink.port_name)
+        if let Some(name) = port.component_id.strip_prefix(layout::OUTPUT_PREFIX) {
+            let outputs = self
+                .interface_outputs
+                .as_ref()
+                .ok_or(EditError::NotAnAbstractionSheet)?;
+            return if outputs.iter().any(|o| o == name) {
+                Ok(PortKind::Input) // output pins are fed by wires
+            } else {
+                Err(EditError::UnknownComponent(port.component_id.clone()))
+            };
+        }
+        let comp = components
+            .iter()
+            .find(|c| c.id == port.component_id)
+            .ok_or_else(|| EditError::UnknownComponent(port.component_id.clone()))?;
+        layout::type_ports(&self.abstractions, &comp.component_type)
+            .and_then(|ports| ports.into_iter().find(|p| p.name == port.port_name))
+            .map(|p| p.kind)
+            .ok_or_else(|| {
+                EditError::UnknownPort(port.component_id.clone(), port.port_name.clone())
             })
-        });
-        prune_net_geometry(net);
     }
 }
 
-/// Remove dead visual geometry from a net: junctions that dangle (fewer than
-/// two incident segments) are dissolved together with their segments, until
-/// the net's junction graph only contains real through-points and branches.
-fn prune_net_geometry(net: &mut WireNet) {
-    loop {
-        let degree: HashMap<&str, usize> = {
-            let mut d: HashMap<&str, usize> = HashMap::new();
-            for seg in &net.segments {
-                for e in [&seg.from, &seg.to] {
-                    if let Endpoint::Junction { junction_id } = e {
-                        *d.entry(junction_id.as_str()).or_default() += 1;
-                    }
+fn port_endpoint(port: &PortRef) -> Endpoint {
+    Endpoint::Port {
+        component_id: port.component_id.clone(),
+        port_name: port.port_name.clone(),
+    }
+}
+
+fn endpoint_is_port(e: &Endpoint, port: &PortRef) -> bool {
+    matches!(e, Endpoint::Port { component_id, port_name }
+        if *component_id == port.component_id && *port_name == port.port_name)
+}
+
+fn net_touches_port(net: &WireNet, port: &PortRef) -> bool {
+    net.segments
+        .iter()
+        .any(|seg| endpoint_is_port(&seg.from, port) || endpoint_is_port(&seg.to, port))
+}
+
+/// The single wire-drawing step both `add_wire` and `connect` build on.
+fn attach_wire(
+    project: &mut Project,
+    sheet: SheetRef,
+    from: &WirePoint,
+    to: &WirePoint,
+) -> Result<WireAttach, EditError> {
+    let ctx = KindCtx::new(project, sheet)?;
+
+    // Output-pin connections are outputs-map writes, not net edits.
+    let is_output_pin = |wp: &WirePoint| {
+        matches!(wp, WirePoint::Port(p) if p.component_id.starts_with(layout::OUTPUT_PREFIX))
+    };
+    if is_output_pin(from) || is_output_pin(to) {
+        return attach_to_output_pin(project, sheet, &ctx, from, to);
+    }
+
+    if from == to {
+        return Err(EditError::NoopWire);
+    }
+
+    let (components, wire_nets) = sheet_mut(project, sheet).ok_or(EditError::BadSheet)?;
+
+    // If this exact wire already exists, it's a no-op — checked before the
+    // replace rule below can detach and re-add it.
+    let existing_endpoint = |wp: &WirePoint| -> Option<Endpoint> {
+        match wp {
+            WirePoint::Port(p) => Some(port_endpoint(p)),
+            WirePoint::Junction { junction_id, .. } => Some(Endpoint::Junction {
+                junction_id: junction_id.clone(),
+            }),
+            WirePoint::New(_) => None,
+        }
+    };
+    if let (Some(a), Some(b)) = (existing_endpoint(from), existing_endpoint(to)) {
+        let already_there = wire_nets.iter().any(|n| {
+            n.segments
+                .iter()
+                .any(|seg| (seg.from == a && seg.to == b) || (seg.from == b && seg.to == a))
+        });
+        if already_there {
+            return Err(EditError::NoopWire);
+        }
+    }
+
+    // Validate port points and apply the replace rule: wiring an input that
+    // is already connected replaces its old connection.
+    for wp in [from, to] {
+        if let WirePoint::Port(p) = wp {
+            if ctx.kind_of(components, p)? == PortKind::Input
+                && wire_nets.iter().any(|n| net_touches_port(n, p))
+            {
+                detach_port(wire_nets, p);
+            }
+        }
+    }
+
+    // Resolve which existing net each point belongs to.
+    let resolve_net = |wire_nets: &Vec<WireNet>, wp: &WirePoint| -> Result<Option<usize>, EditError> {
+        match wp {
+            WirePoint::Port(p) => Ok(wire_nets.iter().position(|n| net_touches_port(n, p))),
+            WirePoint::Junction {
+                net_id,
+                junction_id,
+            } => {
+                let index = wire_nets
+                    .iter()
+                    .position(|n| {
+                        n.id == *net_id && n.junctions.iter().any(|j| j.id == *junction_id)
+                    })
+                    .ok_or_else(|| EditError::UnknownJunction(junction_id.clone()))?;
+                Ok(Some(index))
+            }
+            WirePoint::New(_) => Ok(None),
+        }
+    };
+
+    let net_from = resolve_net(wire_nets, from)?;
+    let net_to = resolve_net(wire_nets, to)?;
+
+    // Junction ids can be renamed if a merge collides; track that.
+    let mut renames: Vec<(String, String)> = Vec::new();
+    let net_index = match (net_from, net_to) {
+        (Some(a), Some(b)) if a != b => {
+            // Merging two live nets: at most one may be driven.
+            if let (Some(sa), Some(sb)) = (&wire_nets[a].source, &wire_nets[b].source) {
+                if sa != sb {
+                    return Err(EditError::TwoSources(format!(
+                        "{}.{}",
+                        sa.component_id, sa.port_name
+                    )));
                 }
             }
-            d
-        };
-        let dangling: Vec<String> = net
-            .junctions
-            .iter()
-            .filter(|j| degree.get(j.id.as_str()).copied().unwrap_or(0) < 2)
-            .map(|j| j.id.clone())
-            .collect();
-        if dangling.is_empty() {
-            return;
+            let absorbed = wire_nets.remove(b);
+            let a = if b < a { a - 1 } else { a };
+            renames = merge_net(&mut wire_nets[a], absorbed);
+            a
         }
-        net.junctions.retain(|j| !dangling.contains(&j.id));
-        net.segments.retain(|seg| {
-            ![&seg.from, &seg.to].iter().any(|e| {
-                matches!(e, Endpoint::Junction { junction_id } if dangling.contains(junction_id))
-            })
-        });
+        (Some(a), _) => a,
+        (_, Some(b)) => b,
+        (None, None) => {
+            let id = generate_net_id(wire_nets);
+            wire_nets.push(WireNet {
+                id,
+                source: None,
+                sinks: vec![],
+                junctions: vec![],
+                segments: vec![],
+            });
+            wire_nets.len() - 1
+        }
+    };
+
+    let mut new_junction = None;
+    let mut endpoint_of = |wp: &WirePoint, net: &mut WireNet| -> Result<Endpoint, EditError> {
+        match wp {
+            WirePoint::Port(p) => Ok(port_endpoint(p)),
+            WirePoint::Junction { junction_id, .. } => {
+                let id = renames
+                    .iter()
+                    .find(|(old, _)| old == junction_id)
+                    .map(|(_, new)| new.clone())
+                    .unwrap_or_else(|| junction_id.clone());
+                if !net.junctions.iter().any(|j| j.id == id) {
+                    return Err(EditError::UnknownJunction(id));
+                }
+                Ok(Endpoint::Junction { junction_id: id })
+            }
+            WirePoint::New(pos) => {
+                let id = generate_junction_id(net);
+                net.junctions.push(Junction {
+                    id: id.clone(),
+                    pos: *pos,
+                });
+                new_junction = Some(id.clone());
+                Ok(Endpoint::Junction { junction_id: id })
+            }
+        }
+    };
+
+    let net = &mut wire_nets[net_index];
+    let from_ep = endpoint_of(from, net)?;
+    let to_ep = endpoint_of(to, net)?;
+
+    let duplicate = net.segments.iter().any(|seg| {
+        (seg.from == from_ep && seg.to == to_ep) || (seg.from == to_ep && seg.to == from_ep)
+    });
+    if duplicate {
+        return Err(EditError::NoopWire);
+    }
+    net.segments.push(crate::project::Segment {
+        from: from_ep,
+        to: to_ep,
+    });
+
+    let net_id = net.id.clone();
+    // Re-derive logic; this is also where two-sources and doubly-wired
+    // inputs are rejected (the whole step rolls back on error).
+    for net in wire_nets.iter_mut() {
+        sync_net_logic(net, components, &ctx)?;
+        drop_orphan_junctions(net);
+    }
+    gc_nets(wire_nets);
+
+    Ok(WireAttach {
+        net_id,
+        new_junction,
+    })
+}
+
+/// Wiring into an `OUTPUT:` pin records the driving port in the
+/// abstraction's outputs map (the wire itself is drawn derived from it).
+fn attach_to_output_pin(
+    project: &mut Project,
+    sheet: SheetRef,
+    ctx: &KindCtx,
+    from: &WirePoint,
+    to: &WirePoint,
+) -> Result<WireAttach, EditError> {
+    let SheetRef::Abstraction(index) = sheet else {
+        return Err(EditError::NotAnAbstractionSheet);
+    };
+    let is_pin = |wp: &WirePoint| {
+        matches!(wp, WirePoint::Port(p) if p.component_id.starts_with(layout::OUTPUT_PREFIX))
+    };
+    let (pin, other) = if is_pin(from) { (from, to) } else { (to, from) };
+    let WirePoint::Port(pin_port) = pin else {
+        unreachable!("is_pin checked")
+    };
+    let pin_name = pin_port
+        .component_id
+        .strip_prefix(layout::OUTPUT_PREFIX)
+        .expect("checked prefix")
+        .to_string();
+
+    let (components, wire_nets) = sheet_mut(project, sheet).ok_or(EditError::BadSheet)?;
+    if !ctx
+        .interface_outputs
+        .as_ref()
+        .is_some_and(|outs| outs.contains(&pin_name))
+    {
+        return Err(EditError::UnknownComponent(pin_port.component_id.clone()));
+    }
+
+    // Find the port that will drive this pin.
+    let source_port: PortRef = match other {
+        WirePoint::Port(p) => {
+            if p.component_id.starts_with(crate::convert::INPUT_PREFIX) {
+                return Err(EditError::PassthroughNotAllowed);
+            }
+            if ctx.kind_of(components, p)? != PortKind::Output {
+                return Err(EditError::NotAnInputAndOutput);
+            }
+            p.clone()
+        }
+        WirePoint::Junction { net_id, .. } => {
+            let net = wire_nets
+                .iter()
+                .find(|n| &n.id == net_id)
+                .ok_or_else(|| EditError::UnknownJunction(net_id.clone()))?;
+            let source = net
+                .source
+                .clone()
+                .ok_or(EditError::OutputPinNeedsSource)?;
+            if source.component_id.starts_with(crate::convert::INPUT_PREFIX) {
+                return Err(EditError::PassthroughNotAllowed);
+            }
+            source
+        }
+        WirePoint::New(_) => return Err(EditError::OutputPinNeedsSource),
+    };
+
+    let source_comp = components
+        .iter()
+        .find(|c| c.id == source_port.component_id)
+        .ok_or_else(|| EditError::UnknownComponent(source_port.component_id.clone()))?;
+    let target = if crate::types::is_primitive(&source_comp.component_type) {
+        source_comp.id.clone()
+    } else {
+        format!("{}.{}", source_port.component_id, source_port.port_name)
+    };
+    project.abstractions[index].outputs.insert(pin_name, target);
+    Ok(WireAttach {
+        net_id: String::new(),
+        new_junction: None,
+    })
+}
+
+/// Remove every segment touching `port`, across all nets. Orphaned nodes and
+/// empty nets are left for `repair_nets`/callers to tidy.
+fn detach_port(wire_nets: &mut [WireNet], port: &PortRef) {
+    for net in wire_nets.iter_mut() {
+        net.segments
+            .retain(|seg| !endpoint_is_port(&seg.from, port) && !endpoint_is_port(&seg.to, port));
     }
 }
 
-/// Drop nets that no longer connect anything: a net only exists while it
-/// joins a source to at least one sink.
+/// Derive a net's logical `source`/`sinks` from its segment endpoints.
+/// Rejects nets with two different driving outputs or an input wired twice.
+fn sync_net_logic(
+    net: &mut WireNet,
+    components: &[ProjectComponent],
+    ctx: &KindCtx,
+) -> Result<(), EditError> {
+    let mut source: Option<PortRef> = None;
+    let mut sinks: Vec<PortRef> = Vec::new();
+    for seg in &net.segments {
+        for e in [&seg.from, &seg.to] {
+            let Endpoint::Port {
+                component_id,
+                port_name,
+            } = e
+            else {
+                continue;
+            };
+            let port = PortRef {
+                component_id: component_id.clone(),
+                port_name: port_name.clone(),
+            };
+            match ctx.kind_of(components, &port)? {
+                PortKind::Output => match &source {
+                    None => source = Some(port),
+                    Some(s) if *s == port => {}
+                    Some(s) => {
+                        return Err(EditError::TwoSources(format!(
+                            "{}.{}",
+                            s.component_id, s.port_name
+                        )))
+                    }
+                },
+                PortKind::Input => {
+                    if sinks.contains(&port) {
+                        return Err(EditError::InputDoublyWired(format!(
+                            "{}.{}",
+                            port.component_id, port.port_name
+                        )));
+                    }
+                    sinks.push(port);
+                }
+            }
+        }
+    }
+    net.source = source;
+    net.sinks = sinks;
+    Ok(())
+}
+
+/// Drop nodes no segment touches (invisible floating dots).
+fn drop_orphan_junctions(net: &mut WireNet) {
+    net.junctions.retain(|j| {
+        net.segments.iter().any(|seg| {
+            [&seg.from, &seg.to].iter().any(
+                |e| matches!(e, Endpoint::Junction { junction_id } if *junction_id == j.id),
+            )
+        })
+    });
+}
+
+fn endpoint_key(e: &Endpoint) -> String {
+    match e {
+        Endpoint::Port {
+            component_id,
+            port_name,
+        } => format!("P:{component_id}\u{0}{port_name}"),
+        Endpoint::Junction { junction_id } => format!("J:{junction_id}"),
+    }
+}
+
+/// A net must be one connected graph: if its segments form several islands,
+/// split the extras into their own nets.
+fn split_all_nets(wire_nets: &mut Vec<WireNet>) {
+    let mut i = 0;
+    while i < wire_nets.len() {
+        for (junctions, segments) in split_off_islands(&mut wire_nets[i]) {
+            let id = generate_net_id(wire_nets);
+            wire_nets.push(WireNet {
+                id,
+                source: None, // synced by the caller
+                sinks: vec![],
+                junctions,
+                segments,
+            });
+        }
+        i += 1;
+    }
+}
+
+/// Remove all but the first connected component from `net`, returning the
+/// (junctions, segments) of each removed island.
+fn split_off_islands(
+    net: &mut WireNet,
+) -> Vec<(Vec<Junction>, Vec<crate::project::Segment>)> {
+    if net.segments.len() <= 1 {
+        return vec![];
+    }
+
+    // Group segments into connected components over endpoint keys.
+    let mut groups: Vec<(Vec<String>, Vec<crate::project::Segment>)> = Vec::new();
+    for seg in net.segments.drain(..) {
+        let ka = endpoint_key(&seg.from);
+        let kb = endpoint_key(&seg.to);
+        let touching: Vec<usize> = groups
+            .iter()
+            .enumerate()
+            .filter(|(_, (keys, _))| keys.contains(&ka) || keys.contains(&kb))
+            .map(|(g, _)| g)
+            .collect();
+        match touching.as_slice() {
+            [] => groups.push((vec![ka, kb], vec![seg])),
+            [g] => {
+                let (keys, segs) = &mut groups[*g];
+                keys.push(ka);
+                keys.push(kb);
+                segs.push(seg);
+            }
+            [first, rest @ ..] => {
+                // This segment bridges several groups: merge them.
+                for &g in rest.iter().rev() {
+                    let (keys, segs) = groups.remove(g);
+                    let target = &mut groups[*first];
+                    target.0.extend(keys);
+                    target.1.extend(segs);
+                }
+                let target = &mut groups[*first];
+                target.0.push(ka);
+                target.0.push(kb);
+                target.1.push(seg);
+            }
+        }
+    }
+
+    // First group stays in this net; junctions follow their group.
+    let all_junctions = std::mem::take(&mut net.junctions);
+    let mut islands = Vec::new();
+    for (index, (keys, segments)) in groups.into_iter().enumerate() {
+        let junctions: Vec<Junction> = all_junctions
+            .iter()
+            .filter(|j| keys.contains(&format!("J:{}", j.id)))
+            .cloned()
+            .collect();
+        if index == 0 {
+            net.junctions = junctions;
+            net.segments = segments;
+        } else {
+            islands.push((junctions, segments));
+        }
+    }
+    islands
+}
+
+/// The standard post-removal consistency pass: drop floating nodes, split
+/// disconnected islands into their own nets, re-derive logic, and collect
+/// nets that lost all their segments.
+fn repair_nets(
+    wire_nets: &mut Vec<WireNet>,
+    components: &[ProjectComponent],
+    ctx: &KindCtx,
+) -> Result<(), EditError> {
+    for net in wire_nets.iter_mut() {
+        drop_orphan_junctions(net);
+    }
+    split_all_nets(wire_nets);
+    for net in wire_nets.iter_mut() {
+        sync_net_logic(net, components, ctx)?;
+    }
+    gc_nets(wire_nets);
+    Ok(())
+}
+
+/// A net exists as long as it has any wire in it. Stubs are legitimate;
+/// only truly empty nets are collected.
 fn gc_nets(wire_nets: &mut Vec<WireNet>) {
-    wire_nets.retain(|n| n.source.is_some() && !n.sinks.is_empty());
+    wire_nets.retain(|n| !n.segments.is_empty());
 }
 
 // ── Normalization (repair pass for loaded / hand-edited files) ───────────────
@@ -941,7 +1412,8 @@ fn normalize_sheet(
             .map(|p| p.kind)
     };
 
-    // Drop logical references that don't resolve or have the wrong direction.
+    // 1. Drop logical references that don't resolve or have the wrong
+    //    direction — they only seed segment synthesis below.
     for net in wire_nets.iter_mut() {
         if let Some(src) = &net.source {
             if port_kind(src) != Some(PortKind::Output) {
@@ -965,16 +1437,150 @@ fn normalize_sheet(
         });
     }
 
-    // Merge nets that share a source (one net per source).
+    // 2. Drop segments whose endpoints don't resolve (unknown components,
+    //    ports, pins or junctions).
+    for net in wire_nets.iter_mut() {
+        let before = net.segments.len();
+        let junction_ids: Vec<String> = net.junctions.iter().map(|j| j.id.clone()).collect();
+        net.segments.retain(|seg| {
+            [&seg.from, &seg.to].iter().all(|e| match e {
+                Endpoint::Port {
+                    component_id,
+                    port_name,
+                } => port_kind(&PortRef {
+                    component_id: component_id.clone(),
+                    port_name: port_name.clone(),
+                })
+                .is_some(),
+                Endpoint::Junction { junction_id } => junction_ids.contains(junction_id),
+            })
+        });
+        if net.segments.len() != before {
+            notes.push(format!(
+                "{label}: wire \"{}\" had dangling segments; removed them",
+                net.id
+            ));
+        }
+    }
+
+    // 3. Synthesize wires for logical-only files: a stored sink with no
+    //    segment gets a direct source→sink segment.
+    for net in wire_nets.iter_mut() {
+        let Some(source) = net.source.clone() else {
+            continue;
+        };
+        for sink in net.sinks.clone() {
+            let has_path = net.segments.iter().any(|seg| {
+                [&seg.from, &seg.to]
+                    .iter()
+                    .any(|e| endpoint_is_port(e, &sink))
+            });
+            if !has_path {
+                net.segments.push(crate::project::Segment {
+                    from: port_endpoint(&source),
+                    to: port_endpoint(&sink),
+                });
+            }
+        }
+    }
+
+    // 4. An input is wired at most once, globally: the first segment wins.
+    let mut seen_inputs: Vec<PortRef> = Vec::new();
+    for net in wire_nets.iter_mut() {
+        let net_id = net.id.clone();
+        net.segments.retain(|seg| {
+            for e in [&seg.from, &seg.to] {
+                let Endpoint::Port {
+                    component_id,
+                    port_name,
+                } = e
+                else {
+                    continue;
+                };
+                let p = PortRef {
+                    component_id: component_id.clone(),
+                    port_name: port_name.clone(),
+                };
+                if port_kind(&p) == Some(PortKind::Input) {
+                    if seen_inputs.contains(&p) {
+                        notes.push(format!(
+                            "{label}: input {}.{} was wired twice; kept the first (removed from \"{net_id}\")",
+                            p.component_id, p.port_name
+                        ));
+                        return false;
+                    }
+                    seen_inputs.push(p);
+                }
+            }
+            true
+        });
+    }
+
+    // 5. One driving output per net: segments touching a second, different
+    //    output are removed.
+    for net in wire_nets.iter_mut() {
+        let mut first_output: Option<PortRef> = None;
+        let net_id = net.id.clone();
+        net.segments.retain(|seg| {
+            for e in [&seg.from, &seg.to] {
+                let Endpoint::Port {
+                    component_id,
+                    port_name,
+                } = e
+                else {
+                    continue;
+                };
+                let p = PortRef {
+                    component_id: component_id.clone(),
+                    port_name: port_name.clone(),
+                };
+                if port_kind(&p) == Some(PortKind::Output) {
+                    match &first_output {
+                        None => first_output = Some(p),
+                        Some(f) if *f == p => {}
+                        Some(f) => {
+                            notes.push(format!(
+                                "{label}: wire \"{net_id}\" was driven by both {}.{} and {}.{}; kept the first",
+                                f.component_id, f.port_name, p.component_id, p.port_name
+                            ));
+                            return false;
+                        }
+                    }
+                }
+            }
+            true
+        });
+    }
+
+    // 6. Nets sharing a driving source are one electrical net (connected
+    //    through the shared port): merge them.
+    let derived_source = |net: &WireNet| -> Option<PortRef> {
+        net.segments.iter().find_map(|seg| {
+            [&seg.from, &seg.to].iter().find_map(|e| {
+                let Endpoint::Port {
+                    component_id,
+                    port_name,
+                } = e
+                else {
+                    return None;
+                };
+                let p = PortRef {
+                    component_id: component_id.clone(),
+                    port_name: port_name.clone(),
+                };
+                (port_kind(&p) == Some(PortKind::Output)).then_some(p)
+            })
+        })
+    };
     let mut i = 0;
     while i < wire_nets.len() {
-        if wire_nets[i].source.is_none() {
+        let Some(source) = derived_source(&wire_nets[i]) else {
             i += 1;
             continue;
-        }
+        };
         let mut j = i + 1;
         while j < wire_nets.len() {
-            if wire_nets[j].source == wire_nets[i].source {
+            if derived_source(&wire_nets[j]) == Some(source.clone()) {
                 let absorbed = wire_nets.remove(j);
                 notes.push(format!(
                     "{label}: merged wire \"{}\" into \"{}\" (same source)",
@@ -988,73 +1594,26 @@ fn normalize_sheet(
         i += 1;
     }
 
-    // One driver per input: first net wins.
-    let mut seen_sinks: Vec<PortRef> = Vec::new();
+    // 7. Standard graph repair: floating nodes, disconnected islands,
+    //    derived logic, empty nets.
     for net in wire_nets.iter_mut() {
-        let net_id = net.id.clone();
-        net.sinks.retain(|s| {
-            if seen_sinks.contains(s) {
-                notes.push(format!(
-                    "{label}: input {}.{} had two drivers; kept the first (dropped from \"{net_id}\")",
-                    s.component_id, s.port_name
-                ));
-                false
-            } else {
-                seen_sinks.push(s.clone());
-                true
-            }
-        });
+        drop_orphan_junctions(net);
     }
-
+    split_all_nets(wire_nets);
+    let ctx = KindCtx {
+        abstractions: abstractions.to_vec(),
+        interface_outputs: interface_inputs.as_ref().map(|_| vec![]),
+        interface_inputs,
+    };
     for net in wire_nets.iter_mut() {
-        // Drop segments whose endpoints don't resolve.
-        let before = net.segments.len();
-        let ids: Vec<String> = components.iter().map(|c| c.id.clone()).collect();
-        let junction_ids: Vec<String> = net.junctions.iter().map(|j| j.id.clone()).collect();
-        net.segments.retain(|seg| {
-            [&seg.from, &seg.to].iter().all(|e| match e {
-                Endpoint::Port { component_id, .. } => {
-                    ids.contains(component_id)
-                        || component_id.starts_with(crate::convert::INPUT_PREFIX)
-                }
-                Endpoint::Junction { junction_id } => junction_ids.contains(junction_id),
-            })
-        });
-        if net.segments.len() != before {
+        if let Err(e) = sync_net_logic(net, components, &ctx) {
             notes.push(format!(
-                "{label}: wire \"{}\" had dangling segments; removed them",
+                "{label}: wire \"{}\" could not be repaired ({e}); removed it",
                 net.id
             ));
-        }
-        prune_net_geometry(net);
-
-        // Synthesize a direct segment for any sink with no visual path.
-        if let Some(source) = net.source.clone() {
-            let sinks = net.sinks.clone();
-            for sink in sinks {
-                let has_path = net.segments.iter().any(|seg| {
-                    [&seg.from, &seg.to].iter().any(|e| {
-                        matches!(e, Endpoint::Port { component_id, port_name }
-                            if *component_id == sink.component_id
-                                && *port_name == sink.port_name)
-                    })
-                });
-                if !has_path {
-                    net.segments.push(crate::project::Segment {
-                        from: Endpoint::Port {
-                            component_id: source.component_id.clone(),
-                            port_name: source.port_name.clone(),
-                        },
-                        to: Endpoint::Port {
-                            component_id: sink.component_id.clone(),
-                            port_name: sink.port_name.clone(),
-                        },
-                    });
-                }
-            }
+            net.segments.clear();
         }
     }
-
     let before = wire_nets.len();
     gc_nets(wire_nets);
     if wire_nets.len() != before {
@@ -1079,7 +1638,9 @@ fn normalize_sheet(
 }
 
 /// Fold `absorbed` into `net`, renaming colliding junction IDs.
-fn merge_net(net: &mut WireNet, mut absorbed: WireNet) {
+/// Returns the (old, new) id pairs of renamed junctions.
+fn merge_net(net: &mut WireNet, mut absorbed: WireNet) -> Vec<(String, String)> {
+    let mut renames = Vec::new();
     for junction in &mut absorbed.junctions {
         if net.junctions.iter().any(|j| j.id == junction.id) {
             let new_id = generate_junction_id(net);
@@ -1093,12 +1654,17 @@ fn merge_net(net: &mut WireNet, mut absorbed: WireNet) {
                     }
                 }
             }
+            renames.push((junction.id.clone(), new_id.clone()));
             junction.id = new_id;
         }
         net.junctions.push(junction.clone());
     }
+    if net.source.is_none() {
+        net.source = absorbed.source.take();
+    }
     net.sinks.append(&mut absorbed.sinks);
     net.segments.append(&mut absorbed.segments);
+    renames
 }
 
 #[cfg(test)]
@@ -1234,7 +1800,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_component_scrubs_nets_and_junctions() {
+    fn delete_component_keeps_wire_stub() {
         let mut e = editor_with_two_nands();
         e.place_component("clk", [0, 10]).unwrap();
         e.connect(port("nand_1", "out"), port("nand_2", "a"), &[[5.0, 1.0]])
@@ -1242,9 +1808,15 @@ mod tests {
         e.connect(port("nand_1", "out"), port("nand_2", "b"), &[])
             .unwrap();
         e.delete_components(&["nand_2".into()]).unwrap();
-        // Net lost both sinks → gone entirely, junction included.
-        assert!(e.project.wire_nets.is_empty());
         assert_eq!(e.project.components.len(), 2);
+        // Wires are placed objects: the source→node stub survives the
+        // deletion of the component it pointed at.
+        assert_eq!(e.project.wire_nets.len(), 1);
+        let net = &e.project.wire_nets[0];
+        assert_eq!(net.segments.len(), 1);
+        assert_eq!(net.junctions.len(), 1);
+        assert_eq!(net.source, Some(port("nand_1", "out")));
+        assert!(net.sinks.is_empty());
     }
 
     #[test]
@@ -1269,12 +1841,16 @@ mod tests {
         e.disconnect_sink(port("nand_2", "a")).unwrap();
         let net = &e.project.wire_nets[0];
         assert_eq!(net.sinks, vec![port("nand_2", "b")]);
-        // The junction on the removed branch is pruned, the other stays.
-        assert_eq!(net.junctions.len(), 1);
-        assert_eq!(net.junctions[0].pos, [5.0, 3.0]);
-        // Disconnecting the last sink removes the net.
+        // Both nodes survive — the a-branch keeps its node as a stub.
+        assert_eq!(net.junctions.len(), 2);
+        // Disconnecting the other sink leaves a sourced net of stubs.
         e.disconnect_sink(port("nand_2", "b")).unwrap();
-        assert!(e.project.wire_nets.is_empty());
+        assert_eq!(e.project.wire_nets.len(), 1);
+        assert!(e.project.wire_nets[0].sinks.is_empty());
+        assert_eq!(
+            e.project.wire_nets[0].source,
+            Some(port("nand_1", "out"))
+        );
     }
 
     #[test]
@@ -1433,6 +2009,243 @@ mod tests {
         assert_eq!(e.sheet, SheetRef::Top);
     }
 
+    // ── Wire graph (nodes as first-class objects) ────────────────────────
+
+    fn node(net_id: &str, junction_id: &str) -> WirePoint {
+        WirePoint::Junction {
+            net_id: net_id.into(),
+            junction_id: junction_id.into(),
+        }
+    }
+
+    #[test]
+    fn add_wire_incrementally_and_branch_from_node() {
+        let mut e = editor_with_two_nands();
+        // Out → node: a committed stub.
+        let a = e
+            .add_wire(WirePoint::Port(port("nand_1", "out")), WirePoint::New([5.0, 1.0]))
+            .unwrap();
+        let n1 = a.new_junction.unwrap();
+        assert_eq!(e.project.wire_nets.len(), 1);
+        assert_eq!(e.project.wire_nets[0].sinks.len(), 0);
+        assert_eq!(e.project.wire_nets[0].source, Some(port("nand_1", "out")));
+
+        // Node → input finishes the connection.
+        e.add_wire(node(&a.net_id, &n1), WirePoint::Port(port("nand_2", "a")))
+            .unwrap();
+        assert_eq!(e.project.wire_nets[0].sinks, vec![port("nand_2", "a")]);
+
+        // Branch from the SAME node to the other input.
+        e.add_wire(node(&a.net_id, &n1), WirePoint::Port(port("nand_2", "b")))
+            .unwrap();
+        assert_eq!(e.project.wire_nets[0].sinks.len(), 2);
+        assert_eq!(e.project.wire_nets[0].segments.len(), 3);
+
+        // Duplicate wire between the same points is a no-op.
+        assert_eq!(
+            e.add_wire(node(&a.net_id, &n1), WirePoint::Port(port("nand_2", "b")))
+                .unwrap_err(),
+            EditError::NoopWire
+        );
+    }
+
+    #[test]
+    fn two_outputs_cannot_drive_one_wire() {
+        let mut e = editor_with_two_nands();
+        let a = e
+            .add_wire(WirePoint::Port(port("nand_1", "out")), WirePoint::New([5.0, 5.0]))
+            .unwrap();
+        let n = a.new_junction.unwrap();
+        assert!(matches!(
+            e.add_wire(node(&a.net_id, &n), WirePoint::Port(port("nand_2", "out")))
+                .unwrap_err(),
+            EditError::TwoSources(_)
+        ));
+        // Rolled back: still one segment, and nand_2.out is untouched.
+        assert_eq!(e.project.wire_nets[0].segments.len(), 1);
+    }
+
+    #[test]
+    fn merging_two_stub_nets_via_wire() {
+        let mut e = editor_with_two_nands();
+        // A sourced stub and a sunk stub.
+        let a = e
+            .add_wire(WirePoint::Port(port("nand_1", "out")), WirePoint::New([5.0, 0.0]))
+            .unwrap();
+        let b = e
+            .add_wire(WirePoint::Port(port("nand_2", "a")), WirePoint::New([7.0, 3.0]))
+            .unwrap();
+        assert_eq!(e.project.wire_nets.len(), 2);
+        // Wire node-to-node: nets merge and the connection goes live.
+        e.add_wire(
+            node(&a.net_id, &a.new_junction.clone().unwrap()),
+            node(&b.net_id, &b.new_junction.clone().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(e.project.wire_nets.len(), 1);
+        let net = &e.project.wire_nets[0];
+        assert_eq!(net.source, Some(port("nand_1", "out")));
+        assert_eq!(net.sinks, vec![port("nand_2", "a")]);
+        assert_eq!(net.segments.len(), 3);
+    }
+
+    #[test]
+    fn tied_inputs_get_driven_when_source_arrives() {
+        let mut e = editor_with_two_nands();
+        // Input-to-input wire: legal, a sourceless net with two sinks.
+        e.add_wire(
+            WirePoint::Port(port("nand_2", "a")),
+            WirePoint::Port(port("nand_2", "b")),
+        )
+        .unwrap();
+        let net = &e.project.wire_nets[0];
+        assert_eq!(net.source, None);
+        assert_eq!(net.sinks.len(), 2);
+        // Attaching an output drives both.
+        e.add_wire(
+            WirePoint::Port(port("nand_1", "out")),
+            WirePoint::Port(port("nand_2", "a")),
+        )
+        .unwrap();
+        // The replace rule detached a first... so instead wire to a node of
+        // that net: rebuild the scenario through a node.
+        let mut e = editor_with_two_nands();
+        let a = e
+            .add_wire(WirePoint::Port(port("nand_2", "a")), WirePoint::New([5.0, 1.0]))
+            .unwrap();
+        let n = a.new_junction.unwrap();
+        e.add_wire(node(&a.net_id, &n), WirePoint::Port(port("nand_2", "b")))
+            .unwrap();
+        e.add_wire(WirePoint::Port(port("nand_1", "out")), node(&a.net_id, &n))
+            .unwrap();
+        let net = &e.project.wire_nets[0];
+        assert_eq!(net.source, Some(port("nand_1", "out")));
+        assert_eq!(net.sinks.len(), 2);
+    }
+
+    #[test]
+    fn deleting_a_node_splits_the_net() {
+        let mut e = editor_with_two_nands();
+        // out → n1 → n2 → a  (a chain with two nodes)
+        let a = e
+            .add_wire(WirePoint::Port(port("nand_1", "out")), WirePoint::New([4.0, 4.0]))
+            .unwrap();
+        let n1 = a.new_junction.unwrap();
+        let b = e
+            .add_wire(node(&a.net_id, &n1), WirePoint::New([8.0, 4.0]))
+            .unwrap();
+        let n2 = b.new_junction.unwrap();
+        e.add_wire(node(&b.net_id, &n2), WirePoint::Port(port("nand_2", "a")))
+            .unwrap();
+        assert_eq!(e.project.wire_nets.len(), 1);
+
+        // Branch a second island off n2, then delete n2: the pieces that
+        // met there fall apart into separate nets.
+        let c = e
+            .add_wire(node(&b.net_id, &n2), WirePoint::New([8.0, 8.0]))
+            .unwrap();
+        let n3 = c.new_junction.unwrap();
+        e.delete_junction(&c.net_id, &n2).unwrap();
+
+        // Remaining: out→n1 (sourced stub), and n3 alone died with its only
+        // segment... n3's segment touched n2 so it's gone; nand_2.a's segment
+        // also touched n2 and is gone.
+        assert_eq!(e.project.wire_nets.len(), 1);
+        let net = &e.project.wire_nets[0];
+        assert_eq!(net.source, Some(port("nand_1", "out")));
+        assert!(net.sinks.is_empty());
+        assert!(net.junctions.iter().any(|j| j.id == n1));
+        assert!(!net.junctions.iter().any(|j| j.id == n3));
+
+        // Undo restores the whole arrangement.
+        e.undo().unwrap();
+        assert_eq!(e.project.wire_nets.len(), 1);
+        assert_eq!(e.project.wire_nets[0].junctions.len(), 3);
+        assert_eq!(e.project.wire_nets[0].sinks, vec![port("nand_2", "a")]);
+    }
+
+    #[test]
+    fn splitting_preserves_both_live_halves() {
+        let mut e = editor_with_two_nands();
+        e.place_component("clk", [0, 10]).unwrap();
+        // clk.out → n1 → n2, n2 → nand_2.a, and n1 → nand_2.b:
+        let a = e
+            .add_wire(WirePoint::Port(port("clk_1", "out")), WirePoint::New([4.0, 8.0]))
+            .unwrap();
+        let n1 = a.new_junction.unwrap();
+        let b = e
+            .add_wire(node(&a.net_id, &n1), WirePoint::New([8.0, 8.0]))
+            .unwrap();
+        let n2 = b.new_junction.unwrap();
+        e.add_wire(node(&b.net_id, &n2), WirePoint::Port(port("nand_2", "a")))
+            .unwrap();
+        e.add_wire(node(&a.net_id, &n1), WirePoint::Port(port("nand_2", "b")))
+            .unwrap();
+
+        // Deleting n1 cuts clk and the b-branch off; n2→a survives as its
+        // own (sourceless) net.
+        e.delete_junction(&a.net_id, &n1).unwrap();
+        assert_eq!(e.project.wire_nets.len(), 1);
+        let net = &e.project.wire_nets[0];
+        assert_eq!(net.source, None);
+        assert_eq!(net.sinks, vec![port("nand_2", "a")]);
+        assert_eq!(net.junctions.len(), 1);
+    }
+
+    #[test]
+    fn move_junction_updates_position() {
+        let mut e = editor_with_two_nands();
+        let a = e
+            .add_wire(WirePoint::Port(port("nand_1", "out")), WirePoint::New([5.0, 1.0]))
+            .unwrap();
+        let n = a.new_junction.unwrap();
+        let undo_before = e.undo_stack.len();
+        e.move_junction(&a.net_id, &n, [5.0, 1.0]).unwrap(); // no-op
+        assert_eq!(e.undo_stack.len(), undo_before);
+        e.move_junction(&a.net_id, &n, [9.0, 4.5]).unwrap();
+        assert_eq!(e.project.wire_nets[0].junctions[0].pos, [9.0, 4.5]);
+        assert!(matches!(
+            e.move_junction(&a.net_id, "ghost", [0.0, 0.0]).unwrap_err(),
+            EditError::UnknownJunction(_)
+        ));
+    }
+
+    #[test]
+    fn output_pin_wired_from_a_node() {
+        let mut e = Editor::empty();
+        let i = e.create_abstraction("buf").unwrap();
+        e.open_sheet(SheetRef::Abstraction(i)).unwrap();
+        e.add_interface_pin(PortKind::Input, "x").unwrap();
+        e.add_interface_pin(PortKind::Output, "q").unwrap();
+        e.place_component("nand", [4, 0]).unwrap();
+        e.connect(pin("INPUT:", "x"), port("nand_1", "a"), &[]).unwrap();
+        e.connect(pin("INPUT:", "x"), port("nand_1", "b"), &[]).unwrap();
+
+        // Drive a node from the gate, then wire the node into the pin.
+        let a = e
+            .add_wire(WirePoint::Port(port("nand_1", "out")), WirePoint::New([9.0, 1.0]))
+            .unwrap();
+        let n = a.new_junction.unwrap();
+        e.add_wire(node(&a.net_id, &n), WirePoint::Port(pin("OUTPUT:", "q")))
+            .unwrap();
+        assert_eq!(
+            e.project.abstractions[i].outputs.get("q"),
+            Some(&"nand_1".to_string())
+        );
+
+        // A sourceless node can't feed an output pin.
+        let b = e
+            .add_wire(WirePoint::Port(port("nand_1", "a")), WirePoint::New([2.0, 6.0]))
+            .unwrap();
+        // (nand_1.a was replaced-off the INPUT:x net onto a fresh stub.)
+        let m = b.new_junction.unwrap();
+        assert_eq!(
+            e.add_wire(node(&b.net_id, &m), WirePoint::Port(pin("OUTPUT:", "q")))
+                .unwrap_err(),
+            EditError::OutputPinNeedsSource
+        );
+    }
+
     // ── Interface pins ───────────────────────────────────────────────────
 
     fn pin(kind_prefix: &str, name: &str) -> PortRef {
@@ -1578,9 +2391,34 @@ mod tests {
         e.place_component("nand", [4, 0]).unwrap();
         e.connect(pin("INPUT:", "x"), port("nand_1", "a"), &[]).unwrap();
 
+        // A hand-edited file with a corrupted stored source but an intact
+        // segment graph heals: the source is re-derived from the segments.
         let mut project = e.project.clone();
-        // A hand-edited file referencing a pin that doesn't exist.
         project.abstractions[i].wire_nets[0].source = Some(pin("INPUT:", "ghost"));
+        let notes = normalize(&mut project);
+        assert_eq!(
+            project.abstractions[i].wire_nets[0].source,
+            Some(pin("INPUT:", "x"))
+        );
+        assert!(!notes.is_empty());
+
+        // But segments referencing an undeclared pin are truly dangling.
+        let mut project = e.project.clone();
+        for net in &mut project.abstractions[i].wire_nets {
+            net.source = Some(pin("INPUT:", "ghost"));
+            for seg in &mut net.segments {
+                for ep in [&mut seg.from, &mut seg.to] {
+                    if matches!(ep, Endpoint::Port { component_id, .. }
+                        if component_id.starts_with("INPUT:"))
+                    {
+                        *ep = Endpoint::Port {
+                            component_id: "INPUT:ghost".into(),
+                            port_name: "ghost".into(),
+                        };
+                    }
+                }
+            }
+        }
         let notes = normalize(&mut project);
         assert!(project.abstractions[i].wire_nets.is_empty());
         assert!(!notes.is_empty());

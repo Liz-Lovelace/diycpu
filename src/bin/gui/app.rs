@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use diycpu::editor::{Editor, SheetRef};
+use diycpu::editor::{EditError, Editor, SheetRef, WirePoint};
 use diycpu::layout::{self, Hit, PortKind, Rect};
 use diycpu::project::{PortRef, Project};
 
@@ -50,10 +50,21 @@ pub enum Gesture {
     BandSelecting {
         start_grid: [f32; 2],
     },
+    /// Wire drawing: every click commits to the document immediately (a
+    /// node, a connection), so this gesture holds only the current anchor.
     DrawingWire {
-        from: PortRef,
-        from_kind: PortKind,
-        bends: Vec<[f32; 2]>,
+        anchor: WirePoint,
+    },
+    /// Left button down on a wire node; not yet decided click vs drag.
+    PressedJunction {
+        net_id: String,
+        junction_id: String,
+        press_screen: [f32; 2],
+    },
+    DraggingJunction {
+        net_id: String,
+        junction_id: String,
+        pos: [f32; 2],
     },
 }
 
@@ -124,6 +135,8 @@ pub struct App {
     pub shift: bool,
     pub hover: Hit,
     pub prompt: Option<Prompt>,
+    /// Run mode advances the clock on a timer.
+    pub playing: bool,
     /// Set when Ctrl+N is pressed with unsaved changes; a second press confirms.
     confirm_new: bool,
     /// Fit the view to content at the next opportunity (needs window size).
@@ -172,6 +185,7 @@ impl App {
             shift: false,
             hover: Hit::Empty,
             prompt: None,
+            playing: false,
             confirm_new: false,
             pending_fit: true,
         }
@@ -294,31 +308,100 @@ impl App {
             })
     }
 
-    /// Where the wire being drawn currently ends: a compatible hovered port
-    /// (snapped), or the half-grid-snapped cursor. Also says whether that
-    /// target is a commit-able port and whether it's an incompatible one.
+    /// Wire-direction kind of a port on the current sheet (pseudo-pins
+    /// included), for preview coloring only — the editor is authoritative.
+    fn port_wire_kind(&self, port: &PortRef) -> Option<PortKind> {
+        if port.component_id.starts_with(diycpu::convert::INPUT_PREFIX) {
+            return Some(PortKind::Output);
+        }
+        if port.component_id.starts_with(layout::OUTPUT_PREFIX) {
+            return Some(PortKind::Input);
+        }
+        let (components, _) = self.editor.sheet_data();
+        let comp = components.iter().find(|c| c.id == port.component_id)?;
+        layout::type_ports(&self.editor.project.abstractions, &comp.component_type)?
+            .into_iter()
+            .find(|p| p.name == port.port_name)
+            .map(|p| p.kind)
+    }
+
+    /// Does the wire being drawn already carry a driving source?
+    fn anchor_drives(&self, anchor: &WirePoint) -> bool {
+        match anchor {
+            WirePoint::Port(p) => self.port_wire_kind(p) == Some(PortKind::Output),
+            WirePoint::Junction { net_id, .. } => {
+                let (_, wire_nets) = self.editor.sheet_data();
+                wire_nets
+                    .iter()
+                    .find(|n| &n.id == net_id)
+                    .is_some_and(|n| n.source.is_some())
+            }
+            WirePoint::New(_) => false,
+        }
+    }
+
+    /// Where the wire being drawn currently ends: a hovered port or node
+    /// (snapped), or the half-grid-snapped cursor.
     pub fn wire_target(&self) -> WireTarget {
-        if let Gesture::DrawingWire { from, from_kind, .. } = &self.gesture {
-            if let Hit::Port {
+        let Gesture::DrawingWire { anchor } = &self.gesture else {
+            return WireTarget::Free(snap_half(self.cursor_grid()));
+        };
+        match &self.hover {
+            Hit::Port {
                 component_id,
                 port_name,
-                kind,
-            } = &self.hover
-            {
+                ..
+            } => {
                 let target = PortRef {
                     component_id: component_id.clone(),
                     port_name: port_name.clone(),
                 };
-                if *kind != *from_kind && target != *from {
-                    return WireTarget::Port(target);
+                if matches!(anchor, WirePoint::Port(p) if *p == target) {
+                    return WireTarget::Free(snap_half(self.cursor_grid()));
                 }
-                if target != *from {
+                // Two drivers can't share a wire.
+                if self.anchor_drives(anchor)
+                    && self.port_wire_kind(&target) == Some(PortKind::Output)
+                {
                     return WireTarget::Incompatible;
                 }
+                WireTarget::Port(target)
             }
-            WireTarget::Free(snap_half(self.cursor_grid()))
-        } else {
-            WireTarget::Free(snap_half(self.cursor_grid()))
+            Hit::Junction {
+                net_id,
+                junction_id,
+            } => {
+                if matches!(anchor, WirePoint::Junction { junction_id: a, .. } if a == junction_id)
+                {
+                    return WireTarget::Free(snap_half(self.cursor_grid()));
+                }
+                // Merging two driven nets is invalid (unless same source).
+                let (_, wire_nets) = self.editor.sheet_data();
+                let target_source = wire_nets
+                    .iter()
+                    .find(|n| &n.id == net_id)
+                    .and_then(|n| n.source.clone());
+                let anchor_source = match anchor {
+                    WirePoint::Port(p)
+                        if self.port_wire_kind(p) == Some(PortKind::Output) =>
+                    {
+                        Some(p.clone())
+                    }
+                    WirePoint::Junction { net_id: a_net, .. } => wire_nets
+                        .iter()
+                        .find(|n| &n.id == a_net)
+                        .and_then(|n| n.source.clone()),
+                    _ => None,
+                };
+                match (anchor_source, target_source) {
+                    (Some(a), Some(b)) if a != b => WireTarget::Incompatible,
+                    _ => WireTarget::Node {
+                        net_id: net_id.clone(),
+                        junction_id: junction_id.clone(),
+                    },
+                }
+            }
+            _ => WireTarget::Free(snap_half(self.cursor_grid())),
         }
     }
 
@@ -361,6 +444,7 @@ impl App {
     // ── Run mode ─────────────────────────────────────────────────────────
 
     fn toggle_run(&mut self) {
+        self.playing = false;
         match self.mode {
             Mode::Run(_) => {
                 self.mode = Mode::Edit;
@@ -479,6 +563,22 @@ impl App {
                     };
                 }
             }
+            Gesture::PressedJunction {
+                net_id,
+                junction_id,
+                press_screen,
+            } => {
+                if dist(pos, *press_screen) > DRAG_THRESHOLD_PX {
+                    self.gesture = Gesture::DraggingJunction {
+                        net_id: net_id.clone(),
+                        junction_id: junction_id.clone(),
+                        pos: snap_half(self.camera.screen_to_grid(pos)),
+                    };
+                }
+            }
+            Gesture::DraggingJunction { pos: drag_pos, .. } => {
+                *drag_pos = snap_half(self.camera.screen_to_grid(pos));
+            }
             _ => {}
         }
 
@@ -546,17 +646,27 @@ impl App {
             Hit::Port {
                 component_id,
                 port_name,
-                kind,
+                ..
             } => {
                 self.gesture = Gesture::DrawingWire {
-                    from: PortRef {
+                    anchor: WirePoint::Port(PortRef {
                         component_id,
                         port_name,
-                    },
-                    from_kind: kind,
-                    bends: vec![],
+                    }),
                 };
-                self.info("Drawing wire — click a matching port; click empty space to bend; Esc cancels");
+                self.info(
+                    "Wiring — click a port to connect, empty space to drop a node, right-click to stop",
+                );
+            }
+            Hit::Junction {
+                net_id,
+                junction_id,
+            } => {
+                self.gesture = Gesture::PressedJunction {
+                    net_id,
+                    junction_id,
+                    press_screen: self.cursor,
+                };
             }
             Hit::Component { component_id } => {
                 if self.ctrl {
@@ -600,46 +710,65 @@ impl App {
         }
     }
 
-    /// A click while drawing a wire: commit on a compatible port, bend on
-    /// empty space, explain on an incompatible port.
+    /// A click while drawing a wire. Every outcome commits to the document
+    /// right away: a port or node finishes this stretch of wire, empty
+    /// space drops a new node and drawing continues from it.
     fn wire_click(&mut self) {
-        let Gesture::DrawingWire {
-            from,
-            from_kind,
-            bends,
-        } = &self.gesture
-        else {
+        let Gesture::DrawingWire { anchor } = &self.gesture else {
             return;
         };
+        let anchor = anchor.clone();
         match self.wire_target() {
             WireTarget::Port(target) => {
-                let from = from.clone();
-                let bends = bends.clone();
                 let label = format!(
-                    "Connected {}.{} to {}.{}",
-                    from.component_id, from.port_name, target.component_id, target.port_name
+                    "Connected to {}.{}",
+                    target.component_id, target.port_name
                 );
-                match self.editor.connect(from, target, &bends) {
-                    Ok(()) => {
+                match self.editor.add_wire(anchor, WirePoint::Port(target)) {
+                    Ok(_) => {
                         self.gesture = Gesture::Idle;
                         self.info(label);
                     }
+                    Err(EditError::NoopWire) => {}
+                    Err(e) => self.error(e.to_string()),
+                }
+            }
+            WireTarget::Node {
+                net_id,
+                junction_id,
+            } => {
+                match self.editor.add_wire(
+                    anchor,
+                    WirePoint::Junction {
+                        net_id,
+                        junction_id,
+                    },
+                ) {
+                    Ok(_) => {
+                        self.gesture = Gesture::Idle;
+                        self.info("Joined the wires");
+                    }
+                    Err(EditError::NoopWire) => {}
                     Err(e) => self.error(e.to_string()),
                 }
             }
             WireTarget::Incompatible => {
-                let need = match from_kind {
-                    PortKind::Output => "an input",
-                    PortKind::Input => "an output",
-                };
-                self.error(format!("This wire needs to end on {need} port"));
+                self.error("This wire already has an output driving it");
             }
             WireTarget::Free(point) => {
-                let Gesture::DrawingWire { bends, .. } = &mut self.gesture else {
-                    return;
-                };
-                if bends.last() != Some(&point) {
-                    bends.push(point);
+                match self.editor.add_wire(anchor, WirePoint::New(point)) {
+                    Ok(attach) => {
+                        self.gesture = Gesture::DrawingWire {
+                            anchor: WirePoint::Junction {
+                                net_id: attach.net_id,
+                                junction_id: attach
+                                    .new_junction
+                                    .expect("New points create a junction"),
+                            },
+                        };
+                    }
+                    Err(EditError::NoopWire) => {}
+                    Err(e) => self.error(e.to_string()),
                 }
             }
         }
@@ -681,21 +810,55 @@ impl App {
                 self.selection.net = None;
             }
             gesture @ Gesture::DrawingWire { .. } => {
-                // Drag-style wiring: releasing over a compatible port commits.
+                // Drag-style wiring: releasing over a port or node commits.
                 self.gesture = gesture;
-                if matches!(self.wire_target(), WireTarget::Port(_)) {
+                if matches!(
+                    self.wire_target(),
+                    WireTarget::Port(_) | WireTarget::Node { .. }
+                ) {
                     self.wire_click();
                 }
             }
+            Gesture::PressedJunction {
+                net_id,
+                junction_id,
+                ..
+            } => {
+                // A click on a node: start drawing a wire from it (branch).
+                self.gesture = Gesture::DrawingWire {
+                    anchor: WirePoint::Junction {
+                        net_id,
+                        junction_id,
+                    },
+                };
+                self.info(
+                    "Wiring from the node — click a port to connect, empty space for another node",
+                );
+            }
+            Gesture::DraggingJunction {
+                net_id,
+                junction_id,
+                pos,
+            } => match self.editor.move_junction(&net_id, &junction_id, pos) {
+                Ok(()) => {}
+                Err(e) => self.error(e.to_string()),
+            },
         }
     }
 
     pub fn middle_or_right_pressed(&mut self) -> PanOrCancel {
-        // An active constructive gesture? Right/middle click cancels it.
+        // An active constructive gesture? Right/middle click ends it.
         match self.gesture {
-            Gesture::Placing { .. } | Gesture::DrawingWire { .. } => {
+            Gesture::Placing { .. } => {
                 self.gesture = Gesture::Idle;
                 self.info("Cancelled");
+                PanOrCancel::Cancelled
+            }
+            Gesture::DrawingWire { .. } => {
+                // Everything placed so far is already committed; this just
+                // puts the pencil down.
+                self.gesture = Gesture::Idle;
+                self.info("Stopped wiring — click a node to continue from it");
                 PanOrCancel::Cancelled
             }
             _ => {
@@ -789,20 +952,49 @@ impl App {
     }
 
     pub fn action_step_forward(&mut self) {
+        self.playing = false;
         if let Mode::Run(session) = &mut self.mode {
             session.step_forward();
         }
     }
 
     pub fn action_step_back(&mut self) {
+        self.playing = false;
         if let Mode::Run(session) = &mut self.mode {
             session.step_back();
         }
     }
 
     pub fn action_rewind(&mut self) {
+        self.playing = false;
         if let Mode::Run(session) = &mut self.mode {
             session.rewind();
+        }
+    }
+
+    /// Toggle autoplay; from edit mode this also starts the run.
+    pub fn action_play_toggle(&mut self) {
+        match self.mode {
+            Mode::Run(_) => self.playing = !self.playing,
+            Mode::Edit => {
+                self.toggle_run();
+                if self.is_running() {
+                    self.playing = true;
+                }
+            }
+        }
+        if self.playing {
+            self.info("Playing — P pauses, ←/→ step by hand");
+        }
+    }
+
+    /// One timer tick while playing.
+    pub fn play_tick(&mut self) {
+        if !self.playing {
+            return;
+        }
+        if let Mode::Run(session) = &mut self.mode {
+            session.step_forward();
         }
     }
 
@@ -829,6 +1021,19 @@ impl App {
             return;
         }
         self.gesture = Gesture::Idle;
+        // A hovered wire node takes priority: point at it and press Delete.
+        if let Hit::Junction {
+            net_id,
+            junction_id,
+        } = self.hover.clone()
+        {
+            match self.editor.delete_junction(&net_id, &junction_id) {
+                Ok(()) => self.info("Removed node"),
+                Err(e) => self.error(e.to_string()),
+            }
+            self.recompute_hover();
+            return;
+        }
         if let Some((kind, name)) = self.selection.pin.clone() {
             match self.editor.remove_interface_pin(kind, &name) {
                 Ok(()) => {
@@ -1043,6 +1248,7 @@ impl App {
                 }
             }
             ("d", true, _) => self.duplicate(),
+            ("p", false, _) => self.action_play_toggle(),
             ("f", false, _) => {
                 self.fit_view();
                 self.info("View fitted to circuit");
@@ -1067,9 +1273,11 @@ impl App {
 pub enum WireTarget {
     /// A compatible port to commit to.
     Port(PortRef),
-    /// Hovering a port that can't take this wire.
+    /// An existing wire node to join.
+    Node { net_id: String, junction_id: String },
+    /// Hovering a port or node that can't take this wire.
     Incompatible,
-    /// Free space (snapped to half-grid) — a bend would go here.
+    /// Free space (snapped to half-grid) — a node would go here.
     Free([f32; 2]),
 }
 
@@ -1220,22 +1428,94 @@ mod tests {
     }
 
     #[test]
-    fn escape_cancels_wire_without_touching_document() {
+    fn wires_are_placed_objects_escape_keeps_them() {
         let mut d = Driver::new();
         d.place("nand", [0.0, 0.0]);
-        let snapshot = serde_json::to_string(&d.app.editor.project).unwrap();
 
+        // out → node → node, then stop: everything clicked stays placed.
         d.click(port_at(&d.app, "nand_1", "out"));
         d.click([6.0, 6.0]);
         d.click([8.0, 2.0]);
         assert!(matches!(d.app.gesture, Gesture::DrawingWire { .. }));
         d.app.handle_key(KeyInput::Escape);
         assert!(matches!(d.app.gesture, Gesture::Idle));
-        assert_eq!(
-            serde_json::to_string(&d.app.editor.project).unwrap(),
-            snapshot,
-            "cancelled wire must leave no trace"
-        );
+        let net = &d.app.editor.project.wire_nets[0];
+        assert_eq!(net.junctions.len(), 2);
+        assert_eq!(net.segments.len(), 2);
+        assert_eq!(net.sinks.len(), 0);
+
+        // Undo peels the wire back click by click.
+        d.app.undo();
+        assert_eq!(d.app.editor.project.wire_nets[0].junctions.len(), 1);
+        d.app.undo();
+        assert!(d.app.editor.project.wire_nets.is_empty());
+    }
+
+    #[test]
+    fn stopped_wire_resumes_from_its_node_from_either_side() {
+        let mut d = Driver::new();
+        d.place("nand", [0.0, 0.0]);
+        d.place("nand", [10.0, 6.0]);
+
+        // Output → node, stop drawing (the stub stays).
+        d.click(port_at(&d.app, "nand_1", "out"));
+        d.click([6.0, 6.0]);
+        d.app.middle_or_right_pressed();
+        assert!(matches!(d.app.gesture, Gesture::Idle));
+        assert_eq!(d.app.editor.project.wire_nets[0].sinks.len(), 0);
+
+        // Now start from the INPUT and finish on the stub's node.
+        d.click(port_at(&d.app, "nand_2", "a"));
+        assert!(matches!(d.app.gesture, Gesture::DrawingWire { .. }));
+        d.click([6.0, 6.0]); // the node lives here
+        assert!(matches!(d.app.gesture, Gesture::Idle));
+        let net = &d.app.editor.project.wire_nets[0];
+        assert_eq!(net.source, Some(PortRef {
+            component_id: "nand_1".into(),
+            port_name: "out".into(),
+        }));
+        assert_eq!(net.sinks.len(), 1);
+    }
+
+    #[test]
+    fn branch_from_a_mid_wire_node() {
+        let mut d = Driver::new();
+        d.place("nand", [0.0, 0.0]);
+        d.place("nand", [10.0, 0.0]);
+        d.place("nand", [10.0, 6.0]);
+
+        // out → node → nand_2.a
+        d.click(port_at(&d.app, "nand_1", "out"));
+        d.click([6.0, 3.0]);
+        d.click(port_at(&d.app, "nand_2", "a"));
+        assert!(matches!(d.app.gesture, Gesture::Idle));
+
+        // Click the node to branch, land on nand_3.a.
+        d.click([6.0, 3.0]);
+        assert!(matches!(d.app.gesture, Gesture::DrawingWire { .. }));
+        d.click(port_at(&d.app, "nand_3", "a"));
+        let net = &d.app.editor.project.wire_nets[0];
+        assert_eq!(net.sinks.len(), 2);
+        assert_eq!(net.junctions.len(), 1);
+        assert_eq!(net.segments.len(), 3);
+    }
+
+    #[test]
+    fn drag_moves_a_node_and_delete_removes_it() {
+        let mut d = Driver::new();
+        d.place("nand", [0.0, 0.0]);
+        d.click(port_at(&d.app, "nand_1", "out"));
+        d.click([6.0, 3.0]);
+        d.app.middle_or_right_pressed(); // stop drawing
+
+        // Drag the node somewhere else.
+        d.drag([6.0, 3.0], [9.0, 5.0]);
+        assert_eq!(d.app.editor.project.wire_nets[0].junctions[0].pos, [9.0, 5.0]);
+
+        // Hover it and press Delete: node and its wire go away.
+        d.move_to([9.0, 5.0]);
+        d.app.handle_key(KeyInput::Delete);
+        assert!(d.app.editor.project.wire_nets.is_empty());
     }
 
     #[test]
@@ -1280,6 +1560,38 @@ mod tests {
         d.click(center_of(&d.app, "dff_1"));
         d.app.handle_key(KeyInput::Escape);
         assert!(!d.app.is_running());
+    }
+
+    #[test]
+    fn autoplay_advances_and_manual_steps_pause() {
+        let mut d = Driver::new();
+        d.place("clk", [1.0, 1.0]);
+        // P from edit mode: starts running AND playing.
+        d.app.handle_key(KeyInput::Char("p"));
+        assert!(d.app.is_running());
+        assert!(d.app.playing);
+
+        d.app.play_tick();
+        d.app.play_tick();
+        let Mode::Run(session) = &d.app.mode else { unreachable!() };
+        assert_eq!(session.cursor, 2);
+
+        // A manual step pauses playback.
+        d.app.handle_key(KeyInput::ArrowLeft);
+        assert!(!d.app.playing);
+        let Mode::Run(session) = &d.app.mode else { unreachable!() };
+        assert_eq!(session.cursor, 1);
+        // Ticks do nothing while paused.
+        d.app.play_tick();
+        let Mode::Run(session) = &d.app.mode else { unreachable!() };
+        assert_eq!(session.cursor, 1);
+
+        // P resumes; stopping the run stops playback too.
+        d.app.handle_key(KeyInput::Char("p"));
+        assert!(d.app.playing);
+        d.app.handle_key(KeyInput::Escape);
+        assert!(!d.app.is_running());
+        assert!(!d.app.playing);
     }
 
     #[test]

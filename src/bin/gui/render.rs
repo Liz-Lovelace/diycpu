@@ -36,6 +36,7 @@ impl Renderer {
         self.draw_components(canvas, app);
         self.draw_interface_pins(canvas, app);
         self.draw_drag_ghosts(canvas, app);
+        self.draw_junction_drag_ghost(canvas, app);
         self.draw_placement_ghost(canvas, app);
         self.draw_band(canvas, app);
         canvas.reset_scissor();
@@ -146,23 +147,57 @@ impl Renderer {
             }
 
             for junction in &net.junctions {
+                let hovered = matches!(
+                    &app.hover,
+                    layout::Hit::Junction { junction_id, net_id }
+                        if *junction_id == junction.id && *net_id == net.id
+                );
                 let s = app.camera.grid_to_screen(junction.pos);
                 let mut p = Path::new();
                 p.circle(s[0], s[1], (3.5 * zoom).clamp(2.0, 5.5));
                 canvas.fill_path(&p, &Paint::color(color));
+                if hovered && !app.is_running() {
+                    let mut ring_path = Path::new();
+                    ring_path.circle(s[0], s[1], (6.5 * zoom).clamp(4.5, 9.0));
+                    let mut ring = Paint::color(theme::accent());
+                    ring.set_line_width(2.0);
+                    canvas.stroke_path(&ring_path, &ring);
+                }
             }
         }
     }
 
+    /// Resolve where a wire anchor sits on the sheet.
+    fn anchor_geom(&self, app: &App, anchor: &diycpu::editor::WirePoint) -> Option<([f32; 2], layout::ExitDir)> {
+        use diycpu::editor::WirePoint;
+        let abstractions = &app.editor.project.abstractions;
+        let (components, wire_nets) = app.editor.sheet_data();
+        match anchor {
+            WirePoint::Port(p) => {
+                layout::port_geom_any(abstractions, components, app.interface(), p)
+                    .map(|(pos, side)| (pos, Some(side)))
+            }
+            WirePoint::Junction {
+                net_id,
+                junction_id,
+            } => wire_nets
+                .iter()
+                .find(|n| &n.id == net_id)?
+                .junctions
+                .iter()
+                .find(|j| &j.id == junction_id)
+                .map(|j| (j.pos, None)),
+            WirePoint::New(pos) => Some((*pos, None)),
+        }
+    }
+
     fn draw_wire_preview(&self, canvas: &mut Canvas<OpenGl>, app: &App) {
-        let Gesture::DrawingWire { from, bends, .. } = &app.gesture else {
+        let Gesture::DrawingWire { anchor } = &app.gesture else {
             return;
         };
         let abstractions = &app.editor.project.abstractions;
-        let (components, _) = app.editor.sheet_data();
-        let Some((from_pos, from_side)) =
-            layout::port_geom_any(abstractions, components, app.interface(), from)
-        else {
+        let (components, wire_nets) = app.editor.sheet_data();
+        let Some((from_pos, from_dir)) = self.anchor_geom(app, anchor) else {
             return;
         };
 
@@ -174,26 +209,109 @@ impl Renderer {
                     None => return,
                 }
             }
-            WireTarget::Incompatible => {
-                (app.cursor_grid(), None, theme::wire_invalid())
+            WireTarget::Node {
+                net_id,
+                junction_id,
+            } => {
+                let pos = wire_nets
+                    .iter()
+                    .find(|n| &n.id == net_id)
+                    .and_then(|n| n.junctions.iter().find(|j| &j.id == junction_id))
+                    .map(|j| j.pos);
+                match pos {
+                    Some(p) => (p, None, theme::wire_preview()),
+                    None => return,
+                }
             }
+            WireTarget::Incompatible => (app.cursor_grid(), None, theme::wire_invalid()),
             WireTarget::Free(p) => (*p, None, theme::wire_preview()),
         };
 
-        // The exact same routing as a committed wire: port → bends → end.
-        let mut waypoints: Vec<([f32; 2], layout::ExitDir)> =
-            vec![(from_pos, Some(from_side))];
-        waypoints.extend(bends.iter().map(|b| (*b, None)));
-        waypoints.push((end, end_dir));
-
+        // The exact same routing as the committed wire will get.
+        let pts = layout::route(from_pos, from_dir, end, end_dir);
         let zoom = app.camera.zoom;
         let mut paint = Paint::color(color);
         paint.set_line_width((2.5 * zoom).clamp(1.5, 4.5));
         paint.set_line_join(femtovg::LineJoin::Round);
         paint.set_line_cap(femtovg::LineCap::Round);
+        let mut p = Path::new();
+        for (k, pt) in pts.iter().enumerate() {
+            let s = app.camera.grid_to_screen(*pt);
+            if k == 0 {
+                p.move_to(s[0], s[1]);
+            } else {
+                p.line_to(s[0], s[1]);
+            }
+        }
+        canvas.stroke_path(&p, &paint);
 
-        for pair in waypoints.windows(2) {
-            let pts = layout::route(pair[0].0, pair[0].1, pair[1].0, pair[1].1);
+        // Where the wire would land: node dot on empty space, ring on a
+        // snappable port or node.
+        let s = app.camera.grid_to_screen(end);
+        match &target {
+            WireTarget::Free(_) => {
+                let mut dot = Path::new();
+                dot.circle(s[0], s[1], (3.5 * zoom).clamp(2.0, 5.5));
+                canvas.fill_path(&dot, &Paint::color(color));
+            }
+            WireTarget::Port(_) | WireTarget::Node { .. } => {
+                let mut ring_path = Path::new();
+                ring_path.circle(s[0], s[1], (7.0 * zoom).clamp(5.0, 10.0));
+                let mut ring = Paint::color(theme::accent());
+                ring.set_line_width(2.0);
+                canvas.stroke_path(&ring_path, &ring);
+            }
+            WireTarget::Incompatible => {}
+        }
+    }
+
+    /// While a node drags, ghost its segments at the target position (the
+    /// document only changes when the drag commits).
+    fn draw_junction_drag_ghost(&self, canvas: &mut Canvas<OpenGl>, app: &App) {
+        let Gesture::DraggingJunction {
+            net_id,
+            junction_id,
+            pos,
+        } = &app.gesture
+        else {
+            return;
+        };
+        let abstractions = &app.editor.project.abstractions;
+        let (components, wire_nets) = app.editor.sheet_data();
+        let Some(net) = wire_nets.iter().find(|n| &n.id == net_id) else {
+            return;
+        };
+
+        let zoom = app.camera.zoom;
+        let mut paint = Paint::color(theme::wire_preview());
+        paint.set_line_width((2.0 * zoom).clamp(1.2, 3.5));
+        paint.set_line_join(femtovg::LineJoin::Round);
+
+        for seg in &net.segments {
+            let touches = [&seg.from, &seg.to].iter().any(|e| {
+                matches!(e, diycpu::project::Endpoint::Junction { junction_id: id } if id == junction_id)
+            });
+            if !touches {
+                continue;
+            }
+            let resolve = |e: &diycpu::project::Endpoint| -> Option<([f32; 2], layout::ExitDir)> {
+                if matches!(e, diycpu::project::Endpoint::Junction { junction_id: id } if id == junction_id)
+                {
+                    return Some((*pos, None));
+                }
+                layout::resolve_endpoint(
+                    abstractions,
+                    components,
+                    app.interface(),
+                    &net.junctions,
+                    e,
+                )
+            };
+            let (Some((a, a_dir)), Some((b, b_dir))) = (resolve(&seg.from), resolve(&seg.to))
+            else {
+                continue;
+            };
+            let pts = layout::route(a, a_dir, b, b_dir);
             let mut p = Path::new();
             for (k, pt) in pts.iter().enumerate() {
                 let s = app.camera.grid_to_screen(*pt);
@@ -206,22 +324,10 @@ impl Renderer {
             canvas.stroke_path(&p, &paint);
         }
 
-        for (b, _) in &waypoints[1..waypoints.len() - 1] {
-            let s = app.camera.grid_to_screen(*b);
-            let mut p = Path::new();
-            p.circle(s[0], s[1], (3.5 * zoom).clamp(2.0, 5.5));
-            canvas.fill_path(&p, &Paint::color(color));
-        }
-
-        // Highlight a snappable target port.
-        if let WireTarget::Port(_) = target {
-            let s = app.camera.grid_to_screen(end);
-            let mut p = Path::new();
-            p.circle(s[0], s[1], (7.0 * zoom).clamp(5.0, 10.0));
-            let mut ring = Paint::color(theme::accent());
-            ring.set_line_width(2.0);
-            canvas.stroke_path(&p, &ring);
-        }
+        let s = app.camera.grid_to_screen(*pos);
+        let mut dot = Path::new();
+        dot.circle(s[0], s[1], (4.5 * zoom).clamp(2.5, 6.5));
+        canvas.fill_path(&dot, &Paint::color(theme::accent()));
     }
 
     fn draw_components(&self, canvas: &mut Canvas<OpenGl>, app: &App) {
@@ -254,10 +360,22 @@ impl Renderer {
         shadow.rounded_rect(tl[0], tl[1] + 2.0 * zoom, w, h, corner);
         canvas.fill_path(&shadow, &Paint::color(theme::chip_shadow()));
 
-        // Body.
+        // Body. A running flip-flop wears its stored bit as its fill color.
         let mut body = Path::new();
         body.rounded_rect(tl[0], tl[1], w, h, corner);
-        canvas.fill_path(&body, &Paint::color(theme::chip_fill()));
+        let fill = if comp.component_type == "dff" {
+            match &app.mode {
+                Mode::Run(session) => match session.component_value(&comp.id) {
+                    Some(true) => theme::badge_on_bg(),
+                    Some(false) => theme::badge_off_bg(),
+                    None => theme::chip_fill(),
+                },
+                Mode::Edit => theme::chip_fill(),
+            }
+        } else {
+            theme::chip_fill()
+        };
+        canvas.fill_path(&body, &Paint::color(fill));
         if selected {
             canvas.fill_path(&body, &Paint::color(theme::accent_soft()));
         }
@@ -269,31 +387,12 @@ impl Renderer {
         border.set_line_width(if selected { 2.5 } else { 1.5 });
         canvas.stroke_path(&body, &border);
 
-        // IC notch: a small semicircle dimple at the top center.
-        if zoom > 0.45 {
-            let mut notch = Path::new();
-            notch.arc(
-                tl[0] + w / 2.0,
-                tl[1],
-                (5.0 * zoom).clamp(2.5, 7.0),
-                0.0,
-                std::f32::consts::PI,
-                femtovg::Solidity::Hole,
-            );
-            let mut np = Paint::color(if selected {
-                theme::accent()
-            } else {
-                theme::chip_border()
-            });
-            np.set_line_width(1.5);
-            canvas.stroke_path(&notch, &np);
-        }
-
         // Labels.
-        let label_size = (13.0 * zoom).clamp(6.0, 22.0);
-        if label_size >= 8.0 {
+        let label_size = (13.0 * zoom).clamp(5.0, 22.0);
+        if label_size >= 5.0 {
             let label = match comp.component_type.as_str() {
-                "clk" => String::new(), // clk draws a waveform glyph instead
+                // clk and dff draw glyphs instead of type names.
+                "clk" | "dff" => String::new(),
                 other => {
                     if is_primitive(other) {
                         other.to_uppercase()
@@ -314,8 +413,8 @@ impl Renderer {
                     Baseline::Middle,
                 );
             }
-            let id_size = (9.0 * zoom).clamp(6.0, 14.0);
-            if id_size >= 7.0 {
+            let id_size = (9.0 * zoom).clamp(5.0, 14.0);
+            if id_size >= 5.0 {
                 self.text(
                     canvas,
                     tl[0] + w / 2.0,
@@ -331,6 +430,9 @@ impl Renderer {
 
         if comp.component_type == "clk" {
             self.draw_clock_glyph(canvas, app, tl, w, h);
+        }
+        if comp.component_type == "dff" {
+            self.draw_dff_glyph(canvas, app, tl, w, h);
         }
 
         // dff initial-value badge (edit mode) / value badge (run mode).
@@ -355,7 +457,7 @@ impl Renderer {
         };
         let ports = layout::component_ports(abstractions, comp);
         let show_port_labels =
-            zoom >= 0.7 && (comp.component_type == "dff" || !is_primitive(&comp.component_type));
+            zoom >= 0.5 && (comp.component_type == "dff" || !is_primitive(&comp.component_type));
         for port in &ports {
             let s = app.camera.grid_to_screen(port.pos);
             let r = (5.0 * zoom).clamp(2.5, 8.0);
@@ -445,6 +547,43 @@ impl Renderer {
         paint.set_line_width((2.0 * app.camera.zoom).clamp(1.0, 3.0));
         paint.set_line_join(femtovg::LineJoin::Round);
         canvas.stroke_path(&p, &paint);
+    }
+
+    /// The flip-flop icon: a one-bit memory cell with the classic
+    /// clock-edge triangle on its left edge.
+    fn draw_dff_glyph(
+        &self,
+        canvas: &mut Canvas<OpenGl>,
+        app: &App,
+        tl: [f32; 2],
+        w: f32,
+        h: f32,
+    ) {
+        // Nudged right so the d/clk port labels keep their room.
+        let cx = tl[0] + w * 0.58;
+        let cy = tl[1] + h / 2.0;
+        let half = (h * 0.21).min(w * 0.15);
+
+        let mut cell = Path::new();
+        cell.rounded_rect(
+            cx - half,
+            cy - half,
+            half * 2.0,
+            half * 2.0,
+            half * 0.3,
+        );
+        let mut paint = Paint::color(theme::chip_label());
+        paint.set_line_width((2.0 * app.camera.zoom).clamp(1.0, 3.0));
+        paint.set_line_join(femtovg::LineJoin::Round);
+        canvas.stroke_path(&cell, &paint);
+
+        // Clock-edge marker: an open ">" sitting on the left edge.
+        let tri = half * 0.6;
+        let mut marker = Path::new();
+        marker.move_to(cx - half, cy - tri);
+        marker.line_to(cx - half + tri, cy);
+        marker.line_to(cx - half, cy + tri);
+        canvas.stroke_path(&marker, &paint);
     }
 
     fn draw_badge(&self, canvas: &mut Canvas<OpenGl>, zoom: f32, tl: [f32; 2], w: f32, on: bool) {
@@ -911,16 +1050,47 @@ impl Renderer {
             });
             stroke.set_line_width(1.2);
             canvas.stroke_path(&bg, &stroke);
-            self.text(
-                canvas,
-                r.x + r.w / 2.0,
-                r.y + r.h / 2.0,
-                &button.label,
-                12.5,
-                if button.enabled { theme::text() } else { theme::text_disabled() },
-                Align::Center,
-                Baseline::Middle,
-            );
+
+            let label_color = if button.enabled {
+                theme::text()
+            } else {
+                theme::text_disabled()
+            };
+            match button.hotkey {
+                // Blender-style: label on the left, dim hotkey on the right.
+                Some(hotkey) => {
+                    self.text(
+                        canvas,
+                        r.x + 10.0,
+                        r.y + r.h / 2.0,
+                        &button.label,
+                        12.5,
+                        label_color,
+                        Align::Left,
+                        Baseline::Middle,
+                    );
+                    self.text(
+                        canvas,
+                        r.x + r.w - 8.0,
+                        r.y + r.h / 2.0,
+                        hotkey,
+                        10.0,
+                        theme::text_dim(),
+                        Align::Right,
+                        Baseline::Middle,
+                    );
+                }
+                None => self.text(
+                    canvas,
+                    r.x + r.w / 2.0,
+                    r.y + r.h / 2.0,
+                    &button.label,
+                    12.5,
+                    label_color,
+                    Align::Center,
+                    Baseline::Middle,
+                ),
+            }
         }
 
         if let Some((label, x, y)) = &ui.step_label {
@@ -1023,6 +1193,12 @@ impl Renderer {
                     PortKind::Output => "output",
                 }
             )],
+            layout::Hit::Junction { .. } => {
+                if app.is_running() {
+                    return;
+                }
+                vec!["node — click to wire from it, drag to move, Delete removes".into()]
+            }
             layout::Hit::Component { component_id } => {
                 let (components, _) = app.editor.sheet_data();
                 let Some(comp) = components.iter().find(|c| &c.id == component_id) else {
@@ -1100,9 +1276,11 @@ impl Renderer {
     ) {
         let mut paint = Paint::color(color);
         paint.set_font(&[self.font]);
-        paint.set_font_size(size);
+        // Quantize size and snap the anchor to whole pixels: glyphs land on
+        // the pixel grid instead of being smeared across it.
+        paint.set_font_size((size * 2.0).round() / 2.0);
         paint.set_text_align(align);
         paint.set_text_baseline(baseline);
-        let _ = canvas.fill_text(x, y, s, &paint);
+        let _ = canvas.fill_text(x.round(), y.round(), s, &paint);
     }
 }

@@ -10,6 +10,7 @@ use crate::theme;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ButtonId {
     RunToggle,
+    PlayPause,
     Rewind,
     StepBack,
     StepForward,
@@ -25,6 +26,8 @@ pub struct Button {
     pub id: ButtonId,
     pub rect: Rect,
     pub label: String,
+    /// Blender-style inline hotkey hint, drawn dim next to the label.
+    pub hotkey: Option<&'static str>,
     pub enabled: bool,
     pub active: bool,
 }
@@ -111,25 +114,37 @@ pub fn ui_layout(app: &App) -> UiLayout {
     let mut bx = theme::PALETTE_WIDTH + 12.0;
     buttons.push(Button {
         id: ButtonId::RunToggle,
-        rect: Rect { x: bx, y: by, w: 74.0, h: bh },
+        rect: Rect { x: bx, y: by, w: 112.0, h: bh },
         label: if running { "■ Stop" } else { "▶ Run" }.into(),
+        hotkey: Some("Space"),
         enabled: true,
         active: running,
     });
-    bx += 86.0;
+    bx += 124.0;
 
     let mut step_label = None;
     match &app.mode {
         Mode::Run(session) => {
-            for (id, label, w) in [
-                (ButtonId::Rewind, "⟲", 30.0),
-                (ButtonId::StepBack, "◂", 30.0),
-                (ButtonId::StepForward, "▸", 30.0),
+            buttons.push(Button {
+                id: ButtonId::PlayPause,
+                rect: Rect { x: bx, y: by, w: 82.0, h: bh },
+                label: if app.playing { "Pause" } else { "Play" }.into(),
+                hotkey: Some("P"),
+                enabled: true,
+                active: app.playing,
+            });
+            bx += 94.0;
+
+            for (id, label, hotkey, w) in [
+                (ButtonId::Rewind, "⟲", "Home", 66.0),
+                (ButtonId::StepBack, "◂", "←", 52.0),
+                (ButtonId::StepForward, "▸", "→", 52.0),
             ] {
                 buttons.push(Button {
                     id,
                     rect: Rect { x: bx, y: by, w, h: bh },
                     label: label.into(),
+                    hotkey: Some(hotkey),
                     enabled: match id {
                         ButtonId::Rewind | ButtonId::StepBack => session.cursor > 0,
                         _ => true,
@@ -147,20 +162,22 @@ pub fn ui_layout(app: &App) -> UiLayout {
         Mode::Edit => {
             let editing_abstraction =
                 !matches!(app.editor.sheet, diycpu::editor::SheetRef::Top);
-            let edit_buttons: &[(ButtonId, &str, f32)] = if editing_abstraction {
-                &[
-                    (ButtonId::BackToTop, "◂ Back", 70.0),
-                    (ButtonId::AddInputPin, "+ input", 76.0),
-                    (ButtonId::AddOutputPin, "+ output", 86.0),
-                ]
-            } else {
-                &[(ButtonId::NewAbstraction, "+ abstraction", 110.0)]
-            };
-            for (id, label, w) in edit_buttons {
+            let edit_buttons: &[(ButtonId, &str, Option<&'static str>, f32)] =
+                if editing_abstraction {
+                    &[
+                        (ButtonId::BackToTop, "◂ Back", Some("Esc"), 96.0),
+                        (ButtonId::AddInputPin, "+ input", None, 76.0),
+                        (ButtonId::AddOutputPin, "+ output", None, 86.0),
+                    ]
+                } else {
+                    &[(ButtonId::NewAbstraction, "+ abstraction", None, 110.0)]
+                };
+            for (id, label, hotkey, w) in edit_buttons {
                 buttons.push(Button {
                     id: *id,
                     rect: Rect { x: bx, y: by, w: *w, h: bh },
                     label: (*label).into(),
+                    hotkey: *hotkey,
                     enabled: true,
                     active: false,
                 });
@@ -171,12 +188,16 @@ pub fn ui_layout(app: &App) -> UiLayout {
 
     // Right-aligned buttons.
     let mut rx = app.window_size[0] - 12.0;
-    for (id, label, w) in [(ButtonId::Save, "Save", 64.0), (ButtonId::Fit, "Fit view", 76.0)] {
+    for (id, label, hotkey, w) in [
+        (ButtonId::Save, "Save", Some("Ctrl+S"), 106.0),
+        (ButtonId::Fit, "Fit view", Some("F"), 98.0),
+    ] {
         rx -= w;
         buttons.push(Button {
             id,
             rect: Rect { x: rx, y: by, w, h: bh },
             label: label.into(),
+            hotkey,
             enabled: !matches!(id, ButtonId::Save) || !running,
             active: false,
         });

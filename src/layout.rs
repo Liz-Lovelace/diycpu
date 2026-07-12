@@ -14,6 +14,9 @@ pub const PORT_STUB: f32 = 0.5;
 /// Hit-test radius around a port center, in grid units.
 pub const PORT_HIT_RADIUS: f32 = 0.4;
 
+/// Hit-test radius around a wire node (junction), in grid units.
+pub const JUNCTION_HIT_RADIUS: f32 = 0.35;
+
 /// Hit-test distance from a wire centerline, in grid units.
 pub const WIRE_HIT_RADIUS: f32 = 0.25;
 
@@ -502,6 +505,11 @@ pub enum Hit {
         name: String,
         kind: PortKind,
     },
+    /// A wire node: click to draw from it, drag to move, Delete removes.
+    Junction {
+        net_id: String,
+        junction_id: String,
+    },
     Component {
         component_id: String,
     },
@@ -547,6 +555,19 @@ pub fn hit_test(
                 return Hit::Pin {
                     name: pin.name,
                     kind: pin.io,
+                };
+            }
+        }
+    }
+
+    // Wire nodes beat component bodies: a node routed over a chip must stay
+    // grabbable.
+    for net in wire_nets.iter().rev() {
+        for junction in net.junctions.iter().rev() {
+            if dist(p, junction.pos) <= JUNCTION_HIT_RADIUS {
+                return Hit::Junction {
+                    net_id: net.id.clone(),
+                    junction_id: junction.id.clone(),
                 };
             }
         }

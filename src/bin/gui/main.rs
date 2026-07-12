@@ -232,7 +232,7 @@ impl Shell {
             _ => match self.app.hover {
                 Hit::Port { .. } => CursorIcon::Crosshair,
                 Hit::Junction { .. } => CursorIcon::Grab,
-                Hit::Component { .. } => CursorIcon::Pointer,
+                Hit::Component { .. } | Hit::Note { .. } => CursorIcon::Pointer,
                 _ => CursorIcon::Default,
             },
         };
@@ -257,6 +257,7 @@ impl Shell {
                     ButtonId::StepForward => self.app.action_step_forward(),
                     ButtonId::Fit => self.app.fit_view(),
                     ButtonId::Save => self.app.save(),
+                    ButtonId::Open => self.app.open(),
                     ButtonId::NewAbstraction => self.app.action_new_abstraction(),
                     ButtonId::AddInputPin => {
                         self.app.action_add_pin(diycpu::layout::PortKind::Input)
@@ -264,10 +265,17 @@ impl Shell {
                     ButtonId::AddOutputPin => {
                         self.app.action_add_pin(diycpu::layout::PortKind::Output)
                     }
+                    ButtonId::RenameAbstraction => self.app.action_rename_title(),
+                    ButtonId::DeleteAbstraction => self.app.action_delete_abstraction(),
                     ButtonId::BackToTop => self.app.action_back_to_top(),
                 }
                 return;
             }
+        }
+
+        if ui.title_rect.contains(cursor) {
+            self.app.action_rename_title();
+            return;
         }
 
         for item in &ui.palette_items {

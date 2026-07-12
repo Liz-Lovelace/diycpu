@@ -441,6 +441,75 @@ pub fn output_target_port(target: &str) -> crate::project::PortRef {
     }
 }
 
+// ── Notes ────────────────────────────────────────────────────────────────────
+//
+// Notes wrap with a deterministic character-count algorithm so the hit
+// rectangle and the rendered text always agree (no font metrics needed).
+
+pub const NOTE_WRAP_CHARS: usize = 26;
+pub const NOTE_LINE_HEIGHT: f32 = 0.55;
+pub const NOTE_CHAR_WIDTH: f32 = 0.24;
+pub const NOTE_PADDING: f32 = 0.3;
+
+/// Greedy word wrap at [`NOTE_WRAP_CHARS`]; over-long words are hard-broken.
+pub fn wrap_note_text(text: &str) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let mut word = word.to_string();
+        loop {
+            let need = if current.is_empty() {
+                word.chars().count()
+            } else {
+                current.chars().count() + 1 + word.chars().count()
+            };
+            if need <= NOTE_WRAP_CHARS {
+                if !current.is_empty() {
+                    current.push(' ');
+                }
+                current.push_str(&word);
+                break;
+            }
+            if current.is_empty() {
+                // A single word longer than the line: hard-break it.
+                let head: String = word.chars().take(NOTE_WRAP_CHARS).collect();
+                let tail: String = word.chars().skip(NOTE_WRAP_CHARS).collect();
+                lines.push(head);
+                word = tail;
+                if word.is_empty() {
+                    break;
+                }
+            } else {
+                lines.push(std::mem::take(&mut current));
+            }
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
+}
+
+/// The clickable rectangle of a note, in grid units.
+pub fn note_bounds(note: &crate::project::Note) -> Rect {
+    let lines = wrap_note_text(&note.text);
+    let longest = lines
+        .iter()
+        .map(|l| l.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(4);
+    Rect {
+        x: note.pos[0],
+        y: note.pos[1],
+        w: longest as f32 * NOTE_CHAR_WIDTH + NOTE_PADDING * 2.0,
+        h: lines.len() as f32 * NOTE_LINE_HEIGHT + NOTE_PADDING * 2.0,
+    }
+}
+
 // ── Endpoint resolution and hit-testing ──────────────────────────────────────
 
 use crate::project::Endpoint;
@@ -517,6 +586,9 @@ pub enum Hit {
         net_id: String,
         segment_index: usize,
     },
+    Note {
+        note_id: String,
+    },
     Empty,
 }
 
@@ -524,6 +596,7 @@ pub fn hit_test(
     abstractions: &[ProjectAbstraction],
     components: &[ProjectComponent],
     wire_nets: &[WireNet],
+    notes: &[crate::project::Note],
     interface: Option<&ProjectAbstraction>,
     p: [f32; 2],
 ) -> Hit {
@@ -594,6 +667,15 @@ pub fn hit_test(
         }
     }
 
+    // Notes sit behind everything interactive.
+    for note in notes.iter().rev() {
+        if note_bounds(note).contains(p) {
+            return Hit::Note {
+                note_id: note.id.clone(),
+            };
+        }
+    }
+
     Hit::Empty
 }
 
@@ -644,6 +726,7 @@ mod tests {
             height: 2.0,
             components: vec![comp("gate", "nand", 0.0, 0.0)],
             wire_nets: vec![],
+        notes: vec![],
         }
     }
 
@@ -754,13 +837,13 @@ mod tests {
     fn hit_priority_port_over_body() {
         let comps = vec![comp("n1", "nand", 0.0, 0.0)];
         // Exactly on the "a" port.
-        let hit = hit_test(&[], &comps, &[], None, [0.0, 0.5]);
+        let hit = hit_test(&[], &comps, &[], &[], None, [0.0, 0.5]);
         assert!(matches!(hit, Hit::Port { ref port_name, .. } if port_name == "a"));
         // Center of the body.
-        let hit = hit_test(&[], &comps, &[], None, [1.5, 1.0]);
+        let hit = hit_test(&[], &comps, &[], &[], None, [1.5, 1.0]);
         assert!(matches!(hit, Hit::Component { ref component_id } if component_id == "n1"));
         // Far away.
-        assert_eq!(hit_test(&[], &comps, &[], None, [20.0, 20.0]), Hit::Empty);
+        assert_eq!(hit_test(&[], &comps, &[], &[], None, [20.0, 20.0]), Hit::Empty);
     }
 
     #[test]
@@ -792,7 +875,7 @@ mod tests {
         // sits near x=4 — probe a point on the wire.
         let pts = route_segment(&[], &comps, None, &net, 0).unwrap();
         let mid = pts[pts.len() / 2];
-        let hit = hit_test(&[], &comps, &[net.clone()], None, mid);
+        let hit = hit_test(&[], &comps, &[net.clone()], &[], None, mid);
         assert!(matches!(hit, Hit::Wire { ref net_id, .. } if net_id == "w1"));
     }
 

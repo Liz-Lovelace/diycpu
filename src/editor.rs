@@ -51,6 +51,8 @@ pub enum EditError {
     /// harmless, callers usually ignore it silently.
     NoopWire,
     OutputPinNeedsSource,
+    AbstractionInUse(usize),
+    UnknownNote(String),
 }
 
 impl fmt::Display for EditError {
@@ -95,6 +97,11 @@ impl fmt::Display for EditError {
             Self::OutputPinNeedsSource => {
                 write!(f, "This wire has no output driving it yet — connect one first")
             }
+            Self::AbstractionInUse(n) => write!(
+                f,
+                "This abstraction is placed {n} time(s) — delete those instances first"
+            ),
+            Self::UnknownNote(id) => write!(f, "That note ({id}) no longer exists"),
         }
     }
 }
@@ -137,6 +144,7 @@ impl Editor {
             abstractions: vec![],
             components: vec![],
             wire_nets: vec![],
+            notes: vec![],
         })
     }
 
@@ -145,6 +153,12 @@ impl Editor {
     /// The components and wire nets of the current sheet.
     pub fn sheet_data(&self) -> (&[ProjectComponent], &[WireNet]) {
         sheet_of(&self.project, self.sheet)
+            .expect("current sheet is always kept valid")
+    }
+
+    /// The annotations on the current sheet.
+    pub fn sheet_notes(&self) -> &[crate::project::Note] {
+        sheet_notes(&self.project, self.sheet)
             .expect("current sheet is always kept valid")
     }
 
@@ -280,10 +294,22 @@ impl Editor {
         ids: &[String],
         delta: [i32; 2],
     ) -> Result<(), EditError> {
+        self.move_items(ids, &[], delta)
+    }
+
+    /// Move components and notes together by a whole number of grid cells,
+    /// as one undo step. Only components have overlap rules.
+    pub fn move_items(
+        &mut self,
+        component_ids: &[String],
+        note_ids: &[String],
+        delta: [i32; 2],
+    ) -> Result<(), EditError> {
         if delta == [0, 0] {
             return Ok(()); // not an edit; don't spend an undo step
         }
-        let ids = ids.to_vec();
+        let ids = component_ids.to_vec();
+        let note_ids = note_ids.to_vec();
         self.mutate(move |project, sheet| {
             let abstractions = project.abstractions.clone();
             let (components, _) = sheet_mut(project, sheet).ok_or(EditError::BadSheet)?;
@@ -310,16 +336,36 @@ impl Editor {
                 comp.pos[0] += delta[0] as f32;
                 comp.pos[1] += delta[1] as f32;
             }
+
+            let notes = sheet_notes_mut(project, sheet).ok_or(EditError::BadSheet)?;
+            for id in &note_ids {
+                let note = notes
+                    .iter_mut()
+                    .find(|n| &n.id == id)
+                    .ok_or_else(|| EditError::UnknownNote(id.clone()))?;
+                note.pos[0] += delta[0] as f32;
+                note.pos[1] += delta[1] as f32;
+            }
             Ok(())
         })
     }
 
     /// Delete components and scrub every reference to them from wire nets.
     pub fn delete_components(&mut self, ids: &[String]) -> Result<(), EditError> {
-        if ids.is_empty() {
+        self.delete_items(ids, &[])
+    }
+
+    /// Delete components and notes as one undo step.
+    pub fn delete_items(
+        &mut self,
+        component_ids: &[String],
+        note_ids: &[String],
+    ) -> Result<(), EditError> {
+        if component_ids.is_empty() && note_ids.is_empty() {
             return Ok(());
         }
-        let ids = ids.to_vec();
+        let ids = component_ids.to_vec();
+        let note_ids = note_ids.to_vec();
         self.mutate(move |project, sheet| {
             let ctx = KindCtx::new(project, sheet)?;
             let (components, wire_nets) =
@@ -351,6 +397,53 @@ impl Editor {
                         target.clear();
                     }
                 }
+            }
+
+            let notes = sheet_notes_mut(project, sheet).ok_or(EditError::BadSheet)?;
+            notes.retain(|n| !note_ids.contains(&n.id));
+            Ok(())
+        })
+    }
+
+    // ── Notes ────────────────────────────────────────────────────────────
+
+    /// Place a text annotation. Returns its id.
+    pub fn place_note(&mut self, pos: [f32; 2], text: &str) -> Result<String, EditError> {
+        let text = text.to_string();
+        self.mutate(move |project, sheet| {
+            let notes = sheet_notes_mut(project, sheet).ok_or(EditError::BadSheet)?;
+            let id = {
+                let mut n = 1;
+                loop {
+                    let candidate = format!("note_{n}");
+                    if !notes.iter().any(|note| note.id == candidate) {
+                        break candidate;
+                    }
+                    n += 1;
+                }
+            };
+            notes.push(crate::project::Note {
+                id: id.clone(),
+                text: text.clone(),
+                pos,
+            });
+            Ok(id)
+        })
+    }
+
+    /// Change a note's text. Empty text deletes the note.
+    pub fn set_note_text(&mut self, id: &str, text: &str) -> Result<(), EditError> {
+        let id = id.to_string();
+        let text = text.trim().to_string();
+        self.mutate(move |project, sheet| {
+            let notes = sheet_notes_mut(project, sheet).ok_or(EditError::BadSheet)?;
+            if !notes.iter().any(|n| n.id == id) {
+                return Err(EditError::UnknownNote(id.clone()));
+            }
+            if text.is_empty() {
+                notes.retain(|n| n.id != id);
+            } else {
+                notes.iter_mut().find(|n| n.id == id).unwrap().text = text.clone();
             }
             Ok(())
         })
@@ -585,6 +678,7 @@ impl Editor {
                 return Err(EditError::InvalidName(name.clone()));
             }
             if crate::types::is_primitive(&name)
+                || name == "note"
                 || project.abstractions.iter().any(|a| a.name == name)
             {
                 return Err(EditError::NameTaken(name.clone()));
@@ -598,6 +692,7 @@ impl Editor {
                 height,
                 components: vec![],
                 wire_nets: vec![],
+                notes: vec![],
             });
             Ok(project.abstractions.len() - 1)
         })
@@ -677,6 +772,229 @@ impl Editor {
             Ok(())
         })
     }
+
+    /// Rename a pin of the abstraction being edited, rewriting every
+    /// reference: its own sheet's wires, the wires attached to instances on
+    /// every other sheet, and outputs-map targets that dot into instances.
+    pub fn rename_interface_pin(
+        &mut self,
+        kind: PortKind,
+        old: &str,
+        new: &str,
+    ) -> Result<(), EditError> {
+        if old == new {
+            return Ok(());
+        }
+        let old = old.to_string();
+        let new = new.to_string();
+        self.mutate(move |project, sheet| {
+            let SheetRef::Abstraction(index) = sheet else {
+                return Err(EditError::NotAnAbstractionSheet);
+            };
+            if !valid_name(&new) {
+                return Err(EditError::InvalidName(new.clone()));
+            }
+            let def = project.abstractions.get_mut(index).ok_or(EditError::BadSheet)?;
+            if def.inputs.iter().any(|x| x == &new) || def.outputs.contains_key(&new) {
+                return Err(EditError::NameTaken(new.clone()));
+            }
+            let abs_name = def.name.clone();
+
+            match kind {
+                PortKind::Input => {
+                    let slot = def
+                        .inputs
+                        .iter_mut()
+                        .find(|x| *x == &old)
+                        .ok_or_else(|| EditError::UnknownComponent(old.clone()))?;
+                    *slot = new.clone();
+                    // The pin's pseudo-port inside its own sheet.
+                    let old_id = format!("{}{old}", crate::convert::INPUT_PREFIX);
+                    let new_id = format!("{}{new}", crate::convert::INPUT_PREFIX);
+                    let rewrite = |p: &mut PortRef| {
+                        if p.component_id == old_id {
+                            p.component_id = new_id.clone();
+                            p.port_name = new.clone();
+                        }
+                    };
+                    for net in def.wire_nets.iter_mut() {
+                        if let Some(s) = &mut net.source {
+                            rewrite(s);
+                        }
+                        net.sinks.iter_mut().for_each(&rewrite);
+                        for seg in &mut net.segments {
+                            for e in [&mut seg.from, &mut seg.to] {
+                                if let Endpoint::Port {
+                                    component_id,
+                                    port_name,
+                                } = e
+                                {
+                                    if *component_id == old_id {
+                                        *component_id = new_id.clone();
+                                        *port_name = new.clone();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                PortKind::Output => {
+                    let target = def
+                        .outputs
+                        .remove(&old)
+                        .ok_or_else(|| EditError::UnknownComponent(old.clone()))?;
+                    def.outputs.insert(new.clone(), target);
+                }
+            }
+
+            // The pin's port on every instance, on every sheet.
+            let sheet_count = project.abstractions.len() + 1;
+            for sheet_index in 0..sheet_count {
+                let (components, wire_nets) = if sheet_index == 0 {
+                    (&project.components, &mut project.wire_nets)
+                } else {
+                    let a = &mut project.abstractions[sheet_index - 1];
+                    (&a.components, &mut a.wire_nets)
+                };
+                let instances: Vec<String> = components
+                    .iter()
+                    .filter(|c| c.component_type == abs_name)
+                    .map(|c| c.id.clone())
+                    .collect();
+                if instances.is_empty() {
+                    continue;
+                }
+                for net in wire_nets.iter_mut() {
+                    let rewrite = |p: &mut PortRef| {
+                        if instances.contains(&p.component_id) && p.port_name == old {
+                            p.port_name = new.clone();
+                        }
+                    };
+                    if let Some(s) = &mut net.source {
+                        rewrite(s);
+                    }
+                    net.sinks.iter_mut().for_each(rewrite);
+                    for seg in &mut net.segments {
+                        for e in [&mut seg.from, &mut seg.to] {
+                            if let Endpoint::Port {
+                                component_id,
+                                port_name,
+                            } = e
+                            {
+                                if instances.contains(component_id) && *port_name == old {
+                                    *port_name = new.clone();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Renamed OUTPUT pins can appear in other abstractions' outputs
+            // maps as "instance.old" dot targets.
+            if kind == PortKind::Output {
+                for a in project.abstractions.iter_mut() {
+                    let instances: Vec<String> = a
+                        .components
+                        .iter()
+                        .filter(|c| c.component_type == abs_name)
+                        .map(|c| c.id.clone())
+                        .collect();
+                    if instances.is_empty() {
+                        continue;
+                    }
+                    for target in a.outputs.values_mut() {
+                        let port = layout::output_target_port(target);
+                        if instances.contains(&port.component_id) && port.port_name == old {
+                            *target = format!("{}.{new}", port.component_id);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Rename the abstraction being edited, retyping every instance.
+    pub fn rename_abstraction(&mut self, index: usize, new_name: &str) -> Result<(), EditError> {
+        let new_name = new_name.to_string();
+        self.mutate(move |project, _| {
+            let old_name = project
+                .abstractions
+                .get(index)
+                .ok_or(EditError::BadSheet)?
+                .name
+                .clone();
+            if new_name == old_name {
+                return Ok(());
+            }
+            if !valid_name(&new_name) {
+                return Err(EditError::InvalidName(new_name.clone()));
+            }
+            if crate::types::is_primitive(&new_name)
+                || new_name == "note"
+                || project.abstractions.iter().any(|a| a.name == new_name)
+            {
+                return Err(EditError::NameTaken(new_name.clone()));
+            }
+            project.abstractions[index].name = new_name.clone();
+            for comp in project.components.iter_mut() {
+                if comp.component_type == old_name {
+                    comp.component_type = new_name.clone();
+                }
+            }
+            for a in project.abstractions.iter_mut() {
+                for comp in a.components.iter_mut() {
+                    if comp.component_type == old_name {
+                        comp.component_type = new_name.clone();
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Rename the project (its display title, also the default filename).
+    pub fn rename_project(&mut self, name: &str) -> Result<(), EditError> {
+        let name = name.trim().to_string();
+        self.mutate(move |project, _| {
+            if name.is_empty() {
+                return Err(EditError::InvalidName(name.clone()));
+            }
+            project.name = name.clone();
+            Ok(())
+        })
+    }
+
+    /// Delete an abstraction type. Refused while instances of it exist.
+    pub fn delete_abstraction(&mut self, index: usize) -> Result<(), EditError> {
+        self.mutate(move |project, _| {
+            let name = project
+                .abstractions
+                .get(index)
+                .ok_or(EditError::BadSheet)?
+                .name
+                .clone();
+            let uses = project
+                .components
+                .iter()
+                .chain(project.abstractions.iter().flat_map(|a| a.components.iter()))
+                .filter(|c| c.component_type == name)
+                .count();
+            if uses > 0 {
+                return Err(EditError::AbstractionInUse(uses));
+            }
+            project.abstractions.remove(index);
+            Ok(())
+        })?;
+        // The sheet indices above `index` all shifted down by one.
+        self.sheet = match self.sheet {
+            SheetRef::Abstraction(j) if j == index => SheetRef::Top,
+            SheetRef::Abstraction(j) if j > index => SheetRef::Abstraction(j - 1),
+            other => other,
+        };
+        Ok(())
+    }
 }
 
 /// Keep an abstraction's instance footprint tall enough for its pins.
@@ -712,6 +1030,23 @@ fn sheet_mut(
             .abstractions
             .get_mut(i)
             .map(|a| (&mut a.components, &mut a.wire_nets)),
+    }
+}
+
+pub fn sheet_notes(project: &Project, sheet: SheetRef) -> Option<&[crate::project::Note]> {
+    match sheet {
+        SheetRef::Top => Some(project.notes.as_slice()),
+        SheetRef::Abstraction(i) => project.abstractions.get(i).map(|a| a.notes.as_slice()),
+    }
+}
+
+fn sheet_notes_mut(
+    project: &mut Project,
+    sheet: SheetRef,
+) -> Option<&mut Vec<crate::project::Note>> {
+    match sheet {
+        SheetRef::Top => Some(&mut project.notes),
+        SheetRef::Abstraction(i) => project.abstractions.get_mut(i).map(|a| &mut a.notes),
     }
 }
 
@@ -1970,6 +2305,7 @@ mod tests {
                 pos: [2.0, 2.0],
             }],
             wire_nets: vec![],
+        notes: vec![],
         });
         e
     }
@@ -2431,6 +2767,177 @@ mod tests {
         let notes = normalize(&mut project);
         assert_eq!(project.abstractions[i].outputs["q"], "");
         assert!(!notes.is_empty());
+    }
+
+    // ── Notes ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn notes_place_edit_move_delete() {
+        let mut e = Editor::empty();
+        let id = e.place_note([2.0, 3.0], "reset logic lives here").unwrap();
+        assert_eq!(id, "note_1");
+        e.move_items(&[], &[id.clone()], [4, 1]).unwrap();
+        assert_eq!(e.project.notes[0].pos, [6.0, 4.0]);
+        e.set_note_text(&id, "updated").unwrap();
+        assert_eq!(e.project.notes[0].text, "updated");
+        // Empty text deletes.
+        e.set_note_text(&id, "  ").unwrap();
+        assert!(e.project.notes.is_empty());
+        e.undo().unwrap();
+        assert_eq!(e.project.notes[0].text, "updated");
+    }
+
+    #[test]
+    fn notes_delete_together_with_components() {
+        let mut e = Editor::empty();
+        e.place_component("nand", [0, 0]).unwrap();
+        let note = e.place_note([5.0, 5.0], "hello").unwrap();
+        e.delete_items(&["nand_1".into()], &[note]).unwrap();
+        assert!(e.project.components.is_empty());
+        assert!(e.project.notes.is_empty());
+        // One undo restores both (single op).
+        e.undo().unwrap();
+        assert_eq!(e.project.components.len(), 1);
+        assert_eq!(e.project.notes.len(), 1);
+    }
+
+    // ── Renames & abstraction deletion ───────────────────────────────────
+
+    fn abstraction_with_instance() -> Editor {
+        let mut e = Editor::empty();
+        let i = e.create_abstraction("buf").unwrap();
+        e.open_sheet(SheetRef::Abstraction(i)).unwrap();
+        e.add_interface_pin(PortKind::Input, "x").unwrap();
+        e.add_interface_pin(PortKind::Output, "q").unwrap();
+        e.place_component("nand", [4, 0]).unwrap();
+        e.connect(pin("INPUT:", "x"), port("nand_1", "a"), &[]).unwrap();
+        e.connect(pin("INPUT:", "x"), port("nand_1", "b"), &[]).unwrap();
+        e.connect(port("nand_1", "out"), pin("OUTPUT:", "q"), &[])
+            .unwrap();
+        e.open_sheet(SheetRef::Top).unwrap();
+        e.place_component("dff", [0, 0]).unwrap();
+        e.place_component("buf", [8, 0]).unwrap();
+        // IDs are unique per sheet, so this is nand_1 at top level.
+        let top_nand = e.place_component("nand", [16, 0]).unwrap();
+        e.connect(port("dff_1", "out"), port("buf_1", "x"), &[]).unwrap();
+        e.connect(port("buf_1", "q"), port(&top_nand, "a"), &[]).unwrap();
+        e
+    }
+
+    #[test]
+    fn rename_input_pin_rewrites_everything() {
+        let mut e = abstraction_with_instance();
+        e.open_sheet(SheetRef::Abstraction(0)).unwrap();
+        e.rename_interface_pin(PortKind::Input, "x", "data").unwrap();
+
+        let def = &e.project.abstractions[0];
+        assert_eq!(def.inputs, vec!["data"]);
+        // Inside: nets now reference INPUT:data.
+        assert_eq!(
+            def.wire_nets[0].source,
+            Some(pin("INPUT:", "data"))
+        );
+        // Outside: the instance's wired port follows.
+        assert!(e
+            .project
+            .wire_nets
+            .iter()
+            .any(|n| n.sinks.contains(&port("buf_1", "data"))));
+        // The circuit still compiles and runs.
+        use crate::convert::project_to_circuit;
+        assert!(project_to_circuit(&e.project).is_ok());
+        let mut p = e.project.clone();
+        assert!(normalize(&mut p).is_empty(), "rename left inconsistencies");
+    }
+
+    #[test]
+    fn rename_output_pin_rewrites_instance_wires_and_dot_targets() {
+        let mut e = abstraction_with_instance();
+        // Nest buf inside a second abstraction that exports its output.
+        let j = e.create_abstraction("wrapper").unwrap();
+        e.open_sheet(SheetRef::Abstraction(j)).unwrap();
+        e.add_interface_pin(PortKind::Output, "w").unwrap();
+        e.place_component("buf", [4, 0]).unwrap();
+        e.connect(port("buf_1", "q"), pin("OUTPUT:", "w"), &[]).unwrap();
+        assert_eq!(
+            e.project.abstractions[j].outputs.get("w"),
+            Some(&"buf_1.q".to_string())
+        );
+
+        e.open_sheet(SheetRef::Abstraction(0)).unwrap();
+        e.rename_interface_pin(PortKind::Output, "q", "result").unwrap();
+
+        assert!(e.project.abstractions[0].outputs.contains_key("result"));
+        // Top-level wire from the instance's output follows.
+        assert!(e
+            .project
+            .wire_nets
+            .iter()
+            .any(|n| n.source == Some(port("buf_1", "result"))));
+        // The wrapper's dot target follows too.
+        assert_eq!(
+            e.project.abstractions[j].outputs.get("w"),
+            Some(&"buf_1.result".to_string())
+        );
+        let mut p = e.project.clone();
+        assert!(normalize(&mut p).is_empty(), "rename left inconsistencies");
+    }
+
+    #[test]
+    fn rename_pin_rejects_collisions() {
+        let mut e = abstraction_with_instance();
+        e.open_sheet(SheetRef::Abstraction(0)).unwrap();
+        assert!(matches!(
+            e.rename_interface_pin(PortKind::Input, "x", "q").unwrap_err(),
+            EditError::NameTaken(_)
+        ));
+        assert!(matches!(
+            e.rename_interface_pin(PortKind::Input, "x", "has space")
+                .unwrap_err(),
+            EditError::InvalidName(_)
+        ));
+    }
+
+    #[test]
+    fn rename_abstraction_retypes_instances() {
+        let mut e = abstraction_with_instance();
+        e.rename_abstraction(0, "buffer").unwrap();
+        assert_eq!(e.project.abstractions[0].name, "buffer");
+        assert_eq!(e.project.components[1].component_type, "buffer");
+        assert!(matches!(
+            e.rename_abstraction(0, "nand").unwrap_err(),
+            EditError::NameTaken(_)
+        ));
+        use crate::convert::project_to_circuit;
+        assert!(project_to_circuit(&e.project).is_ok());
+    }
+
+    #[test]
+    fn rename_project_allows_free_text() {
+        let mut e = Editor::empty();
+        e.rename_project("My First CPU!").unwrap();
+        assert_eq!(e.project.name, "My First CPU!");
+        assert!(matches!(
+            e.rename_project("   ").unwrap_err(),
+            EditError::InvalidName(_)
+        ));
+    }
+
+    #[test]
+    fn delete_abstraction_refused_while_used() {
+        let mut e = abstraction_with_instance();
+        assert!(matches!(
+            e.delete_abstraction(0).unwrap_err(),
+            EditError::AbstractionInUse(1)
+        ));
+        e.delete_components(&["buf_1".into()]).unwrap();
+        e.open_sheet(SheetRef::Abstraction(0)).unwrap();
+        e.delete_abstraction(0).unwrap();
+        assert!(e.project.abstractions.is_empty());
+        assert_eq!(e.sheet, SheetRef::Top, "deleting the open sheet goes home");
+        // Undo brings it back (and the sheet restore comes from the stack).
+        e.undo().unwrap();
+        assert_eq!(e.project.abstractions.len(), 1);
     }
 
     // ── Normalization ────────────────────────────────────────────────────

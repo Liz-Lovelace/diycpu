@@ -32,9 +32,6 @@ pub fn chip_border() -> Color {
 pub fn chip_label() -> Color {
     hex(0x2B303B)
 }
-pub fn chip_sublabel() -> Color {
-    hex(0x9AA0AB)
-}
 pub fn chip_shadow() -> Color {
     Color::rgba(40, 44, 52, 22)
 }
@@ -103,6 +100,12 @@ pub fn badge_on_bg() -> Color {
 pub fn badge_off_bg() -> Color {
     hex(0xEDEFF2)
 }
+pub fn value_digit_on() -> Color {
+    hex(0xB87A00) // dark amber, readable on the tinted body
+}
+pub fn value_digit_off() -> Color {
+    hex(0x8A909C)
+}
 
 // ── Abstraction interface pins ──
 pub fn pin_plate_input_bg() -> Color {
@@ -116,6 +119,17 @@ pub fn pin_plate_border() -> Color {
 }
 pub fn pin_label() -> Color {
     hex(0x3E4450)
+}
+
+// ── Notes ──
+pub fn note_bg() -> Color {
+    hex(0xFFF7D6)
+}
+pub fn note_border() -> Color {
+    hex(0xE3D9A8)
+}
+pub fn note_text() -> Color {
+    hex(0x5C5638)
 }
 
 // ── UI chrome ──

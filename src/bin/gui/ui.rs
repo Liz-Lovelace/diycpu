@@ -16,9 +16,12 @@ pub enum ButtonId {
     StepForward,
     Fit,
     Save,
+    Open,
     NewAbstraction,
     AddInputPin,
     AddOutputPin,
+    RenameAbstraction,
+    DeleteAbstraction,
     BackToTop,
 }
 
@@ -45,6 +48,8 @@ pub struct UiLayout {
     pub buttons: Vec<Button>,
     /// "step k" readout position (run mode), None otherwise.
     pub step_label: Option<(String, f32, f32)>,
+    /// Clickable title region (click renames the project / abstraction).
+    pub title_rect: Rect,
 }
 
 pub fn ui_layout(app: &App) -> UiLayout {
@@ -74,11 +79,12 @@ pub fn ui_layout(app: &App) -> UiLayout {
         _ => None,
     };
 
+    let is_builtin = |name: &str| matches!(name, "clk" | "nand" | "dff" | "note");
     for item in app.palette_items() {
-        let is_abstraction_start = !matches!(item.as_str(), "clk" | "nand" | "dff")
+        let is_abstraction_start = !is_builtin(&item)
             && !palette_items
                 .iter()
-                .any(|p: &PaletteItem| !matches!(p.type_name.as_str(), "clk" | "nand" | "dff"));
+                .any(|p: &PaletteItem| !is_builtin(&p.type_name));
         if is_abstraction_start {
             y += 10.0;
             section_headers.push(("ABSTRACTIONS".to_string(), y + 12.0));
@@ -168,6 +174,8 @@ pub fn ui_layout(app: &App) -> UiLayout {
                         (ButtonId::BackToTop, "◂ Back", Some("Esc"), 96.0),
                         (ButtonId::AddInputPin, "+ input", None, 76.0),
                         (ButtonId::AddOutputPin, "+ output", None, 86.0),
+                        (ButtonId::RenameAbstraction, "Rename", None, 76.0),
+                        (ButtonId::DeleteAbstraction, "Delete", None, 72.0),
                     ]
                 } else {
                     &[(ButtonId::NewAbstraction, "+ abstraction", None, 110.0)]
@@ -190,6 +198,7 @@ pub fn ui_layout(app: &App) -> UiLayout {
     let mut rx = app.window_size[0] - 12.0;
     for (id, label, hotkey, w) in [
         (ButtonId::Save, "Save", Some("Ctrl+S"), 106.0),
+        (ButtonId::Open, "Open", Some("Ctrl+O"), 100.0),
         (ButtonId::Fit, "Fit view", Some("F"), 98.0),
     ] {
         rx -= w;
@@ -198,16 +207,37 @@ pub fn ui_layout(app: &App) -> UiLayout {
             rect: Rect { x: rx, y: by, w, h: bh },
             label: label.into(),
             hotkey,
-            enabled: !matches!(id, ButtonId::Save) || !running,
+            enabled: !matches!(id, ButtonId::Save | ButtonId::Open) || !running,
             active: false,
         });
         rx -= 8.0;
     }
+
+    // The title doubles as the rename affordance; approximate its width
+    // from the displayed text length.
+    let title_len = app.editor.project.name.chars().count()
+        + match app.editor.sheet {
+            diycpu::editor::SheetRef::Abstraction(i) => app
+                .editor
+                .project
+                .abstractions
+                .get(i)
+                .map(|a| a.name.chars().count() + 3)
+                .unwrap_or(0),
+            diycpu::editor::SheetRef::Top => 0,
+        };
+    let title_rect = Rect {
+        x: 8.0,
+        y: 6.0,
+        w: (title_len as f32 * 8.0 + 20.0).min(theme::PALETTE_WIDTH - 10.0),
+        h: theme::TOPBAR_HEIGHT - 12.0,
+    };
 
     UiLayout {
         palette_items,
         section_headers,
         buttons,
         step_label,
+        title_rect,
     }
 }

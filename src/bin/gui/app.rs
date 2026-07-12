@@ -33,13 +33,18 @@ pub enum Gesture {
     Placing {
         type_name: String,
     },
-    /// Left button down on a component; not yet decided click vs drag.
+    /// Left button down on a component or note; not yet decided click vs drag.
     PressedComponent {
+        id: String,
+        press_screen: [f32; 2],
+    },
+    PressedNote {
         id: String,
         press_screen: [f32; 2],
     },
     DraggingComponents {
         ids: Vec<String>,
+        note_ids: Vec<String>,
         press_grid: [f32; 2],
         delta: [i32; 2],
     },
@@ -71,6 +76,7 @@ pub enum Gesture {
 #[derive(Default)]
 pub struct Selection {
     pub components: Vec<String>,
+    pub notes: Vec<String>,
     pub net: Option<String>,
     /// A selected interface pin (kind, name) inside an abstraction sheet.
     pub pin: Option<(PortKind, String)>,
@@ -79,26 +85,38 @@ pub struct Selection {
 impl Selection {
     pub fn clear(&mut self) {
         self.components.clear();
+        self.notes.clear();
         self.net = None;
         self.pin = None;
     }
     pub fn is_empty(&self) -> bool {
-        self.components.is_empty() && self.net.is_none() && self.pin.is_none()
+        self.components.is_empty()
+            && self.notes.is_empty()
+            && self.net.is_none()
+            && self.pin.is_none()
     }
 }
 
 /// What a text prompt, once confirmed, will do.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum PromptAction {
     NewAbstraction,
     AddInputPin,
     AddOutputPin,
+    NewNote { pos: [i32; 2] },
+    EditNote { id: String },
+    RenamePin { kind: PortKind, old: String },
+    RenameAbstraction { index: usize },
+    RenameProject,
 }
 
 pub struct Prompt {
     pub title: String,
     pub value: String,
     pub action: PromptAction,
+    /// Identifier prompts filter input to name-safe characters; free-text
+    /// prompts (notes, project title) accept anything printable.
+    pub identifier: bool,
 }
 
 /// Keyboard input, abstracted away from the windowing library so the app
@@ -137,8 +155,9 @@ pub struct App {
     pub prompt: Option<Prompt>,
     /// Run mode advances the clock on a timer.
     pub playing: bool,
-    /// Set when Ctrl+N is pressed with unsaved changes; a second press confirms.
-    confirm_new: bool,
+    /// Set when an action would discard unsaved changes; repeating the
+    /// action confirms it. Any other click clears it.
+    pending_discard: Option<DiscardIntent>,
     /// Fit the view to content at the next opportunity (needs window size).
     pub pending_fit: bool,
 }
@@ -186,7 +205,7 @@ impl App {
             hover: Hit::Empty,
             prompt: None,
             playing: false,
-            confirm_new: false,
+            pending_discard: None,
             pending_fit: true,
         }
     }
@@ -240,6 +259,8 @@ impl App {
                 &self.editor.project.abstractions,
                 components,
                 wire_nets,
+                diycpu::editor::sheet_notes(&self.editor.project, self.editor.sheet)
+                    .unwrap_or(&[]),
                 self.interface(),
                 g,
             )
@@ -248,17 +269,30 @@ impl App {
         };
     }
 
-    /// The palette entries: primitives, then abstraction types.
+    /// The palette entries: primitives and the note tool, then abstractions.
     pub fn palette_items(&self) -> Vec<String> {
-        let mut items = vec!["clk".to_string(), "nand".to_string(), "dff".to_string()];
+        let mut items = vec![
+            "clk".to_string(),
+            "nand".to_string(),
+            "dff".to_string(),
+            "note".to_string(),
+        ];
         items.extend(self.editor.project.abstractions.iter().map(|a| a.name.clone()));
         items
     }
 
+    /// Nominal footprint of a palette item's ghost (notes size to their text
+    /// once typed; the ghost just shows where it lands).
+    pub fn placement_size(&self, type_name: &str) -> [f32; 2] {
+        if type_name == "note" {
+            return [4.0, 1.2];
+        }
+        layout::type_size(&self.editor.project.abstractions, type_name).unwrap_or([3.0, 2.0])
+    }
+
     /// Snapped top-left placement position so the ghost centers on the cursor.
     pub fn placement_pos(&self, type_name: &str) -> [i32; 2] {
-        let size = layout::type_size(&self.editor.project.abstractions, type_name)
-            .unwrap_or([3.0, 2.0]);
+        let size = self.placement_size(type_name);
         let g = self.cursor_grid();
         [
             (g[0] - size[0] / 2.0).round() as i32,
@@ -269,6 +303,9 @@ impl App {
     /// Would placing/moving these footprints collide? Used by ghost previews;
     /// the editor re-validates authoritatively on commit.
     pub fn placement_is_valid(&self, type_name: &str) -> bool {
+        if type_name == "note" {
+            return true; // annotations may sit anywhere
+        }
         let abstractions = &self.editor.project.abstractions;
         let Some(size) = layout::type_size(abstractions, type_name) else {
             return false;
@@ -407,11 +444,34 @@ impl App {
 
     // ── File operations ──────────────────────────────────────────────────
 
+    /// Save to the current file, or fall through to Save As when the
+    /// project has never been saved.
     pub fn save(&mut self) {
-        let path = self
-            .file_path
-            .clone()
-            .unwrap_or_else(|| PathBuf::from(format!("{}.json", self.editor.project.name)));
+        match self.file_path.clone() {
+            Some(path) => self.write_to(path),
+            None => self.save_as(),
+        }
+    }
+
+    pub fn save_as(&mut self) {
+        let default_name: String = self
+            .editor
+            .project
+            .name
+            .chars()
+            .map(|c| if c == '/' || c == '\\' { '-' } else { c })
+            .collect();
+        let picked = rfd::FileDialog::new()
+            .add_filter("circuit", &["json"])
+            .set_file_name(format!("{default_name}.json"))
+            .save_file();
+        match picked {
+            Some(path) => self.write_to(path),
+            None => self.info("Save cancelled"),
+        }
+    }
+
+    fn write_to(&mut self, path: PathBuf) {
         match serde_json::to_string_pretty(&self.editor.project)
             .map_err(|e| e.to_string())
             .and_then(|json| std::fs::write(&path, json + "\n").map_err(|e| e.to_string()))
@@ -425,13 +485,21 @@ impl App {
         }
     }
 
+    /// True when it's safe to discard the document (clean, or confirmed).
+    fn confirm_discard(&mut self, intent: DiscardIntent, again: &str) -> bool {
+        if !self.editor.dirty || self.pending_discard == Some(intent) {
+            self.pending_discard = None;
+            return true;
+        }
+        self.pending_discard = Some(intent);
+        self.error(format!("Unsaved changes — {again} again to discard them"));
+        false
+    }
+
     fn new_project(&mut self) {
-        if self.editor.dirty && !self.confirm_new {
-            self.confirm_new = true;
-            self.error("Unsaved changes — press Ctrl+N again to discard them");
+        if !self.confirm_discard(DiscardIntent::New, "press Ctrl+N") {
             return;
         }
-        self.confirm_new = false;
         self.editor = Editor::empty();
         self.file_path = None;
         self.selection.clear();
@@ -439,6 +507,40 @@ impl App {
         self.mode = Mode::Edit;
         self.pending_fit = true;
         self.info("New circuit");
+    }
+
+    pub fn open(&mut self) {
+        if !self.confirm_discard(DiscardIntent::Open, "choose Open") {
+            return;
+        }
+        let picked = rfd::FileDialog::new()
+            .add_filter("circuit", &["json"])
+            .pick_file();
+        let Some(path) = picked else {
+            self.info("Open cancelled");
+            return;
+        };
+        match load_project(&path) {
+            Ok((project, notes)) => {
+                self.editor = Editor::new(project);
+                self.file_path = Some(path.clone());
+                self.selection.clear();
+                self.gesture = Gesture::Idle;
+                self.mode = Mode::Edit;
+                self.playing = false;
+                self.pending_fit = true;
+                if notes.is_empty() {
+                    self.info(format!("Opened {}", path.display()));
+                } else {
+                    self.error(format!(
+                        "Opened {} — repaired: {}",
+                        path.display(),
+                        notes.join("; ")
+                    ));
+                }
+            }
+            Err(e) => self.error(e),
+        }
     }
 
     // ── Run mode ─────────────────────────────────────────────────────────
@@ -531,17 +633,43 @@ impl App {
                 if dist(pos, *press_screen) > DRAG_THRESHOLD_PX {
                     // Promote to drag: the pressed component leads; if it's
                     // part of the selection the whole selection comes along.
-                    let ids = if self.selection.components.contains(id) {
-                        self.selection.components.clone()
+                    let (ids, note_ids) = if self.selection.components.contains(id) {
+                        (
+                            self.selection.components.clone(),
+                            self.selection.notes.clone(),
+                        )
                     } else {
                         let ids = vec![id.clone()];
+                        self.selection.clear();
                         self.selection.components = ids.clone();
-                        self.selection.net = None;
-                        ids
+                        (ids, vec![])
                     };
                     let press_grid = self.camera.screen_to_grid(*press_screen);
                     self.gesture = Gesture::DraggingComponents {
                         ids,
+                        note_ids,
+                        press_grid,
+                        delta: [0, 0],
+                    };
+                }
+            }
+            Gesture::PressedNote { id, press_screen } => {
+                if dist(pos, *press_screen) > DRAG_THRESHOLD_PX {
+                    let (ids, note_ids) = if self.selection.notes.contains(id) {
+                        (
+                            self.selection.components.clone(),
+                            self.selection.notes.clone(),
+                        )
+                    } else {
+                        let note_ids = vec![id.clone()];
+                        self.selection.clear();
+                        self.selection.notes = note_ids.clone();
+                        (vec![], note_ids)
+                    };
+                    let press_grid = self.camera.screen_to_grid(*press_screen);
+                    self.gesture = Gesture::DraggingComponents {
+                        ids,
+                        note_ids,
                         press_grid,
                         delta: [0, 0],
                     };
@@ -587,7 +715,7 @@ impl App {
     }
 
     pub fn left_pressed(&mut self) {
-        self.confirm_new = false;
+        self.pending_discard = None;
 
         // A click outside an open prompt dismisses it.
         if self.prompt.is_some() {
@@ -606,11 +734,22 @@ impl App {
             Gesture::Placing { type_name } => {
                 let type_name = type_name.clone();
                 let pos = self.placement_pos(&type_name);
+                if type_name == "note" {
+                    // The note is only created once its text is confirmed.
+                    self.gesture = Gesture::Idle;
+                    self.prompt = Some(Prompt {
+                        title: "Note text".into(),
+                        value: String::new(),
+                        action: PromptAction::NewNote { pos },
+                        identifier: false,
+                    });
+                    return;
+                }
                 match self.editor.place_component(&type_name, pos) {
                     Ok(id) => {
-                        self.selection.components = vec![id.clone()];
-                        self.selection.net = None;
-                        self.info(format!("Placed {id}"));
+                        self.selection.clear();
+                        self.selection.components = vec![id];
+                        self.info(format!("Placed a {type_name}"));
                         if !self.shift {
                             self.gesture = Gesture::Idle;
                         }
@@ -630,8 +769,8 @@ impl App {
             // Selection-only interactions while running.
             match self.hover.clone() {
                 Hit::Component { component_id } => {
+                    self.selection.clear();
                     self.selection.components = vec![component_id];
-                    self.selection.net = None;
                 }
                 Hit::Wire { net_id, .. } => {
                     self.selection.clear();
@@ -682,13 +821,34 @@ impl App {
                         self.selection.components.push(component_id);
                     }
                     self.selection.net = None;
+                    self.selection.pin = None;
                 } else {
                     if !self.selection.components.contains(&component_id) {
+                        self.selection.clear();
                         self.selection.components = vec![component_id.clone()];
-                        self.selection.net = None;
                     }
                     self.gesture = Gesture::PressedComponent {
                         id: component_id,
+                        press_screen: self.cursor,
+                    };
+                }
+            }
+            Hit::Note { note_id } => {
+                if self.ctrl {
+                    if let Some(i) = self.selection.notes.iter().position(|n| n == &note_id) {
+                        self.selection.notes.remove(i);
+                    } else {
+                        self.selection.notes.push(note_id);
+                    }
+                    self.selection.net = None;
+                    self.selection.pin = None;
+                } else {
+                    if !self.selection.notes.contains(&note_id) {
+                        self.selection.clear();
+                        self.selection.notes = vec![note_id.clone()];
+                    }
+                    self.gesture = Gesture::PressedNote {
+                        id: note_id,
                         press_screen: self.cursor,
                     };
                 }
@@ -785,15 +945,22 @@ impl App {
             }
             Gesture::PressedComponent { id, .. } => {
                 // A click (no drag): collapse the selection to this component.
+                self.selection.clear();
                 self.selection.components = vec![id];
-                self.selection.net = None;
             }
-            Gesture::DraggingComponents { ids, delta, .. } => {
-                match self.editor.move_components(&ids, delta) {
-                    Ok(()) => {}
-                    Err(e) => self.error(e.to_string()),
-                }
+            Gesture::PressedNote { id, .. } => {
+                self.selection.clear();
+                self.selection.notes = vec![id];
             }
+            Gesture::DraggingComponents {
+                ids,
+                note_ids,
+                delta,
+                ..
+            } => match self.editor.move_items(&ids, &note_ids, delta) {
+                Ok(()) => {}
+                Err(e) => self.error(e.to_string()),
+            },
             Gesture::PressedEmpty { .. } => {
                 self.selection.clear();
             }
@@ -802,12 +969,21 @@ impl App {
                 let band = rect_between(start_grid, g);
                 let abstractions = &self.editor.project.abstractions;
                 let (components, _) = self.editor.sheet_data();
-                self.selection.components = components
+                let components: Vec<String> = components
                     .iter()
                     .filter(|c| layout::footprint(abstractions, c).intersects(&band))
                     .map(|c| c.id.clone())
                     .collect();
-                self.selection.net = None;
+                let notes: Vec<String> = self
+                    .editor
+                    .sheet_notes()
+                    .iter()
+                    .filter(|n| layout::note_bounds(n).intersects(&band))
+                    .map(|n| n.id.clone())
+                    .collect();
+                self.selection.clear();
+                self.selection.components = components;
+                self.selection.notes = notes;
             }
             gesture @ Gesture::DrawingWire { .. } => {
                 // Drag-style wiring: releasing over a port or node commits.
@@ -885,6 +1061,31 @@ impl App {
 
     pub fn double_clicked(&mut self) {
         if !self.canvas_rect().contains(self.cursor) || self.is_running() {
+            return;
+        }
+        if let Hit::Note { note_id } = self.hover.clone() {
+            let text = self
+                .editor
+                .sheet_notes()
+                .iter()
+                .find(|n| n.id == note_id)
+                .map(|n| n.text.clone())
+                .unwrap_or_default();
+            self.prompt = Some(Prompt {
+                title: "Edit note (empty text removes it)".into(),
+                value: text,
+                action: PromptAction::EditNote { id: note_id },
+                identifier: false,
+            });
+            return;
+        }
+        if let Hit::Pin { name, kind } = self.hover.clone() {
+            self.prompt = Some(Prompt {
+                title: format!("Rename pin \"{name}\""),
+                value: name.clone(),
+                action: PromptAction::RenamePin { kind, old: name },
+                identifier: true,
+            });
             return;
         }
         if let Hit::Component { component_id } = self.hover.clone() {
@@ -1050,16 +1251,17 @@ impl App {
                 }
                 Err(e) => self.error(e.to_string()),
             }
-        } else if !self.selection.components.is_empty() {
+        } else if !self.selection.components.is_empty() || !self.selection.notes.is_empty() {
             let ids = self.selection.components.clone();
-            let n = ids.len();
-            match self.editor.delete_components(&ids) {
+            let note_ids = self.selection.notes.clone();
+            let n = ids.len() + note_ids.len();
+            match self.editor.delete_items(&ids, &note_ids) {
                 Ok(()) => {
                     self.selection.clear();
                     self.info(if n == 1 {
-                        "Deleted 1 component".to_string()
+                        "Deleted".to_string()
                     } else {
-                        format!("Deleted {n} components")
+                        format!("Deleted {n} items")
                     });
                 }
                 Err(e) => self.error(e.to_string()),
@@ -1144,10 +1346,18 @@ impl App {
             KeyInput::Enter => self.commit_prompt(),
             KeyInput::Char(ch) if !self.ctrl => {
                 for c in ch.chars() {
-                    if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                    let ok = if prompt.identifier {
+                        c.is_ascii_alphanumeric() || c == '_' || c == '-'
+                    } else {
+                        !c.is_control()
+                    };
+                    if ok {
                         prompt.value.push(c);
                     }
                 }
+            }
+            KeyInput::Space if !prompt.identifier => {
+                prompt.value.push(' ');
             }
             _ => {}
         }
@@ -1158,12 +1368,17 @@ impl App {
             return;
         };
         let name = prompt.value.trim().to_string();
-        if name.is_empty() {
+        // Only notes may commit empty (that's how they're removed).
+        if name.is_empty() && !matches!(prompt.action, PromptAction::EditNote { .. }) {
             self.error("A name is required");
             self.prompt = Some(prompt);
             return;
         }
-        match prompt.action {
+        let retry = |app: &mut App, e: EditError, prompt: Prompt| {
+            app.error(e.to_string());
+            app.prompt = Some(prompt);
+        };
+        match prompt.action.clone() {
             PromptAction::NewAbstraction => match self.editor.create_abstraction(&name) {
                 Ok(i) => {
                     let _ = self.editor.open_sheet(SheetRef::Abstraction(i));
@@ -1173,10 +1388,7 @@ impl App {
                         "Created \"{name}\" — add pins and parts, then Esc to go back"
                     ));
                 }
-                Err(e) => {
-                    self.error(e.to_string());
-                    self.prompt = Some(prompt);
-                }
+                Err(e) => retry(self, e, prompt),
             },
             PromptAction::AddInputPin | PromptAction::AddOutputPin => {
                 let kind = if prompt.action == PromptAction::AddInputPin {
@@ -1186,12 +1398,44 @@ impl App {
                 };
                 match self.editor.add_interface_pin(kind, &name) {
                     Ok(()) => self.info(format!("Added pin \"{name}\"")),
-                    Err(e) => {
-                        self.error(e.to_string());
-                        self.prompt = Some(prompt);
-                    }
+                    Err(e) => retry(self, e, prompt),
                 }
             }
+            PromptAction::NewNote { pos } => {
+                match self.editor.place_note([pos[0] as f32, pos[1] as f32], &name) {
+                    Ok(id) => {
+                        self.selection.clear();
+                        self.selection.notes = vec![id];
+                        self.info("Note placed — double-click it to edit");
+                    }
+                    Err(e) => retry(self, e, prompt),
+                }
+            }
+            PromptAction::EditNote { id } => match self.editor.set_note_text(&id, &name) {
+                Ok(()) => {
+                    if name.is_empty() {
+                        self.selection.notes.retain(|n| n != &id);
+                        self.info("Note removed");
+                    }
+                }
+                Err(e) => retry(self, e, prompt),
+            },
+            PromptAction::RenamePin { kind, old } => {
+                match self.editor.rename_interface_pin(kind, &old, &name) {
+                    Ok(()) => self.info(format!("Renamed pin to \"{name}\"")),
+                    Err(e) => retry(self, e, prompt),
+                }
+            }
+            PromptAction::RenameAbstraction { index } => {
+                match self.editor.rename_abstraction(index, &name) {
+                    Ok(()) => self.info(format!("Renamed to \"{name}\"")),
+                    Err(e) => retry(self, e, prompt),
+                }
+            }
+            PromptAction::RenameProject => match self.editor.rename_project(&name) {
+                Ok(()) => self.info(format!("Project renamed to \"{name}\"")),
+                Err(e) => retry(self, e, prompt),
+            },
         }
     }
 
@@ -1204,6 +1448,7 @@ impl App {
             title: "Name the new abstraction".into(),
             value: String::new(),
             action: PromptAction::NewAbstraction,
+            identifier: true,
         });
     }
 
@@ -1222,7 +1467,58 @@ impl App {
                 PortKind::Input => PromptAction::AddInputPin,
                 PortKind::Output => PromptAction::AddOutputPin,
             },
+            identifier: true,
         });
+    }
+
+    /// Rename whatever the title bar names: the open abstraction, or the
+    /// project itself.
+    pub fn action_rename_title(&mut self) {
+        if !self.require_edit_mode() {
+            return;
+        }
+        self.gesture = Gesture::Idle;
+        match self.editor.sheet {
+            SheetRef::Abstraction(index) => {
+                let Some(def) = self.editor.project.abstractions.get(index) else {
+                    return;
+                };
+                self.prompt = Some(Prompt {
+                    title: "Rename abstraction".into(),
+                    value: def.name.clone(),
+                    action: PromptAction::RenameAbstraction { index },
+                    identifier: true,
+                });
+            }
+            SheetRef::Top => {
+                self.prompt = Some(Prompt {
+                    title: "Rename project".into(),
+                    value: self.editor.project.name.clone(),
+                    action: PromptAction::RenameProject,
+                    identifier: false,
+                });
+            }
+        }
+    }
+
+    /// Delete the abstraction whose sheet is open (undoable; refused while
+    /// instances of it exist).
+    pub fn action_delete_abstraction(&mut self) {
+        if !self.require_edit_mode() {
+            return;
+        }
+        let SheetRef::Abstraction(index) = self.editor.sheet else {
+            return;
+        };
+        match self.editor.delete_abstraction(index) {
+            Ok(()) => {
+                self.selection.clear();
+                self.gesture = Gesture::Idle;
+                self.pending_fit = true;
+                self.info("Abstraction deleted (Ctrl+Z restores it)");
+            }
+            Err(e) => self.error(e.to_string()),
+        }
     }
 
     pub fn action_back_to_top(&mut self) {
@@ -1241,7 +1537,17 @@ impl App {
             ("z", true, false) => self.undo(),
             ("z", true, true) => self.redo(),
             ("y", true, _) => self.redo(),
-            ("s", true, _) => self.save(),
+            ("s", true, false) => self.save(),
+            ("s", true, true) => {
+                if self.require_edit_mode() {
+                    self.save_as()
+                }
+            }
+            ("o", true, _) => {
+                if self.require_edit_mode() {
+                    self.open()
+                }
+            }
             ("n", true, _) => {
                 if self.require_edit_mode() {
                     self.new_project()
@@ -1268,6 +1574,12 @@ impl App {
         self.ctrl = false;
         self.shift = false;
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiscardIntent {
+    New,
+    Open,
 }
 
 pub enum WireTarget {
@@ -1318,12 +1630,12 @@ mod tests {
 
     /// Drive the app the way a user would: cursor moves and clicks at grid
     /// positions, straight through the real gesture state machine.
-    struct Driver {
-        app: App,
+    pub struct Driver {
+        pub app: App,
     }
 
     impl Driver {
-        fn new() -> Self {
+        pub fn new() -> Self {
             let mut app = App::new(None);
             app.window_size = [1280.0, 720.0];
             app.pending_fit = false;
@@ -1332,12 +1644,12 @@ mod tests {
             Driver { app }
         }
 
-        fn move_to(&mut self, g: [f32; 2]) {
+        pub fn move_to(&mut self, g: [f32; 2]) {
             let s = self.app.camera.grid_to_screen(g);
             self.app.mouse_moved(s);
         }
 
-        fn click(&mut self, g: [f32; 2]) {
+        pub fn click(&mut self, g: [f32; 2]) {
             self.move_to(g);
             self.app.left_pressed();
             self.app.left_released();
@@ -1345,7 +1657,7 @@ mod tests {
             self.app.recompute_hover();
         }
 
-        fn drag(&mut self, from: [f32; 2], to: [f32; 2]) {
+        pub fn drag(&mut self, from: [f32; 2], to: [f32; 2]) {
             self.move_to(from);
             self.app.left_pressed();
             // Two moves so the drag threshold is crossed mid-gesture.
@@ -1355,12 +1667,12 @@ mod tests {
             self.app.recompute_hover();
         }
 
-        fn place(&mut self, type_name: &str, center: [f32; 2]) {
+        pub fn place(&mut self, type_name: &str, center: [f32; 2]) {
             self.app.palette_clicked(type_name);
             self.click(center);
         }
 
-        fn type_text(&mut self, s: &str) {
+        pub fn type_text(&mut self, s: &str) {
             for c in s.chars() {
                 self.app.handle_key(KeyInput::Char(&c.to_string()));
             }
@@ -1669,5 +1981,109 @@ mod tests {
             ),
             Some(false)
         );
+    }
+}
+
+#[cfg(test)]
+mod crud_tests {
+    use super::tests::*;
+    use super::*;
+
+    #[test]
+    fn note_lifecycle_through_gestures() {
+        let mut d = Driver::new();
+        // Place via palette + prompt.
+        d.app.palette_clicked("note");
+        d.click([4.0, 4.0]);
+        assert!(d.app.prompt.is_some());
+        d.type_text("hello world");
+        d.app.handle_key(KeyInput::Space);
+        d.type_text("note");
+        d.app.handle_key(KeyInput::Enter);
+        assert_eq!(d.app.editor.project.notes.len(), 1);
+        assert_eq!(d.app.editor.project.notes[0].text, "hello world note");
+
+        // Drag it somewhere else.
+        let bounds = diycpu::layout::note_bounds(&d.app.editor.project.notes[0]);
+        let center = [bounds.x + bounds.w / 2.0, bounds.y + bounds.h / 2.0];
+        d.drag(center, [center[0] + 5.0, center[1] + 3.0]);
+        let moved = &d.app.editor.project.notes[0];
+        assert_eq!(moved.pos[0], bounds.x + 5.0);
+
+        // Double-click opens the editor prefilled; emptying removes it.
+        let bounds = diycpu::layout::note_bounds(&d.app.editor.project.notes[0]);
+        d.move_to([bounds.x + bounds.w / 2.0, bounds.y + bounds.h / 2.0]);
+        d.app.recompute_hover();
+        d.app.double_clicked();
+        assert!(d.app.prompt.is_some());
+        let len = d.app.prompt.as_ref().unwrap().value.chars().count();
+        for _ in 0..len {
+            d.app.handle_key(KeyInput::Backspace);
+        }
+        d.app.handle_key(KeyInput::Enter);
+        assert!(d.app.editor.project.notes.is_empty());
+    }
+
+    #[test]
+    fn rename_pin_via_double_click() {
+        let mut d = Driver::new();
+        d.app.action_new_abstraction();
+        d.type_text("thing");
+        d.app.handle_key(KeyInput::Enter);
+        d.app.action_add_pin(PortKind::Input);
+        d.type_text("x");
+        d.app.handle_key(KeyInput::Enter);
+
+        // Pin rails sit left of the content — pan them into the canvas.
+        d.app.camera.offset = [700.0, 300.0];
+
+        // Double-click the pin's name plate.
+        let abstractions = &d.app.editor.project.abstractions;
+        let pin = diycpu::layout::interface_pins(abstractions, &abstractions[0])
+            .into_iter()
+            .find(|p| p.name == "x")
+            .unwrap();
+        let plate = pin.plate;
+        d.move_to([plate.x + plate.w / 2.0, plate.y + plate.h / 2.0]);
+        d.app.recompute_hover();
+        d.app.double_clicked();
+        assert!(d.app.prompt.is_some());
+        assert_eq!(d.app.prompt.as_ref().unwrap().value, "x");
+        d.type_text("_in"); // appended to the prefill
+        d.app.handle_key(KeyInput::Enter);
+        assert_eq!(d.app.editor.project.abstractions[0].inputs, vec!["x_in"]);
+    }
+
+    #[test]
+    fn rename_project_and_abstraction_via_title() {
+        let mut d = Driver::new();
+        d.app.action_rename_title();
+        assert!(d.app.prompt.is_some());
+        let len = d.app.prompt.as_ref().unwrap().value.chars().count();
+        for _ in 0..len {
+            d.app.handle_key(KeyInput::Backspace);
+        }
+        d.type_text("my");
+        d.app.handle_key(KeyInput::Space);
+        d.type_text("cpu");
+        d.app.handle_key(KeyInput::Enter);
+        assert_eq!(d.app.editor.project.name, "my cpu");
+
+        d.app.action_new_abstraction();
+        d.type_text("adder");
+        d.app.handle_key(KeyInput::Enter);
+        d.app.action_rename_title(); // now renames the open abstraction
+        let len = d.app.prompt.as_ref().unwrap().value.chars().count();
+        for _ in 0..len {
+            d.app.handle_key(KeyInput::Backspace);
+        }
+        d.type_text("adder2");
+        d.app.handle_key(KeyInput::Enter);
+        assert_eq!(d.app.editor.project.abstractions[0].name, "adder2");
+
+        // And delete it from its own sheet.
+        d.app.action_delete_abstraction();
+        assert!(d.app.editor.project.abstractions.is_empty());
+        assert_eq!(d.app.editor.sheet, SheetRef::Top);
     }
 }

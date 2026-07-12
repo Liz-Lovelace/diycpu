@@ -30,6 +30,7 @@ impl Renderer {
         let view = app.canvas_rect();
         canvas.scissor(view.x, view.y, view.w, view.h);
         self.draw_grid(canvas, app, view);
+        self.draw_notes(canvas, app);
         self.draw_wires(canvas, app);
         self.draw_derived_output_wires(canvas, app);
         self.draw_wire_preview(canvas, app);
@@ -90,6 +91,53 @@ impl Renderer {
             });
             paint.set_line_width(1.0);
             canvas.stroke_path(&p, &paint);
+        }
+    }
+
+    /// Sticky-note annotations: drawn behind the circuit, wrapped with the
+    /// same deterministic algorithm layout uses for their hit rectangles.
+    fn draw_notes(&self, canvas: &mut Canvas<OpenGl>, app: &App) {
+        let zoom = app.camera.zoom;
+        let cell = app.camera.cell_px();
+        for note in app.editor.sheet_notes() {
+            let bounds = layout::note_bounds(note);
+            let tl = app.camera.grid_to_screen([bounds.x, bounds.y]);
+            let selected = app.selection.notes.contains(&note.id);
+
+            let mut bg = Path::new();
+            bg.rounded_rect(
+                tl[0],
+                tl[1],
+                bounds.w * cell,
+                bounds.h * cell,
+                (4.0 * zoom).clamp(1.5, 6.0),
+            );
+            canvas.fill_path(&bg, &Paint::color(theme::note_bg()));
+            let mut border = Paint::color(if selected {
+                theme::accent()
+            } else {
+                theme::note_border()
+            });
+            border.set_line_width(if selected { 2.0 } else { 1.2 });
+            canvas.stroke_path(&bg, &border);
+
+            let size = (12.0 * zoom).clamp(5.0, 18.0);
+            if size >= 5.0 {
+                let pad = layout::NOTE_PADDING * cell;
+                let line_h = layout::NOTE_LINE_HEIGHT * cell;
+                for (i, line) in layout::wrap_note_text(&note.text).iter().enumerate() {
+                    self.text(
+                        canvas,
+                        tl[0] + pad,
+                        tl[1] + pad + (i as f32 + 0.5) * line_h,
+                        line,
+                        size,
+                        theme::note_text(),
+                        Align::Left,
+                        Baseline::Middle,
+                    );
+                }
+            }
         }
     }
 
@@ -387,63 +435,59 @@ impl Renderer {
         border.set_line_width(if selected { 2.5 } else { 1.5 });
         canvas.stroke_path(&body, &border);
 
-        // Labels.
+        // Labels: primitives draw glyphs; abstractions show their name.
         let label_size = (13.0 * zoom).clamp(5.0, 22.0);
-        if label_size >= 5.0 {
-            let label = match comp.component_type.as_str() {
-                // clk and dff draw glyphs instead of type names.
-                "clk" | "dff" => String::new(),
-                other => {
-                    if is_primitive(other) {
-                        other.to_uppercase()
-                    } else {
-                        other.to_string()
-                    }
+        if label_size >= 5.0 && !is_primitive(&comp.component_type) {
+            self.text(
+                canvas,
+                tl[0] + w / 2.0,
+                tl[1] + h / 2.0 - 1.0,
+                &comp.component_type,
+                label_size,
+                theme::chip_label(),
+                Align::Center,
+                Baseline::Middle,
+            );
+        }
+
+        match comp.component_type.as_str() {
+            "clk" => self.draw_clock_glyph(canvas, app, tl, w, h),
+            "nand" => self.draw_nand_glyph(canvas, app, tl, w, h),
+            "dff" => {
+                // The flip-flop's face IS its bit: init while editing,
+                // live state while running. Double-click flips the init.
+                let value = match &app.mode {
+                    Mode::Run(session) => session.component_value(&comp.id),
+                    Mode::Edit => comp.init,
                 }
-            };
-            if !label.is_empty() {
+                .unwrap_or(false);
+                let digit_size = (20.0 * zoom).clamp(8.0, 32.0);
                 self.text(
                     canvas,
-                    tl[0] + w / 2.0,
-                    tl[1] + h / 2.0 - 1.0,
-                    &label,
-                    label_size,
-                    theme::chip_label(),
+                    tl[0] + w * 0.58,
+                    tl[1] + h / 2.0,
+                    if value { "1" } else { "0" },
+                    digit_size,
+                    if value {
+                        theme::value_digit_on()
+                    } else {
+                        theme::value_digit_off()
+                    },
                     Align::Center,
                     Baseline::Middle,
                 );
             }
-            let id_size = (9.0 * zoom).clamp(5.0, 14.0);
-            if id_size >= 5.0 {
-                self.text(
-                    canvas,
-                    tl[0] + w / 2.0,
-                    tl[1] + h + 3.0 * zoom,
-                    &comp.id,
-                    id_size,
-                    theme::chip_sublabel(),
-                    Align::Center,
-                    Baseline::Top,
-                );
-            }
+            _ => {}
         }
 
-        if comp.component_type == "clk" {
-            self.draw_clock_glyph(canvas, app, tl, w, h);
-        }
-        if comp.component_type == "dff" {
-            self.draw_dff_glyph(canvas, app, tl, w, h);
-        }
-
-        // dff initial-value badge (edit mode) / value badge (run mode).
+        // Run-mode value badge for the primitives whose face doesn't
+        // already show it.
         if let Mode::Run(session) = &app.mode {
-            if is_primitive(&comp.component_type) {
+            if is_primitive(&comp.component_type) && comp.component_type != "dff" {
                 if let Some(v) = session.component_value(&comp.id) {
                     self.draw_badge(canvas, zoom, tl, w, v);
                 }
             }
-        } else if comp.component_type == "dff" {
-            self.draw_badge(canvas, zoom, tl, w, comp.init.unwrap_or(false));
         }
 
         // Ports.
@@ -549,9 +593,8 @@ impl Renderer {
         canvas.stroke_path(&p, &paint);
     }
 
-    /// The flip-flop icon: a one-bit memory cell with the classic
-    /// clock-edge triangle on its left edge.
-    fn draw_dff_glyph(
+    /// The MIL-spec NAND symbol: a D-shape with the inversion bubble.
+    fn draw_nand_glyph(
         &self,
         canvas: &mut Canvas<OpenGl>,
         app: &App,
@@ -559,31 +602,36 @@ impl Renderer {
         w: f32,
         h: f32,
     ) {
-        // Nudged right so the d/clk port labels keep their room.
-        let cx = tl[0] + w * 0.58;
+        let cx = tl[0] + w / 2.0;
         let cy = tl[1] + h / 2.0;
-        let half = (h * 0.21).min(w * 0.15);
+        let gh = h * 0.42; // glyph height
+        let r = gh / 2.0;
+        let left = cx - gh * 0.62;
+        let flat = cx + gh * 0.05; // where the flat part meets the arc
 
-        let mut cell = Path::new();
-        cell.rounded_rect(
-            cx - half,
-            cy - half,
-            half * 2.0,
-            half * 2.0,
-            half * 0.3,
+        let mut body = Path::new();
+        body.move_to(flat, cy - r);
+        body.line_to(left, cy - r);
+        body.line_to(left, cy + r);
+        body.line_to(flat, cy + r);
+        body.arc(
+            flat,
+            cy,
+            r,
+            std::f32::consts::FRAC_PI_2,
+            -std::f32::consts::FRAC_PI_2,
+            femtovg::Solidity::Solid,
         );
         let mut paint = Paint::color(theme::chip_label());
         paint.set_line_width((2.0 * app.camera.zoom).clamp(1.0, 3.0));
         paint.set_line_join(femtovg::LineJoin::Round);
-        canvas.stroke_path(&cell, &paint);
+        canvas.stroke_path(&body, &paint);
 
-        // Clock-edge marker: an open ">" sitting on the left edge.
-        let tri = half * 0.6;
-        let mut marker = Path::new();
-        marker.move_to(cx - half, cy - tri);
-        marker.line_to(cx - half + tri, cy);
-        marker.line_to(cx - half, cy + tri);
-        canvas.stroke_path(&marker, &paint);
+        // Inversion bubble on the output.
+        let rb = (r * 0.22).max(1.5);
+        let mut bubble = Path::new();
+        bubble.circle(flat + r + rb, cy, rb);
+        canvas.stroke_path(&bubble, &paint);
     }
 
     fn draw_badge(&self, canvas: &mut Canvas<OpenGl>, zoom: f32, tl: [f32; 2], w: f32, on: bool) {
@@ -825,7 +873,13 @@ impl Renderer {
     }
 
     fn draw_drag_ghosts(&self, canvas: &mut Canvas<OpenGl>, app: &App) {
-        let Gesture::DraggingComponents { ids, delta, .. } = &app.gesture else {
+        let Gesture::DraggingComponents {
+            ids,
+            note_ids,
+            delta,
+            ..
+        } = &app.gesture
+        else {
             return;
         };
         if *delta == [0, 0] {
@@ -835,8 +889,21 @@ impl Renderer {
         let abstractions = &app.editor.project.abstractions;
         let (components, _) = app.editor.sheet_data();
         let cell = app.camera.cell_px();
-        for comp in components.iter().filter(|c| ids.contains(&c.id)) {
-            let rect = layout::footprint(abstractions, comp);
+
+        let mut ghost_rects: Vec<layout::Rect> = components
+            .iter()
+            .filter(|c| ids.contains(&c.id))
+            .map(|c| layout::footprint(abstractions, c))
+            .collect();
+        ghost_rects.extend(
+            app.editor
+                .sheet_notes()
+                .iter()
+                .filter(|n| note_ids.contains(&n.id))
+                .map(layout::note_bounds),
+        );
+
+        for rect in ghost_rects {
             let tl = app.camera.grid_to_screen([
                 rect.x + delta[0] as f32,
                 rect.y + delta[1] as f32,
@@ -871,6 +938,27 @@ impl Renderer {
             return;
         }
         let pos = app.placement_pos(type_name);
+        if type_name == "note" {
+            // A blank sticky-note outline; the text comes right after.
+            let size = app.placement_size(type_name);
+            let tl = app.camera.grid_to_screen([pos[0] as f32, pos[1] as f32]);
+            let cell = app.camera.cell_px();
+            canvas.set_global_alpha(0.6);
+            let mut p = Path::new();
+            p.rounded_rect(
+                tl[0],
+                tl[1],
+                size[0] * cell,
+                size[1] * cell,
+                (4.0 * app.camera.zoom).clamp(1.5, 6.0),
+            );
+            canvas.fill_path(&p, &Paint::color(theme::note_bg()));
+            let mut stroke = Paint::color(theme::note_border());
+            stroke.set_line_width(1.2);
+            canvas.stroke_path(&p, &stroke);
+            canvas.set_global_alpha(1.0);
+            return;
+        }
         let valid = app.placement_is_valid(type_name);
         let ghost = ProjectComponent {
             id: String::new(),
@@ -960,11 +1048,9 @@ impl Renderer {
                 }
             }
 
-            // Mini chip glyph.
+            // Mini glyph: a sticky note for the note tool, a chip otherwise.
             let glyph_x = r.x + 8.0;
             let glyph_y = r.y + r.h / 2.0;
-            let mut chip = Path::new();
-            chip.rounded_rect(glyph_x, glyph_y - 7.0, 18.0, 14.0, 2.5);
             let color = if item.enabled {
                 theme::chip_border()
             } else {
@@ -972,14 +1058,28 @@ impl Renderer {
             };
             let mut cp = Paint::color(color);
             cp.set_line_width(1.3);
-            canvas.stroke_path(&chip, &cp);
-            for dy in [-3.0, 3.0] {
-                let mut pin = Path::new();
-                pin.move_to(glyph_x - 3.0, glyph_y + dy);
-                pin.line_to(glyph_x, glyph_y + dy);
-                pin.move_to(glyph_x + 18.0, glyph_y + dy);
-                pin.line_to(glyph_x + 21.0, glyph_y + dy);
-                canvas.stroke_path(&pin, &cp);
+            if item.type_name == "note" {
+                let mut sticky = Path::new();
+                sticky.rounded_rect(glyph_x, glyph_y - 7.0, 18.0, 14.0, 2.0);
+                canvas.stroke_path(&sticky, &cp);
+                for dy in [-2.5, 1.5] {
+                    let mut line = Path::new();
+                    line.move_to(glyph_x + 3.5, glyph_y + dy);
+                    line.line_to(glyph_x + 14.5, glyph_y + dy);
+                    canvas.stroke_path(&line, &cp);
+                }
+            } else {
+                let mut chip = Path::new();
+                chip.rounded_rect(glyph_x, glyph_y - 7.0, 18.0, 14.0, 2.5);
+                canvas.stroke_path(&chip, &cp);
+                for dy in [-3.0, 3.0] {
+                    let mut pin = Path::new();
+                    pin.move_to(glyph_x - 3.0, glyph_y + dy);
+                    pin.line_to(glyph_x, glyph_y + dy);
+                    pin.move_to(glyph_x + 18.0, glyph_y + dy);
+                    pin.line_to(glyph_x + 21.0, glyph_y + dy);
+                    canvas.stroke_path(&pin, &cp);
+                }
             }
 
             self.text(
@@ -1016,6 +1116,16 @@ impl Renderer {
         }
         if app.editor.dirty {
             title.push_str(" •");
+        }
+        // The title is clickable (rename); hint with a hover underline.
+        if ui.title_rect.contains(app.cursor) && !app.is_running() {
+            let mut underline = Path::new();
+            let y = theme::TOPBAR_HEIGHT / 2.0 + 9.0;
+            underline.move_to(12.0, y);
+            underline.line_to(12.0 + title.chars().count() as f32 * 7.5, y);
+            let mut up = Paint::color(theme::text_dim());
+            up.set_line_width(1.0);
+            canvas.stroke_path(&underline, &up);
         }
         self.text(
             canvas,
@@ -1178,7 +1288,7 @@ impl Renderer {
                     )]
                 } else {
                     vec![format!(
-                        "{component_id}.{port_name} — {}",
+                        "{} \"{port_name}\"",
                         match kind {
                             PortKind::Input => "input",
                             PortKind::Output => "output",
@@ -1187,7 +1297,7 @@ impl Renderer {
                 }
             }
             layout::Hit::Pin { name, kind } => vec![format!(
-                "{} pin \"{name}\" — Delete removes it",
+                "{} pin \"{name}\" — double-click renames, Delete removes",
                 match kind {
                     PortKind::Input => "input",
                     PortKind::Output => "output",
@@ -1199,21 +1309,35 @@ impl Renderer {
                 }
                 vec!["node — click to wire from it, drag to move, Delete removes".into()]
             }
+            layout::Hit::Note { .. } => {
+                if app.is_running() {
+                    return;
+                }
+                vec!["note — double-click to edit".into()]
+            }
             layout::Hit::Component { component_id } => {
                 let (components, _) = app.editor.sheet_data();
                 let Some(comp) = components.iter().find(|c| &c.id == component_id) else {
                     return;
                 };
-                let mut lines = vec![format!("{} ({})", comp.id, comp.component_type)];
+                let mut lines = match comp.component_type.as_str() {
+                    "clk" => vec!["clock — toggles every step".to_string()],
+                    "nand" => vec!["NAND gate".to_string()],
+                    "dff" => vec![],
+                    other => vec![format!("{other} — double-click to open")],
+                };
                 if let Mode::Run(session) = &app.mode {
                     if let Some(v) = session.component_value(&comp.id) {
                         lines.push(format!("value: {}", if v { "1" } else { "0" }));
                     }
                 } else if comp.component_type == "dff" {
                     lines.push(format!(
-                        "starts at {} — double-click to flip",
+                        "flip-flop — starts at {}, double-click to flip",
                         if comp.init.unwrap_or(false) { "1" } else { "0" }
                     ));
+                }
+                if lines.is_empty() {
+                    return;
                 }
                 lines
             }

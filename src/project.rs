@@ -15,6 +15,18 @@ pub struct Project {
     pub components: Vec<ProjectComponent>,
     #[serde(default)]
     pub wire_nets: Vec<WireNet>,
+    /// Free-floating text annotations. Purely visual; the engine ignores them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<Note>,
+}
+
+/// A text annotation placed on the canvas.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Note {
+    pub id: String,
+    pub text: String,
+    #[serde(default)]
+    pub pos: [f32; 2],
 }
 
 /// A component as stored in a project file.
@@ -46,6 +58,9 @@ pub struct ProjectAbstraction {
     /// Wire nets within this abstraction's sub-circuit.
     #[serde(default)]
     pub wire_nets: Vec<WireNet>,
+    /// Annotations on this abstraction's sheet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<Note>,
 }
 
 fn default_width() -> f32 {
@@ -119,6 +134,7 @@ mod tests {
     #[test]
     fn round_trip_empty_project() {
         let project = Project {
+            notes: vec![],
             name: "test".into(),
             steps: 8,
             abstractions: vec![],
@@ -135,6 +151,7 @@ mod tests {
     #[test]
     fn round_trip_component() {
         let project = Project {
+            notes: vec![],
             name: "test".into(),
             steps: 1,
             abstractions: vec![],
@@ -208,9 +225,11 @@ mod tests {
     #[test]
     fn round_trip_abstraction() {
         let project = Project {
+            notes: vec![],
             name: "test".into(),
             steps: 0,
             abstractions: vec![ProjectAbstraction {
+                notes: vec![],
                 name: "not".into(),
                 inputs: vec!["x".into()],
                 outputs: {

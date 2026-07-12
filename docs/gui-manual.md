@@ -18,12 +18,14 @@ exit), `--run N` (enter run mode and step N times first), `--sheet name`
 | Wire | Click or drag from any port. Click a compatible port to connect; click empty canvas to drop a **node** and keep drawing from it; right-click or Esc to stop (everything placed stays). Wiring an already-connected input replaces its old connection. |
 | Wire nodes | Click a node to draw a new branch from it (fan-out). Drag a node to move it. Hover a node and press Delete to remove it — the wire splits where it was cut. Stubs are fine: wires don't need to connect anything to exist. |
 | Delete | Select, then Delete/Backspace. Deleting a component cleans up its connections but leaves your routed wires as stubs. |
-| Flip a DFF's start value | Double-click it (badge shows 0/1). |
+| Flip a DFF's start value | Double-click it — the big digit on its face is the stored bit. |
+| Notes | Pick “note” in the palette, click the canvas, type. Double-click a note to edit it (empty text removes it); drag to move; notes can sit anywhere. |
 | Duplicate | Ctrl+D. |
 | Undo / redo | Ctrl+Z / Ctrl+Shift+Z (or Ctrl+Y). One action = one undo step; a cancelled gesture never becomes one. |
 | Cancel anything | Esc or right-click. |
 | Pan / zoom | Middle- or right-drag; scroll wheel zooms at the cursor. `F` fits the circuit, Ctrl+0 resets zoom. |
-| Save / new | Ctrl+S / Ctrl+N. The status bar confirms the path. |
+| Files | Ctrl+S save, Ctrl+Shift+S save as, Ctrl+O open, Ctrl+N new — native file dialogs; unsaved changes ask you to repeat the action to confirm. |
+| Rename the project | Click its name in the title bar. |
 
 ## Abstractions
 
@@ -32,8 +34,12 @@ exit), `--run N` (enter run mode and step N times first), `--sheet name`
   the title bar shows `project ▸ name`. Esc or “◂ Back” returns.
 - **Pins**: “+ input” / “+ output” add pins, which appear on rails beside
   the content. Wire from an input pin into the circuit like any port; wire
-  a component output into an output pin to define what it emits. Click a
-  pin's name plate and press Delete to remove it.
+  a component output into an output pin to define what it emits.
+  Double-click a pin's name plate to rename it (every wire and instance
+  follows); click it and press Delete to remove it.
+- **Rename / delete the abstraction**: the toolbar buttons inside its
+  sheet (or click the title). Deleting is refused while instances of it
+  are still placed somewhere.
 - Instances everywhere update immediately; nesting is unlimited, recursion
   is refused, and clocks can't be placed inside abstractions.
 

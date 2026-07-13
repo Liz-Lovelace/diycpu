@@ -502,7 +502,6 @@ impl Renderer {
         }
     }
 
-    /// While a node drags, ghost its segments at the target position (the
     /// One component, plus — when it's an abstraction instance big enough
     /// on screen — its contents cross-faded in, recursively.
     #[allow(clippy::too_many_arguments)]
@@ -1022,7 +1021,7 @@ impl Renderer {
     fn draw_derived_output_wires(
         &self,
         canvas: &mut Canvas<OpenGl>,
-        _app: &App,
+        app: &App,
         ctx: &SheetCtx,
     ) {
         let Some(def) = ctx.interface else {
@@ -1058,7 +1057,24 @@ impl Renderer {
                     p.line_to(s[0], s[1]);
                 }
             }
-            let mut paint = Paint::color(theme::wire());
+            // Live value of the driving port while simulating.
+            let color = match (&app.mode, &ctx.sim_path) {
+                (Mode::Run(session), Some(path)) => {
+                    let is_prim = ctx
+                        .components
+                        .iter()
+                        .find(|c| c.id == port.component_id)
+                        .map(|c| is_primitive(&c.component_type))
+                        .unwrap_or(true);
+                    match session.port_value_at(path, is_prim, &port) {
+                        Some(true) => theme::wire_on(),
+                        Some(false) => theme::wire_off(),
+                        None => theme::wire(),
+                    }
+                }
+                _ => theme::wire(),
+            };
+            let mut paint = Paint::color(color);
             paint.set_line_width((2.5 * zoom).clamp(0.5, 4.5));
             paint.set_line_join(femtovg::LineJoin::Round);
             paint.set_line_cap(femtovg::LineCap::Round);
@@ -1777,7 +1793,12 @@ impl Renderer {
                     other => vec![format!("{other} — zoom in or double-click to open")],
                 };
                 if let Mode::Run(session) = &app.mode {
-                    if let Some(v) = session.component_value(&comp.id) {
+                    let path: Vec<String> = app
+                        .path
+                        .iter()
+                        .map(|seg| seg.instance_id.clone())
+                        .collect();
+                    if let Some(v) = session.component_value_at(&path, &comp.id) {
                         lines.push(format!("value: {}", if v { "1" } else { "0" }));
                     }
                 } else if comp.component_type == "dff" {

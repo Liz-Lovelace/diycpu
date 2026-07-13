@@ -212,6 +212,8 @@ pub struct App {
     pub clipboard: Option<Fragment>,
     /// Run mode advances the clock on a timer.
     pub playing: bool,
+    /// Scroll offset of the palette, for projects with many abstractions.
+    pub palette_scroll: f32,
     /// Set when an action would discard unsaved changes; repeating the
     /// action confirms it. Any other click clears it.
     pending_discard: Option<DiscardIntent>,
@@ -266,6 +268,7 @@ impl App {
             layout_dialog: None,
             clipboard: None,
             playing: false,
+            palette_scroll: 0.0,
             pending_discard: None,
             pending_fit: true,
         }
@@ -349,11 +352,11 @@ impl App {
     fn try_descend(&mut self) -> bool {
         let view = self.camera.view();
         let v = self.viewport_min();
-        let center = self.canvas_center();
         let abstractions = &self.editor.project.abstractions;
         let (components, _) = self.editor.sheet_data();
 
         let central = self.central_box(DESCEND_COVER_INSET);
+
         let mut target: Option<(String, usize, layout::Rect)> = None;
         for comp in components {
             let Some(def_index) = abstractions
@@ -377,7 +380,6 @@ impl App {
                 break;
             }
         }
-        let _ = center;
         let Some((instance_id, def_index, rect)) = target else {
             return false;
         };
@@ -451,6 +453,17 @@ impl App {
         self.gesture = Gesture::Idle;
         self.recompute_hover();
         true
+    }
+
+    /// The name of the abstraction a sheet ref points at, if any — used to
+    /// notice when an index silently changes identity across undo/redo.
+    fn sheet_identity(&self, sheet: SheetRef) -> Option<String> {
+        match sheet {
+            SheetRef::Top => None,
+            SheetRef::Abstraction(i) => {
+                self.editor.project.abstractions.get(i).map(|a| a.name.clone())
+            }
+        }
     }
 
     /// The editor's sheet changed underneath the view (undo across sheets,
@@ -849,22 +862,22 @@ impl App {
         let Some(path) = self.file_path.clone() else {
             return; // nowhere to save yet — Save As picks the home
         };
-        match serde_json::to_string_pretty(&self.editor.project)
-            .map_err(|e| e.to_string())
-            .and_then(|json| std::fs::write(&path, json + "\n").map_err(|e| e.to_string()))
-        {
-            Ok(()) => self.editor.dirty = false,
+        match self.persist(&path) {
+            Ok(()) => {}
             Err(e) => self.error(format!("Autosave failed: {e}")),
         }
     }
 
-    fn write_to(&mut self, path: PathBuf) {
-        match serde_json::to_string_pretty(&self.editor.project)
+    fn persist(&mut self, path: &std::path::Path) -> Result<(), String> {
+        serde_json::to_string_pretty(&self.editor.project)
             .map_err(|e| e.to_string())
-            .and_then(|json| std::fs::write(&path, json + "\n").map_err(|e| e.to_string()))
-        {
+            .and_then(|json| std::fs::write(path, json + "\n").map_err(|e| e.to_string()))
+            .map(|()| self.editor.dirty = false)
+    }
+
+    fn write_to(&mut self, path: PathBuf) {
+        match self.persist(&path) {
             Ok(()) => {
-                self.editor.dirty = false;
                 self.file_path = Some(path.clone());
                 self.info(format!("Saved {}", path.display()));
             }
@@ -896,6 +909,16 @@ impl App {
         self.mode = Mode::Edit;
         self.pending_fit = true;
         self.info("New circuit");
+    }
+
+    /// The window wants to close. True = allow it. A dirty never-saved
+    /// project asks for one more click (everything else autosaves).
+    pub fn request_close(&mut self) -> bool {
+        if self.file_path.is_some() {
+            self.autosave();
+            return true;
+        }
+        self.confirm_discard(DiscardIntent::Close, "close")
     }
 
     pub fn open(&mut self) {
@@ -944,17 +967,21 @@ impl App {
                 self.info("Back to editing");
             }
             Mode::Edit => {
-                self.gesture = Gesture::Idle;
-                // Simulation always runs the whole design from the top.
-                if self.editor.sheet != SheetRef::Top || self.view_root != SheetRef::Top {
-                    let _ = self.editor.open_sheet(SheetRef::Top);
-                    self.view_root = SheetRef::Top;
-                    self.path.clear();
-                    self.selection.clear();
-                    self.pending_fit = true;
-                }
+                // Compile first: a failed run must not yank the user out of
+                // whatever they were zoomed into.
                 match SimSession::new(&self.editor.project) {
                     Ok(session) => {
+                        self.gesture = Gesture::Idle;
+                        // Simulation always runs the whole design from the top.
+                        if self.editor.sheet != SheetRef::Top
+                            || self.view_root != SheetRef::Top
+                        {
+                            let _ = self.editor.open_sheet(SheetRef::Top);
+                            self.view_root = SheetRef::Top;
+                            self.path.clear();
+                            self.selection.clear();
+                            self.pending_fit = true;
+                        }
                         self.mode = Mode::Run(session);
                         self.info("Running — ←/→ step the clock, Esc to stop");
                     }
@@ -979,20 +1006,10 @@ impl App {
         let abstractions = &self.editor.project.abstractions;
         let (components, _) = self.editor.sheet_data();
         let mut bounds = layout::components_bounds(abstractions, components);
-        // Interface pins live on rails beside the content — include them.
+        // Interface pins float beside the content — include them.
         if let Some(def) = self.interface() {
             for pin in layout::interface_pins(abstractions, def) {
-                let r = pin.plate;
-                bounds = Some(match bounds {
-                    None => r,
-                    Some(b) => {
-                        let x = b.x.min(r.x);
-                        let y = b.y.min(r.y);
-                        let x2 = (b.x + b.w).max(r.x + r.w);
-                        let y2 = (b.y + b.h).max(r.y + r.h);
-                        Rect { x, y, w: x2 - x, h: y2 - y }
-                    }
-                });
+                bounds = Some(bounds.map_or(pin.plate, |b| b.union(&pin.plate)));
             }
         }
         bounds
@@ -1012,8 +1029,11 @@ impl App {
     // ── Mouse input ──────────────────────────────────────────────────────
 
     pub fn mouse_moved(&mut self, pos: [f32; 2]) {
-        let previous = self.cursor;
         self.cursor = pos;
+        // Modal layers freeze the canvas beneath them.
+        if self.prompt.is_some() || self.layout_dialog.is_some() {
+            return;
+        }
 
         match &mut self.gesture {
             Gesture::Panning { last } => {
@@ -1129,17 +1149,16 @@ impl App {
             _ => {}
         }
 
-        let _ = previous;
         self.recompute_hover();
     }
 
     pub fn left_pressed(&mut self) {
         self.pending_discard = None;
 
-        // A click outside an open prompt dismisses it.
+        // A click outside an open prompt dismisses it (backstop; the shell
+        // normally swallows these first).
         if self.prompt.is_some() {
-            self.prompt = None;
-            self.info("Cancelled");
+            self.dismiss_prompt();
             return;
         }
 
@@ -1474,24 +1493,24 @@ impl App {
         }
     }
 
-    pub fn middle_or_right_pressed(&mut self) -> PanOrCancel {
+    pub fn middle_or_right_pressed(&mut self) {
+        if self.prompt.is_some() || self.layout_dialog.is_some() {
+            return;
+        }
         // An active constructive gesture? Right/middle click ends it.
         match self.gesture {
             Gesture::Placing { .. } => {
                 self.gesture = Gesture::Idle;
                 self.info("Cancelled");
-                PanOrCancel::Cancelled
             }
             Gesture::DrawingWire { .. } => {
                 // Everything placed so far is already committed; this just
                 // puts the pencil down.
                 self.gesture = Gesture::Idle;
                 self.info("Stopped wiring — click a node to continue from it");
-                PanOrCancel::Cancelled
             }
             _ => {
                 self.gesture = Gesture::Panning { last: self.cursor };
-                PanOrCancel::Panning
             }
         }
     }
@@ -1503,6 +1522,17 @@ impl App {
     }
 
     pub fn scrolled(&mut self, amount: f32) {
+        if self.prompt.is_some() || self.layout_dialog.is_some() {
+            return;
+        }
+        // Over the palette, the wheel scrolls the palette itself.
+        if self.cursor[0] < theme::PALETTE_WIDTH && self.cursor[1] > theme::TOPBAR_HEIGHT {
+            let content = 58.0 + self.palette_items().len() as f32 * 36.0 + 34.0;
+            let available = self.window_size[1] - theme::TOPBAR_HEIGHT - theme::STATUSBAR_HEIGHT;
+            let max_scroll = (content - available).max(0.0);
+            self.palette_scroll = (self.palette_scroll - amount * 0.4).clamp(0.0, max_scroll);
+            return;
+        }
         if !self.canvas_rect().contains(self.cursor) {
             return;
         }
@@ -1699,14 +1729,8 @@ impl App {
             self.toggle_run();
         } else if !self.selection.is_empty() {
             self.selection.clear();
-        } else if self.ascend_once() {
-            self.info("Zoomed out one level");
-        } else if self.view_root != SheetRef::Top {
-            self.view_root = SheetRef::Top;
-            let _ = self.editor.open_sheet(SheetRef::Top);
-            self.selection.clear();
-            self.pending_fit = true;
-            self.info("Back to the main circuit");
+        } else {
+            self.action_back_to_top();
         }
     }
 
@@ -1782,11 +1806,14 @@ impl App {
         }
         self.gesture = Gesture::Idle;
         self.selection.clear();
+        let before = self.sheet_identity(self.focus_sheet());
         match self.editor.undo() {
             Ok(()) => self.info("Undone"),
             Err(e) => self.info(e.to_string()),
         }
-        if self.editor.sheet != self.focus_sheet() {
+        if self.editor.sheet != self.focus_sheet()
+            || self.sheet_identity(self.editor.sheet) != before
+        {
             self.reset_view_to_editor_sheet();
         }
     }
@@ -1797,11 +1824,14 @@ impl App {
         }
         self.gesture = Gesture::Idle;
         self.selection.clear();
+        let before = self.sheet_identity(self.focus_sheet());
         match self.editor.redo() {
             Ok(()) => self.info("Redone"),
             Err(e) => self.info(e.to_string()),
         }
-        if self.editor.sheet != self.focus_sheet() {
+        if self.editor.sheet != self.focus_sheet()
+            || self.sheet_identity(self.editor.sheet) != before
+        {
             self.reset_view_to_editor_sheet();
         }
     }
@@ -1881,16 +1911,22 @@ impl App {
         if !self.require_edit_mode() {
             return;
         }
-        if self.selection.components.is_empty() {
+        let fragment = self
+            .editor
+            .fragment(&self.selection.components, &self.selection.notes);
+        if fragment.is_empty() {
             self.info("Nothing selected to duplicate");
             return;
         }
-        let ids = self.selection.components.clone();
-        match self.editor.duplicate_components(&ids) {
-            Ok(new_ids) => {
-                self.info(format!("Duplicated {} component(s)", new_ids.len()));
+        match self.editor.paste_fragment(&fragment, [1, 1], true) {
+            Ok((new_ids, new_notes)) => {
+                self.info(format!(
+                    "Duplicated {} item(s)",
+                    new_ids.len() + new_notes.len()
+                ));
+                self.selection.clear();
                 self.selection.components = new_ids;
-                self.selection.net = None;
+                self.selection.notes = new_notes;
             }
             Err(e) => self.error(e.to_string()),
         }
@@ -1918,6 +1954,12 @@ impl App {
             KeyInput::Home => self.action_rewind(),
             KeyInput::Space => self.action_run_toggle(),
             KeyInput::Char(ch) => self.key_char(ch),
+        }
+    }
+
+    pub fn dismiss_prompt(&mut self) {
+        if self.prompt.take().is_some() {
+            self.info("Cancelled");
         }
     }
 
@@ -2158,7 +2200,11 @@ impl App {
                 self.info("View fitted to circuit");
             }
             ("0", true, _) => {
-                self.camera.zoom = 1.0;
+                let center = self.canvas_center();
+                let factor = 1.0 / self.camera.zoom;
+                self.camera.zoom_at(center, factor);
+                self.update_focus();
+                self.recompute_hover();
             }
             _ => {}
         }
@@ -2178,6 +2224,7 @@ impl App {
 enum DiscardIntent {
     New,
     Open,
+    Close,
 }
 
 pub enum WireTarget {
@@ -2189,11 +2236,6 @@ pub enum WireTarget {
     Incompatible,
     /// Free space (snapped to half-grid) — a node would go here.
     Free([f32; 2]),
-}
-
-pub enum PanOrCancel {
-    Panning,
-    Cancelled,
 }
 
 fn dist(a: [f32; 2], b: [f32; 2]) -> f32 {
@@ -3011,20 +3053,21 @@ impl App {
         let Some(dialog) = &mut self.layout_dialog else {
             return;
         };
+        let index = dialog.index;
         let pending_port = dialog.pending_port.take();
         let pending_size = dialog.pending_size.take();
         let had_drag = dialog.drag.take();
         match had_drag {
             Some(DialogDrag::Port(_)) => {
                 if let Some((name, side, t)) = pending_port {
-                    if let Err(e) = self.editor.set_port_layout(&name, side, t) {
+                    if let Err(e) = self.editor.set_port_layout(index, &name, side, t) {
                         self.error(e.to_string());
                     }
                 }
             }
             Some(DialogDrag::Resize) => {
                 if let Some((w, h)) = pending_size {
-                    if let Err(e) = self.editor.set_abstraction_size(w, h) {
+                    if let Err(e) = self.editor.set_abstraction_size(index, w, h) {
                         self.error(e.to_string());
                     }
                 }

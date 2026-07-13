@@ -61,7 +61,7 @@ pub fn ui_layout(app: &App) -> UiLayout {
 
     let x = 10.0;
     let w = theme::PALETTE_WIDTH - 20.0;
-    let mut y = theme::TOPBAR_HEIGHT + 10.0;
+    let mut y = theme::TOPBAR_HEIGHT + 10.0 - app.palette_scroll;
 
     section_headers.push(("PRIMITIVES".to_string(), y + 12.0));
     y += 24.0;

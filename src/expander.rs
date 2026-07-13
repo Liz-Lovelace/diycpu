@@ -237,6 +237,39 @@ fn check_abstraction_cycles(
     Ok(())
 }
 
+/// The flattened component name an abstraction output will resolve to,
+/// computed structurally (no expansion needed). `target` is an outputs-map
+/// value: a bare internal component, or `"instance.output"` dotted form.
+fn resolve_output_flat(
+    prefix: &str,
+    abstraction: &AbstractionDef,
+    target: &str,
+    abstraction_map: &HashMap<&str, &AbstractionDef>,
+    depth: usize,
+) -> Option<String> {
+    if depth > 64 {
+        return None; // cyclic files are rejected elsewhere; stay safe
+    }
+    match target.split_once('.') {
+        None => Some(format!("{prefix}/{target}")),
+        Some((inner_instance, inner_output)) => {
+            let inner = abstraction
+                .components
+                .iter()
+                .find(|c| c.name == inner_instance)?;
+            let inner_abs = abstraction_map.get(inner.component_type.as_str())?;
+            let inner_target = inner_abs.outputs.get(inner_output)?;
+            resolve_output_flat(
+                &format!("{prefix}/{inner_instance}"),
+                inner_abs,
+                inner_target,
+                abstraction_map,
+                depth + 1,
+            )
+        }
+    }
+}
+
 /// Complete an instance's input bindings: an unconnected abstraction input
 /// reads as constant 0, so each missing binding gets a synthesized zero
 /// source. Extra (undeclared) inputs are still rejected.
@@ -292,6 +325,25 @@ fn expand_instance(
             component.name.clone(),
             format!("{name_prefix}/{}", component.name),
         );
+    }
+
+    // Phase 1.5: Pre-register every sub-instance output's flat name, so a
+    // sub-instance may reference another regardless of definition order.
+    for component in &abstraction.components {
+        if is_primitive(&component.component_type) {
+            continue;
+        }
+        if let Some(sub_abstraction) = abstraction_map.get(component.component_type.as_str()) {
+            let sub_prefix = format!("{name_prefix}/{}", component.name);
+            for (output_name, target) in &sub_abstraction.outputs {
+                if let Some(flat) =
+                    resolve_output_flat(&sub_prefix, sub_abstraction, target, abstraction_map, 0)
+                {
+                    internal_name_map
+                        .insert(format!("{}.{}", component.name, output_name), flat);
+                }
+            }
+        }
     }
 
     // Phase 2: Expand sub-abstraction instances (in definition order)

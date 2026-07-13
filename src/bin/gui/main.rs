@@ -27,7 +27,7 @@ use winit::{
     window::{CursorIcon, Window, WindowAttributes},
 };
 
-use app::{App, Gesture, PanOrCancel};
+use app::{App, Gesture};
 use diycpu::layout::Hit;
 use render::Renderer;
 use ui::{ui_layout, ButtonId};
@@ -263,6 +263,12 @@ impl Shell {
     /// Left press: dialog first, then chrome, then canvas (with
     /// double-click detection).
     fn left_pressed(&mut self) {
+        // Modal layers swallow every click: a prompt dismisses (like
+        // clicking outside any dialog), the layout dialog handles its own.
+        if self.app.prompt.is_some() {
+            self.app.dismiss_prompt();
+            return;
+        }
         if self.app.layout_dialog.is_some() {
             self.app.dialog_mouse_pressed();
             return;
@@ -400,7 +406,13 @@ impl ApplicationHandler for AppState {
         };
 
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                if shell.app.request_close() {
+                    event_loop.exit();
+                } else {
+                    shell.window.request_redraw();
+                }
+            }
             WindowEvent::Resized(size) => {
                 if size.width > 0 && size.height > 0 {
                     self_surface_resize(shell, size);
@@ -431,9 +443,7 @@ impl ApplicationHandler for AppState {
                         }
                     }
                     (MouseButton::Middle | MouseButton::Right, ElementState::Pressed) => {
-                        match shell.app.middle_or_right_pressed() {
-                            PanOrCancel::Panning | PanOrCancel::Cancelled => {}
-                        }
+                        shell.app.middle_or_right_pressed();
                     }
                     (MouseButton::Middle | MouseButton::Right, ElementState::Released) => {
                         shell.app.pan_released()

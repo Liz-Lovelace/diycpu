@@ -52,6 +52,15 @@ impl Rect {
     pub fn contains(&self, p: [f32; 2]) -> bool {
         p[0] >= self.x && p[0] <= self.x + self.w && p[1] >= self.y && p[1] <= self.y + self.h
     }
+
+    /// Smallest rectangle covering both.
+    pub fn union(&self, other: &Rect) -> Rect {
+        let x = self.x.min(other.x);
+        let y = self.y.min(other.y);
+        let x2 = (self.x + self.w).max(other.x + other.w);
+        let y2 = (self.y + self.h).max(other.y + other.h);
+        Rect { x, y, w: x2 - x, h: y2 - y }
+    }
 }
 
 /// The port list of a component type, in display order (top to bottom).
@@ -405,23 +414,39 @@ fn connect_orthogonal(
     };
     let ea = ext(sa, a_dir);
     let eb = ext(sb, b_dir);
-    // Detour axis: perpendicular to a's exit (or b's when a is free).
-    let horizontal_exit = match a_dir.or(b_dir) {
-        Some(Side::Left) | Some(Side::Right) | None => true,
-        Some(Side::Top) | Some(Side::Bottom) => false,
+    // Which axis each port exits along (None = free endpoint).
+    let axis = |d: ExitDir| -> Option<bool> {
+        d.map(|s| matches!(s, Side::Left | Side::Right)) // true = horizontal
     };
-    if horizontal_exit {
-        let detour_y = sa[1].min(sb[1]) - DETOUR;
-        pts.push(ea);
-        pts.push([ea[0], detour_y]);
-        pts.push([eb[0], detour_y]);
-        pts.push(eb);
-    } else {
-        let detour_x = sa[0].min(sb[0]) - DETOUR;
-        pts.push(ea);
-        pts.push([detour_x, ea[1]]);
-        pts.push([detour_x, eb[1]]);
-        pts.push(eb);
+    match (axis(a_dir), axis(b_dir)) {
+        // Mixed axes: the extended points already clear both ports, so a
+        // single elbow between them is clean (the corner keeps each leg
+        // moving away from its own port).
+        (Some(true), Some(false)) => {
+            pts.push(ea);
+            pts.push([ea[0], eb[1]]);
+            pts.push(eb);
+        }
+        (Some(false), Some(true)) => {
+            pts.push(ea);
+            pts.push([eb[0], ea[1]]);
+            pts.push(eb);
+        }
+        // Same (or free) axes: wrap around perpendicular to the exits.
+        (Some(false), _) | (None, Some(false)) => {
+            let detour_x = sa[0].min(sb[0]) - DETOUR;
+            pts.push(ea);
+            pts.push([detour_x, ea[1]]);
+            pts.push([detour_x, eb[1]]);
+            pts.push(eb);
+        }
+        _ => {
+            let detour_y = sa[1].min(sb[1]) - DETOUR;
+            pts.push(ea);
+            pts.push([ea[0], detour_y]);
+            pts.push([eb[0], detour_y]);
+            pts.push(eb);
+        }
     }
 }
 
@@ -482,16 +507,7 @@ pub fn components_bounds(
     let mut bounds: Option<Rect> = None;
     for c in components {
         let r = footprint(abstractions, c);
-        bounds = Some(match bounds {
-            None => r,
-            Some(b) => {
-                let x = b.x.min(r.x);
-                let y = b.y.min(r.y);
-                let x2 = (b.x + b.w).max(r.x + r.w);
-                let y2 = (b.y + b.h).max(r.y + r.h);
-                Rect { x, y, w: x2 - x, h: y2 - y }
-            }
-        });
+        bounds = Some(bounds.map_or(r, |b| b.union(&r)));
     }
     bounds
 }
@@ -648,16 +664,7 @@ pub fn abstraction_inner_bounds(
 ) -> Rect {
     let mut bounds = components_bounds(abstractions, &def.components);
     let mut extend = |r: Rect| {
-        bounds = Some(match bounds {
-            None => r,
-            Some(b) => {
-                let x = b.x.min(r.x);
-                let y = b.y.min(r.y);
-                let x2 = (b.x + b.w).max(r.x + r.w);
-                let y2 = (b.y + b.h).max(r.y + r.h);
-                Rect { x, y, w: x2 - x, h: y2 - y }
-            }
-        });
+        bounds = Some(bounds.map_or(r, |b| b.union(&r)));
     };
     for note in &def.notes {
         extend(note_bounds(note));
@@ -1133,6 +1140,50 @@ mod tests {
         let out = ports.iter().find(|p| p.info.name == "out").unwrap();
         assert_eq!(out.side, Side::Bottom);
         assert_eq!(out.pos, [11.0, 22.0]);
+    }
+
+    /// A polyline retraces itself when two consecutive co-linear legs point
+    /// in opposite directions — the signature of stabbing through a port.
+    fn assert_no_retrace(pts: &[[f32; 2]]) {
+        let legs: Vec<[f32; 2]> = pts
+            .windows(2)
+            .map(|p| [p[1][0] - p[0][0], p[1][1] - p[0][1]])
+            .filter(|d| d[0].abs() > 1e-6 || d[1].abs() > 1e-6)
+            .collect();
+        for pair in legs.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            let colinear = (a[0].abs() > 1e-6) == (b[0].abs() > 1e-6);
+            if colinear {
+                assert!(
+                    a[0] * b[0] >= 0.0 && a[1] * b[1] >= 0.0,
+                    "retrace: leg {a:?} then {b:?} in {pts:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn route_mixed_axis_detours_never_retrace() {
+        // The two degenerate combos found in review: horizontal exit into a
+        // Bottom port behind it, and vertical exit into a Right port.
+        for (a, ad, b, bd) in [
+            ([10.0, 0.0], Side::Right, [2.0, 5.0], Side::Bottom),
+            ([5.0, 10.0], Side::Bottom, [0.0, 2.0], Side::Right),
+            ([0.0, 0.0], Side::Left, [5.0, -3.0], Side::Top),
+            ([3.0, 0.0], Side::Top, [3.0, 6.0], Side::Left),
+        ] {
+            let pts = route(a, Some(ad), b, Some(bd));
+            for pair in pts.windows(2) {
+                assert!(
+                    pair[0][0] == pair[1][0] || pair[0][1] == pair[1][1],
+                    "non-orthogonal in {pts:?}"
+                );
+            }
+            assert_no_retrace(&pts);
+        }
+        // And the plain cases still hold.
+        assert_no_retrace(&route([10.0, 1.0], Some(Side::Right), [2.0, 1.0], Some(Side::Left)));
+        assert_no_retrace(&route([8.0, 1.0], None, [2.0, 1.0], Some(Side::Left)));
     }
 
     #[test]

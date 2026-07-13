@@ -32,7 +32,9 @@ impl SimSession {
             states: Vec::new(),
             cursor: 0,
         };
-        let precompute = project.steps.max(1);
+        // The timeline extends on demand; precompute a sane amount even if
+        // the file asks for a huge step count.
+        let precompute = project.steps.clamp(1, 4096);
         session.compute_states(precompute);
         Ok(session)
     }
@@ -115,9 +117,5 @@ impl SimSession {
         }
         key.push_str(component_id);
         self.state().get(&key).copied()
-    }
-
-    pub fn component_value(&self, component_id: &str) -> Option<bool> {
-        self.component_value_at(&[], component_id)
     }
 }

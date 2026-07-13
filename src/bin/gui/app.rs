@@ -14,6 +14,20 @@ use crate::camera::Camera;
 use crate::sim::SimSession;
 use crate::theme;
 
+/// One level of the zoom path: which instance on `parent` we're inside.
+#[derive(Clone, PartialEq)]
+pub struct PathSeg {
+    pub parent: SheetRef,
+    pub instance_id: String,
+    pub child: SheetRef,
+}
+
+/// An instance bigger than this fraction of the viewport (and containing
+/// its center) pulls focus in; smaller than the ascend fraction pushes it
+/// back out. The gap is hysteresis.
+const DESCEND_AT: f32 = 1.30;
+const ASCEND_AT: f32 = 1.15;
+
 /// Pixels the cursor must travel before a press becomes a drag.
 const DRAG_THRESHOLD_PX: f32 = 5.0;
 
@@ -69,6 +83,16 @@ pub enum Gesture {
     DraggingJunction {
         net_id: String,
         junction_id: String,
+        pos: [f32; 2],
+    },
+    /// Left button down on a pin's name plate; not yet decided click vs drag.
+    PressedPin {
+        kind: PortKind,
+        name: String,
+        press_screen: [f32; 2],
+    },
+    DraggingPin {
+        name: String,
         pos: [f32; 2],
     },
 }
@@ -141,6 +165,11 @@ pub struct Status {
 pub struct App {
     pub editor: Editor,
     pub camera: Camera,
+    /// The sheet the whole view is rooted at (Top, or an abstraction
+    /// opened from the sidebar).
+    pub view_root: SheetRef,
+    /// Zoom path from the view root down to the focused sheet.
+    pub path: Vec<PathSeg>,
     pub mode: Mode,
     pub gesture: Gesture,
     pub selection: Selection,
@@ -190,6 +219,8 @@ impl App {
         App {
             editor,
             camera: Camera::new(),
+            view_root: SheetRef::Top,
+            path: Vec::new(),
             mode: Mode::Edit,
             gesture: Gesture::Idle,
             selection: Selection::default(),
@@ -216,6 +247,198 @@ impl App {
             SheetRef::Abstraction(i) => self.editor.project.abstractions.get(i),
             SheetRef::Top => None,
         }
+    }
+
+    // ── Infinite zoom: focus descend/ascend ──────────────────────────────
+
+    pub fn focus_sheet(&self) -> SheetRef {
+        self.path.last().map(|s| s.child).unwrap_or(self.view_root)
+    }
+
+    fn viewport_min(&self) -> f32 {
+        let r = self.canvas_rect();
+        r.w.min(r.h)
+    }
+
+    fn canvas_center(&self) -> [f32; 2] {
+        let r = self.canvas_rect();
+        [r.x + r.w / 2.0, r.y + r.h / 2.0]
+    }
+
+    /// The child→parent transform of one zoom-path segment, recomputed from
+    /// the live document.
+    pub fn seg_map(&self, seg: &PathSeg) -> Option<diycpu::layout::SheetMap> {
+        let abstractions = &self.editor.project.abstractions;
+        let (components, _) = diycpu::editor::sheet_of(&self.editor.project, seg.parent)?;
+        let comp = components.iter().find(|c| c.id == seg.instance_id)?;
+        let def = abstractions.iter().find(|a| a.name == comp.component_type)?;
+        Some(diycpu::layout::instance_inner_map(
+            abstractions,
+            def,
+            layout::footprint(abstractions, comp),
+        ))
+    }
+
+    /// Keep the focused sheet in step with the camera: zooming into an
+    /// instance until it fills the screen hands focus (and the camera's
+    /// coordinate system) to its sheet; zooming back out hands it back.
+    /// The rebased camera describes the identical visual transform, so the
+    /// hand-off is invisible.
+    pub fn update_focus(&mut self) {
+        if self.is_running() {
+            return;
+        }
+        if !matches!(self.gesture, Gesture::Idle | Gesture::Panning { .. }) {
+            return;
+        }
+        for _ in 0..16 {
+            if !self.try_descend() && !self.try_ascend() {
+                break;
+            }
+        }
+    }
+
+    fn try_descend(&mut self) -> bool {
+        let view = self.camera.view();
+        let v = self.viewport_min();
+        let center = self.canvas_center();
+        let abstractions = &self.editor.project.abstractions;
+        let (components, _) = self.editor.sheet_data();
+
+        let mut target: Option<(String, usize, layout::Rect)> = None;
+        for comp in components {
+            let Some(def_index) = abstractions
+                .iter()
+                .position(|a| a.name == comp.component_type)
+            else {
+                continue;
+            };
+            let rect = layout::footprint(abstractions, comp);
+            let tl = view.to_screen([rect.x, rect.y]);
+            let (w, h) = (rect.w * view.scale, rect.h * view.scale);
+            let contains = center[0] >= tl[0]
+                && center[0] <= tl[0] + w
+                && center[1] >= tl[1]
+                && center[1] <= tl[1] + h;
+            if w.max(h) > DESCEND_AT * v && contains {
+                target = Some((comp.id.clone(), def_index, rect));
+                break;
+            }
+        }
+        let Some((instance_id, def_index, rect)) = target else {
+            return false;
+        };
+
+        let def = &self.editor.project.abstractions[def_index];
+        let map = diycpu::layout::instance_inner_map(
+            &self.editor.project.abstractions,
+            def,
+            rect,
+        );
+        self.camera.set_view(view.through(&map));
+        self.path.push(PathSeg {
+            parent: self.editor.sheet,
+            instance_id,
+            child: SheetRef::Abstraction(def_index),
+        });
+        let _ = self.editor.open_sheet(SheetRef::Abstraction(def_index));
+        self.selection.clear();
+        self.recompute_hover();
+        true
+    }
+
+    fn try_ascend(&mut self) -> bool {
+        let Some(seg) = self.path.last().cloned() else {
+            return false;
+        };
+        let Some(map) = self.seg_map(&seg) else {
+            // The enclosing instance vanished (undo, delete): snap out.
+            self.reset_view_to_editor_sheet();
+            return false;
+        };
+        let parent_view = self.camera.view().through(&map.inverse());
+        let abstractions = &self.editor.project.abstractions;
+        let (parent_components, _) =
+            diycpu::editor::sheet_of(&self.editor.project, seg.parent).unwrap_or((&[], &[]));
+        let Some(comp) = parent_components.iter().find(|c| c.id == seg.instance_id) else {
+            self.reset_view_to_editor_sheet();
+            return false;
+        };
+        let rect = layout::footprint(abstractions, comp);
+        let tl = parent_view.to_screen([rect.x, rect.y]);
+        let (w, h) = (rect.w * parent_view.scale, rect.h * parent_view.scale);
+        let v = self.viewport_min();
+        let center = self.canvas_center();
+        let contains = center[0] >= tl[0]
+            && center[0] <= tl[0] + w
+            && center[1] >= tl[1]
+            && center[1] <= tl[1] + h;
+        if w.max(h) >= ASCEND_AT * v && contains {
+            return false;
+        }
+        self.camera.set_view(parent_view);
+        self.path.pop();
+        let _ = self.editor.open_sheet(seg.parent);
+        self.selection.clear();
+        self.recompute_hover();
+        true
+    }
+
+    /// One explicit step outward (Esc / Back button), seamlessly rebased.
+    fn ascend_once(&mut self) -> bool {
+        let Some(seg) = self.path.last().cloned() else {
+            return false;
+        };
+        if let Some(map) = self.seg_map(&seg) {
+            self.camera.set_view(self.camera.view().through(&map.inverse()));
+        }
+        self.path.pop();
+        let _ = self.editor.open_sheet(seg.parent);
+        self.selection.clear();
+        self.gesture = Gesture::Idle;
+        self.recompute_hover();
+        true
+    }
+
+    /// The editor's sheet changed underneath the view (undo across sheets,
+    /// abstraction deleted): re-root the view there.
+    fn reset_view_to_editor_sheet(&mut self) {
+        self.view_root = self.editor.sheet;
+        self.path.clear();
+        self.pending_fit = true;
+    }
+
+    /// Open an abstraction as the root of the view (sidebar affordance).
+    pub fn open_as_root(&mut self, index: usize) {
+        if !self.require_edit_mode() {
+            return;
+        }
+        match self.editor.open_sheet(SheetRef::Abstraction(index)) {
+            Ok(()) => {
+                self.view_root = SheetRef::Abstraction(index);
+                self.path.clear();
+                self.selection.clear();
+                self.gesture = Gesture::Idle;
+                self.pending_fit = true;
+                self.info("Editing the abstraction — every instance updates; Esc goes back");
+            }
+            Err(e) => self.error(e.to_string()),
+        }
+    }
+
+    /// The title-bar trail: project ▸ root abstraction ▸ … ▸ focus.
+    pub fn breadcrumb(&self) -> Vec<String> {
+        let abstractions = &self.editor.project.abstractions;
+        let name_of = |sheet: &SheetRef| match sheet {
+            SheetRef::Top => None,
+            SheetRef::Abstraction(i) => abstractions.get(*i).map(|a| a.name.clone()),
+        };
+        let mut parts = vec![self.editor.project.name.clone()];
+        parts.extend(name_of(&self.view_root));
+        for seg in &self.path {
+            parts.extend(name_of(&seg.child));
+        }
+        parts
     }
 
     // ── Small helpers ────────────────────────────────────────────────────
@@ -502,6 +725,8 @@ impl App {
         }
         self.editor = Editor::empty();
         self.file_path = None;
+        self.view_root = SheetRef::Top;
+        self.path.clear();
         self.selection.clear();
         self.gesture = Gesture::Idle;
         self.mode = Mode::Edit;
@@ -524,6 +749,8 @@ impl App {
             Ok((project, notes)) => {
                 self.editor = Editor::new(project);
                 self.file_path = Some(path.clone());
+                self.view_root = SheetRef::Top;
+                self.path.clear();
                 self.selection.clear();
                 self.gesture = Gesture::Idle;
                 self.mode = Mode::Edit;
@@ -555,8 +782,10 @@ impl App {
             Mode::Edit => {
                 self.gesture = Gesture::Idle;
                 // Simulation always runs the whole design from the top.
-                if self.editor.sheet != SheetRef::Top {
+                if self.editor.sheet != SheetRef::Top || self.view_root != SheetRef::Top {
                     let _ = self.editor.open_sheet(SheetRef::Top);
+                    self.view_root = SheetRef::Top;
+                    self.path.clear();
                     self.selection.clear();
                     self.pending_fit = true;
                 }
@@ -628,6 +857,7 @@ impl App {
                 let dy = pos[1] - last[1];
                 *last = pos;
                 self.camera.pan(dx, dy);
+                self.update_focus();
             }
             Gesture::PressedComponent { id, press_screen } => {
                 if dist(pos, *press_screen) > DRAG_THRESHOLD_PX {
@@ -705,6 +935,19 @@ impl App {
                 }
             }
             Gesture::DraggingJunction { pos: drag_pos, .. } => {
+                *drag_pos = snap_half(self.camera.screen_to_grid(pos));
+            }
+            Gesture::PressedPin {
+                name, press_screen, ..
+            } => {
+                if dist(pos, *press_screen) > DRAG_THRESHOLD_PX {
+                    self.gesture = Gesture::DraggingPin {
+                        name: name.clone(),
+                        pos: snap_half(self.camera.screen_to_grid(pos)),
+                    };
+                }
+            }
+            Gesture::DraggingPin { pos: drag_pos, .. } => {
                 *drag_pos = snap_half(self.camera.screen_to_grid(pos));
             }
             _ => {}
@@ -854,9 +1097,11 @@ impl App {
                 }
             }
             Hit::Pin { name, kind } => {
-                self.selection.clear();
-                self.selection.pin = Some((kind, name.clone()));
-                self.info(format!("Pin \"{name}\" selected — Delete removes it"));
+                self.gesture = Gesture::PressedPin {
+                    kind,
+                    name,
+                    press_screen: self.cursor,
+                };
             }
             Hit::Wire { net_id, .. } => {
                 self.selection.clear();
@@ -1019,6 +1264,20 @@ impl App {
                 Ok(()) => {}
                 Err(e) => self.error(e.to_string()),
             },
+            Gesture::PressedPin { kind, name, .. } => {
+                // A click: select the pin.
+                self.selection.clear();
+                self.selection.pin = Some((kind, name.clone()));
+                self.info(format!(
+                    "Pin \"{name}\" — drag moves it, double-click renames, Delete removes"
+                ));
+            }
+            Gesture::DraggingPin { name, pos } => {
+                match self.editor.set_pin_position(&name, pos) {
+                    Ok(()) => {}
+                    Err(e) => self.error(e.to_string()),
+                }
+            }
         }
     }
 
@@ -1056,6 +1315,7 @@ impl App {
         }
         let factor = (1.0015f32).powf(amount);
         self.camera.zoom_at(self.cursor, factor);
+        self.update_focus();
         self.recompute_hover();
     }
 
@@ -1103,8 +1363,9 @@ impl App {
                 }
                 return;
             }
-            // Double-click an abstraction instance to open its sheet.
+            // Double-click an abstraction instance: jump the zoom inside it.
             let type_name = comp.component_type.clone();
+            let instance_id = comp.id.clone();
             if let Some(i) = self
                 .editor
                 .project
@@ -1112,16 +1373,36 @@ impl App {
                 .iter()
                 .position(|a| a.name == type_name)
             {
-                match self.editor.open_sheet(SheetRef::Abstraction(i)) {
-                    Ok(()) => {
-                        self.selection.clear();
-                        self.gesture = Gesture::Idle;
-                        self.pending_fit = true;
-                        self.info(format!(
-                            "Editing \"{type_name}\" — every instance updates; Esc goes back"
-                        ));
-                    }
-                    Err(e) => self.error(e.to_string()),
+                let parent = self.editor.sheet;
+                if self.editor.open_sheet(SheetRef::Abstraction(i)).is_ok() {
+                    self.path.push(PathSeg {
+                        parent,
+                        instance_id,
+                        child: SheetRef::Abstraction(i),
+                    });
+                    // Land just past the descend threshold: the content
+                    // slightly overfills the screen, so zooming out walks
+                    // back out naturally.
+                    let abstractions = &self.editor.project.abstractions;
+                    let b = diycpu::layout::abstraction_inner_bounds(
+                        abstractions,
+                        &abstractions[i],
+                    );
+                    let v = self.viewport_min();
+                    let scale = DESCEND_AT * 0.98 * v / b.w.max(b.h).max(0.1);
+                    let center = self.canvas_center();
+                    self.camera.set_view(crate::camera::View {
+                        scale,
+                        offset: [
+                            center[0] - (b.x + b.w / 2.0) * scale,
+                            center[1] - (b.y + b.h / 2.0) * scale,
+                        ],
+                    });
+                    self.selection.clear();
+                    self.gesture = Gesture::Idle;
+                    self.info(format!(
+                        "Inside \"{type_name}\" — zoom out or press Esc to leave"
+                    ));
                 }
             }
         }
@@ -1209,7 +1490,10 @@ impl App {
             self.toggle_run();
         } else if !self.selection.is_empty() {
             self.selection.clear();
-        } else if self.editor.sheet != SheetRef::Top {
+        } else if self.ascend_once() {
+            self.info("Zoomed out one level");
+        } else if self.view_root != SheetRef::Top {
+            self.view_root = SheetRef::Top;
             let _ = self.editor.open_sheet(SheetRef::Top);
             self.selection.clear();
             self.pending_fit = true;
@@ -1279,6 +1563,9 @@ impl App {
             Ok(()) => self.info("Undone"),
             Err(e) => self.info(e.to_string()),
         }
+        if self.editor.sheet != self.focus_sheet() {
+            self.reset_view_to_editor_sheet();
+        }
     }
 
     pub fn redo(&mut self) {
@@ -1290,6 +1577,9 @@ impl App {
         match self.editor.redo() {
             Ok(()) => self.info("Redone"),
             Err(e) => self.info(e.to_string()),
+        }
+        if self.editor.sheet != self.focus_sheet() {
+            self.reset_view_to_editor_sheet();
         }
     }
 
@@ -1382,6 +1672,8 @@ impl App {
             PromptAction::NewAbstraction => match self.editor.create_abstraction(&name) {
                 Ok(i) => {
                     let _ = self.editor.open_sheet(SheetRef::Abstraction(i));
+                    self.view_root = SheetRef::Abstraction(i);
+                    self.path.clear();
                     self.selection.clear();
                     self.pending_fit = true;
                     self.info(format!(
@@ -1512,9 +1804,9 @@ impl App {
         };
         match self.editor.delete_abstraction(index) {
             Ok(()) => {
+                self.reset_view_to_editor_sheet();
                 self.selection.clear();
                 self.gesture = Gesture::Idle;
-                self.pending_fit = true;
                 self.info("Abstraction deleted (Ctrl+Z restores it)");
             }
             Err(e) => self.error(e.to_string()),
@@ -1522,7 +1814,10 @@ impl App {
     }
 
     pub fn action_back_to_top(&mut self) {
-        if self.editor.sheet != SheetRef::Top {
+        if self.ascend_once() {
+            self.info("Zoomed out one level");
+        } else if self.view_root != SheetRef::Top {
+            self.view_root = SheetRef::Top;
             let _ = self.editor.open_sheet(SheetRef::Top);
             self.selection.clear();
             self.gesture = Gesture::Idle;
@@ -2085,5 +2380,131 @@ mod crud_tests {
         d.app.action_delete_abstraction();
         assert!(d.app.editor.project.abstractions.is_empty());
         assert_eq!(d.app.editor.sheet, SheetRef::Top);
+    }
+}
+
+#[cfg(test)]
+mod zoom_tests {
+    use super::tests::*;
+    use super::*;
+
+    fn build_project_with_instance(d: &mut Driver) {
+        d.app.action_new_abstraction();
+        d.type_text("box");
+        d.app.handle_key(KeyInput::Enter);
+        d.place("nand", [2.0, 1.0]);
+        d.app.handle_key(KeyInput::Escape); // clear selection
+        d.app.handle_key(KeyInput::Escape); // back to top
+        assert_eq!(d.app.editor.sheet, SheetRef::Top);
+        d.place("box", [5.0, 5.0]);
+        d.app.handle_key(KeyInput::Escape);
+    }
+
+    /// Aim the camera so the given grid rect fills `fill`× the viewport,
+    /// centered.
+    fn aim(d: &mut Driver, rect: diycpu::layout::Rect, fill: f32) {
+        let cr = d.app.canvas_rect();
+        let v = cr.w.min(cr.h);
+        let scale = fill * v / rect.w.max(rect.h);
+        d.app.camera.zoom = scale / crate::camera::CELL;
+        d.app.camera.offset = [
+            cr.x + cr.w / 2.0 - (rect.x + rect.w / 2.0) * scale,
+            cr.y + cr.h / 2.0 - (rect.y + rect.h / 2.0) * scale,
+        ];
+    }
+
+    #[test]
+    fn zooming_in_descends_and_out_ascends_seamlessly() {
+        let mut d = Driver::new();
+        build_project_with_instance(&mut d);
+        let abstractions = &d.app.editor.project.abstractions;
+        let comp = &d.app.editor.project.components[0];
+        let rect = diycpu::layout::footprint(abstractions, comp);
+
+        // Big enough and centered: focus descends.
+        aim(&mut d, rect, 1.5);
+        let view_before = d.app.camera.view();
+        let world_probe = [rect.x + 1.0, rect.y + 1.0]; // a point on the parent sheet
+        let screen_before = view_before.to_screen(world_probe);
+
+        d.app.update_focus();
+        assert_eq!(d.app.editor.sheet, SheetRef::Abstraction(0));
+        assert_eq!(d.app.path.len(), 1);
+
+        // Seamless: the same world point still lands on the same pixel when
+        // mapped through the rebased camera and the inverse of the map.
+        let seg = d.app.path.last().unwrap().clone();
+        let map = d.app.seg_map(&seg).unwrap();
+        let parent_view = d.app.camera.view().through(&map.inverse());
+        let screen_after = parent_view.to_screen(world_probe);
+        assert!(
+            (screen_before[0] - screen_after[0]).abs() < 0.5
+                && (screen_before[1] - screen_after[1]).abs() < 0.5,
+            "rebase moved the world: {screen_before:?} vs {screen_after:?}"
+        );
+
+        // Zoom the camera way out (in child coordinates): focus ascends.
+        d.app.camera.zoom *= 0.2;
+        d.app.update_focus();
+        assert_eq!(d.app.editor.sheet, SheetRef::Top);
+        assert!(d.app.path.is_empty());
+    }
+
+    #[test]
+    fn escape_ascends_one_level_and_editing_targets_focus() {
+        let mut d = Driver::new();
+        build_project_with_instance(&mut d);
+        let rect = diycpu::layout::footprint(
+            &d.app.editor.project.abstractions,
+            &d.app.editor.project.components[0],
+        );
+        aim(&mut d, rect, 1.5);
+        d.app.update_focus();
+        assert_eq!(d.app.path.len(), 1);
+
+        // Editing while focused edits the abstraction's sheet.
+        d.app.camera.zoom = 1.0; // gestures at sane scale (no auto-ascend: no scroll)
+        d.app.camera.offset = [400.0, 200.0];
+        d.place("dff", [10.0, 1.0]);
+        assert_eq!(d.app.editor.project.abstractions[0].components.len(), 2);
+        assert!(!d.app.status.is_error, "{}", d.app.status.text);
+
+        d.app.handle_key(KeyInput::Escape); // clear selection
+        d.app.handle_key(KeyInput::Escape); // ascend
+        assert!(d.app.path.is_empty());
+        assert_eq!(d.app.editor.sheet, SheetRef::Top);
+    }
+
+    #[test]
+    fn breadcrumb_tracks_the_path() {
+        let mut d = Driver::new();
+        build_project_with_instance(&mut d);
+        assert_eq!(d.app.breadcrumb(), vec!["untitled"]);
+        let rect = diycpu::layout::footprint(
+            &d.app.editor.project.abstractions,
+            &d.app.editor.project.components[0],
+        );
+        aim(&mut d, rect, 1.5);
+        d.app.update_focus();
+        assert_eq!(d.app.breadcrumb(), vec!["untitled", "box"]);
+        d.app.open_as_root(0);
+        assert_eq!(d.app.breadcrumb(), vec!["untitled", "box"]);
+        assert!(d.app.path.is_empty());
+    }
+
+    #[test]
+    fn undo_across_sheets_resets_the_view() {
+        let mut d = Driver::new();
+        build_project_with_instance(&mut d);
+        let rect = diycpu::layout::footprint(
+            &d.app.editor.project.abstractions,
+            &d.app.editor.project.components[0],
+        );
+        aim(&mut d, rect, 1.5);
+        d.app.update_focus();
+        assert_eq!(d.app.path.len(), 1);
+        // Undo jumps back to a top-sheet edit: view must follow.
+        d.app.undo();
+        assert_eq!(d.app.editor.sheet, d.app.focus_sheet());
     }
 }

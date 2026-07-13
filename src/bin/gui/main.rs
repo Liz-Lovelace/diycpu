@@ -37,6 +37,7 @@ struct CliArgs {
     screenshot: Option<PathBuf>,
     run_steps: Option<usize>,
     sheet: Option<String>,
+    camera: Option<(f32, f32, f32)>,
     size: (u32, u32),
 }
 
@@ -46,6 +47,7 @@ fn parse_args() -> CliArgs {
         screenshot: None,
         run_steps: None,
         sheet: None,
+        camera: None,
         size: (1280, 800),
     };
     let mut it = std::env::args().skip(1);
@@ -54,6 +56,15 @@ fn parse_args() -> CliArgs {
             "--screenshot" => args.screenshot = it.next().map(PathBuf::from),
             "--run" => args.run_steps = it.next().and_then(|s| s.parse().ok()),
             "--sheet" => args.sheet = it.next(),
+            "--camera" => {
+                if let Some(s) = it.next() {
+                    let parts: Vec<f32> =
+                        s.split(',').filter_map(|p| p.parse().ok()).collect();
+                    if let [zoom, x, y] = parts[..] {
+                        args.camera = Some((zoom, x, y));
+                    }
+                }
+            }
             "--size" => {
                 if let Some(s) = it.next() {
                     if let Some((w, h)) = s.split_once('x') {
@@ -146,10 +157,14 @@ impl Shell {
                 .iter()
                 .position(|a| &a.name == sheet_name)
             {
-                let _ = app
-                    .editor
-                    .open_sheet(diycpu::editor::SheetRef::Abstraction(i));
+                app.open_as_root(i);
             }
+        }
+        if let Some((zoom, x, y)) = args.camera {
+            app.camera.zoom = zoom;
+            app.camera.offset = [x, y];
+            app.pending_fit = false;
+            app.update_focus();
         }
         if let Some(steps) = args.run_steps {
             app.action_run_toggle();
@@ -279,6 +294,21 @@ impl Shell {
         }
 
         for item in &ui.palette_items {
+            if let Some(er) = &item.edit_rect {
+                if er.contains(cursor) {
+                    if let Some(i) = self
+                        .app
+                        .editor
+                        .project
+                        .abstractions
+                        .iter()
+                        .position(|a| a.name == item.type_name)
+                    {
+                        self.app.open_as_root(i);
+                    }
+                    return;
+                }
+            }
             if item.rect.contains(cursor) {
                 if item.enabled {
                     self.app.palette_clicked(&item.type_name);

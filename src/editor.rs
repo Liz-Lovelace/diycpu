@@ -32,8 +32,6 @@ pub enum EditError {
     UnknownComponent(String),
     UnknownPort(String, String),
     Overlap,
-    SecondClock,
-    ClockInsideAbstraction,
     RecursiveAbstraction(String),
     NotAnInputAndOutput,
     NotADff(String),
@@ -62,10 +60,6 @@ impl fmt::Display for EditError {
             Self::UnknownComponent(id) => write!(f, "No component \"{id}\""),
             Self::UnknownPort(c, p) => write!(f, "Component \"{c}\" has no port \"{p}\""),
             Self::Overlap => write!(f, "Components can't overlap"),
-            Self::SecondClock => write!(f, "The design already has a clock (one per design)"),
-            Self::ClockInsideAbstraction => {
-                write!(f, "Clocks can only be placed in the main circuit")
-            }
             Self::RecursiveAbstraction(name) => {
                 write!(f, "Placing \"{name}\" here would nest it inside itself")
             }
@@ -235,19 +229,6 @@ impl Editor {
         self.mutate(move |project, sheet| {
             let size = layout::type_size(&project.abstractions, &type_name)
                 .ok_or_else(|| EditError::UnknownComponentType(type_name.clone()))?;
-
-            if type_name == "clk" {
-                match sheet {
-                    SheetRef::Top => {
-                        if project.components.iter().any(|c| c.component_type == "clk") {
-                            return Err(EditError::SecondClock);
-                        }
-                    }
-                    SheetRef::Abstraction(_) => {
-                        return Err(EditError::ClockInsideAbstraction)
-                    }
-                }
-            }
 
             // An abstraction may not (transitively) contain itself.
             if let SheetRef::Abstraction(i) = sheet {
@@ -685,6 +666,7 @@ impl Editor {
             }
             let [width, height] = layout::default_abstraction_size(&name, 0, 0);
             project.abstractions.push(crate::project::ProjectAbstraction {
+                pin_positions: HashMap::new(),
                 name: name.clone(),
                 inputs: vec![],
                 outputs: HashMap::new(),
@@ -713,13 +695,39 @@ impl Editor {
             if def.inputs.iter().any(|x| x == &name) || def.outputs.contains_key(&name) {
                 return Err(EditError::NameTaken(name.clone()));
             }
-            match kind {
-                PortKind::Input => def.inputs.push(name.clone()),
+            let index = match kind {
+                PortKind::Input => {
+                    def.inputs.push(name.clone());
+                    def.inputs.len() - 1
+                }
                 PortKind::Output => {
                     def.outputs.insert(name.clone(), String::new());
+                    def.outputs.len() - 1
                 }
-            }
+            };
             update_interface_height(def);
+            // Pins are free-floating objects: give the new one a concrete
+            // home on the rail so it never drifts as content changes.
+            let abstractions = project.abstractions.clone();
+            let pos =
+                layout::default_pin_position(&abstractions, &abstractions[i], kind, index);
+            project.abstractions[i].pin_positions.insert(name.clone(), pos);
+            Ok(())
+        })
+    }
+
+    /// Move an interface pin to a new spot inside its sheet.
+    pub fn set_pin_position(&mut self, name: &str, pos: [f32; 2]) -> Result<(), EditError> {
+        let name = name.to_string();
+        self.mutate(move |project, sheet| {
+            let SheetRef::Abstraction(i) = sheet else {
+                return Err(EditError::NotAnAbstractionSheet);
+            };
+            let def = project.abstractions.get_mut(i).ok_or(EditError::BadSheet)?;
+            if !def.inputs.iter().any(|x| x == &name) && !def.outputs.contains_key(&name) {
+                return Err(EditError::UnknownComponent(name.clone()));
+            }
+            def.pin_positions.insert(name.clone(), pos);
             Ok(())
         })
     }
@@ -768,6 +776,8 @@ impl Editor {
                     }
                 }
             }
+            let def = project.abstractions.get_mut(i).ok_or(EditError::BadSheet)?;
+            def.pin_positions.remove(&name);
             update_interface_height(def);
             Ok(())
         })
@@ -800,6 +810,9 @@ impl Editor {
             }
             let abs_name = def.name.clone();
 
+            if let Some(pos) = def.pin_positions.remove(&old) {
+                def.pin_positions.insert(new.clone(), pos);
+            }
             match kind {
                 PortKind::Input => {
                     let slot = def
@@ -1694,6 +1707,30 @@ pub fn normalize(project: &mut Project) -> Vec<String> {
         );
     }
 
+    // Give legacy pins (from files predating free-floating pins) a stored
+    // position so their layout stops depending on content bounds.
+    for i in 0..project.abstractions.len() {
+        let def = &project.abstractions[i];
+        let mut missing: Vec<(String, PortKind, usize)> = Vec::new();
+        for (n, name) in def.inputs.iter().enumerate() {
+            if !def.pin_positions.contains_key(name) {
+                missing.push((name.clone(), PortKind::Input, n));
+            }
+        }
+        let mut outs: Vec<&String> = def.outputs.keys().collect();
+        outs.sort();
+        for (n, name) in outs.into_iter().enumerate() {
+            if !def.pin_positions.contains_key(name) {
+                missing.push((name.clone(), PortKind::Output, n));
+            }
+        }
+        for (name, kind, n) in missing {
+            let pos =
+                layout::default_pin_position(&abstractions, &project.abstractions[i], kind, n);
+            project.abstractions[i].pin_positions.insert(name, pos);
+        }
+    }
+
     // Output pin targets must reference an existing output port.
     for a in &mut project.abstractions {
         let comps = a.components.clone();
@@ -2050,13 +2087,35 @@ mod tests {
     }
 
     #[test]
-    fn only_one_clock() {
+    fn clocks_are_a_shared_signal() {
+        // Several clk components — even inside abstractions — are all the
+        // same clock. Placing them anywhere is legal and they tick together.
         let mut e = Editor::empty();
         e.place_component("clk", [0, 0]).unwrap();
-        assert_eq!(
-            e.place_component("clk", [10, 0]).unwrap_err(),
-            EditError::SecondClock
-        );
+        e.place_component("clk", [10, 0]).unwrap();
+        let i = e.create_abstraction("ticker").unwrap();
+        e.open_sheet(SheetRef::Abstraction(i)).unwrap();
+        e.add_interface_pin(PortKind::Output, "q").unwrap();
+        e.place_component("clk", [0, 0]).unwrap();
+        e.place_component("dff", [6, 0]).unwrap();
+        e.connect(port("clk_1", "out"), port("dff_1", "clk"), &[]).unwrap();
+        e.connect(port("dff_1", "out"), port("dff_1", "d"), &[]).unwrap();
+        e.connect(port("dff_1", "out"), pin("OUTPUT:", "q"), &[]).unwrap();
+        e.open_sheet(SheetRef::Top).unwrap();
+        e.place_component("ticker", [0, 8]).unwrap();
+
+        use crate::compiler::compile;
+        use crate::convert::project_to_circuit;
+        use crate::expander::expand;
+        use crate::simulator::simulate;
+        let expanded = expand(&project_to_circuit(&e.project).unwrap()).unwrap();
+        let compiled = compile(&expanded.def).unwrap();
+        let results = simulate(&compiled);
+        // Both top-level clocks and the one inside the abstraction agree.
+        for (step, state) in results.iter().enumerate() {
+            assert_eq!(state["clk_1"], state["clk_2"]);
+            assert_eq!(state["clk_1"], step % 2 == 1);
+        }
     }
 
     #[test]
@@ -2293,6 +2352,7 @@ mod tests {
     fn project_with_not_abstraction() -> Editor {
         let mut e = Editor::empty();
         e.project.abstractions.push(ProjectAbstraction {
+            pin_positions: HashMap::new(),
             name: "not".into(),
             inputs: vec!["x".into()],
             outputs: HashMap::from([("out".into(), "gate".into())]),
@@ -2308,16 +2368,6 @@ mod tests {
         notes: vec![],
         });
         e
-    }
-
-    #[test]
-    fn no_clock_inside_abstraction() {
-        let mut e = project_with_not_abstraction();
-        e.open_sheet(SheetRef::Abstraction(0)).unwrap();
-        assert_eq!(
-            e.place_component("clk", [8, 0]).unwrap_err(),
-            EditError::ClockInsideAbstraction
-        );
     }
 
     #[test]
@@ -2938,6 +2988,39 @@ mod tests {
         // Undo brings it back (and the sheet restore comes from the stack).
         e.undo().unwrap();
         assert_eq!(e.project.abstractions.len(), 1);
+    }
+
+    #[test]
+    fn pins_have_stored_positions_and_order_ports() {
+        let mut e = Editor::empty();
+        let i = e.create_abstraction("thing").unwrap();
+        e.open_sheet(SheetRef::Abstraction(i)).unwrap();
+        e.add_interface_pin(PortKind::Input, "a").unwrap();
+        e.add_interface_pin(PortKind::Input, "b").unwrap();
+        // Both pins got concrete homes at creation.
+        assert!(e.project.abstractions[i].pin_positions.contains_key("a"));
+        assert!(e.project.abstractions[i].pin_positions.contains_key("b"));
+
+        // Move "b" above "a": the instance's ports reorder to match.
+        let a_y = e.project.abstractions[i].pin_positions["a"][1];
+        e.set_pin_position("b", [-4.0, a_y - 3.0]).unwrap();
+        e.open_sheet(SheetRef::Top).unwrap();
+        e.place_component("thing", [0, 0]).unwrap();
+        let comp = &e.project.components[0];
+        let ports = layout::component_ports(&e.project.abstractions, comp);
+        let inputs: Vec<&str> = ports
+            .iter()
+            .filter(|p| p.info.kind == PortKind::Input)
+            .map(|p| p.info.name.as_str())
+            .collect();
+        assert_eq!(inputs, vec!["b", "a"], "port order mirrors inside layout");
+
+        // Rename keeps the position; removal drops it.
+        e.open_sheet(SheetRef::Abstraction(i)).unwrap();
+        e.rename_interface_pin(PortKind::Input, "b", "top").unwrap();
+        assert!(e.project.abstractions[i].pin_positions.contains_key("top"));
+        e.remove_interface_pin(PortKind::Input, "top").unwrap();
+        assert!(!e.project.abstractions[i].pin_positions.contains_key("top"));
     }
 
     // ── Normalization ────────────────────────────────────────────────────

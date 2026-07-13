@@ -27,21 +27,34 @@ exit), `--run N` (enter run mode and step N times first), `--sheet name`
 | Files | Ctrl+S save, Ctrl+Shift+S save as, Ctrl+O open, Ctrl+N new — native file dialogs; unsaved changes ask you to repeat the action to confirm. |
 | Rename the project | Click its name in the title bar. |
 
+## Infinite zoom
+
+The canvas is one continuous zoomable world. Zoom toward any abstraction
+instance and, as it approaches screen size, its label fades out and its
+contents fade in — keep zooming and you're *inside*, editing its sheet,
+with the parent circuit still visible around the frame. Zoom back out and
+you're seamlessly back in the parent. This nests to any depth. Double-click
+an instance to jump straight inside; Esc (or “◂ Back”) steps back out one
+level. The title bar shows where you are (`project ▸ alu ▸ adder`).
+
 ## Abstractions
 
 - **Create**: the “+ abstraction” button in the toolbar, then name it.
-- **Edit**: double-click any instance (or create one) to open its sheet —
-  the title bar shows `project ▸ name`. Esc or “◂ Back” returns.
-- **Pins**: “+ input” / “+ output” add pins, which appear on rails beside
-  the content. Wire from an input pin into the circuit like any port; wire
-  a component output into an output pin to define what it emits.
+- **Edit**: zoom or double-click into any instance, or click the ↗ on the
+  abstraction's sidebar row to open it as the root of the view.
+- **Pins** are free-floating objects inside the sheet: “+ input” /
+  “+ output” create them, and you drag them anywhere you like. Wire from
+  an input pin into the circuit like any port; wire a component output
+  into an output pin to define what it emits. The vertical order of the
+  pins inside is the port order on the closed rectangle outside.
   Double-click a pin's name plate to rename it (every wire and instance
   follows); click it and press Delete to remove it.
 - **Rename / delete the abstraction**: the toolbar buttons inside its
   sheet (or click the title). Deleting is refused while instances of it
   are still placed somewhere.
-- Instances everywhere update immediately; nesting is unlimited, recursion
-  is refused, and clocks can't be placed inside abstractions.
+- Instances everywhere update immediately; nesting is unlimited and
+  recursion is refused. Clocks are welcome inside abstractions — every clk
+  anywhere is the same shared signal.
 
 ## Running
 
@@ -58,3 +71,7 @@ Hotkeys are printed right on the toolbar buttons.
 The clock starts at 0 and toggles once per step; flip-flops latch on the
 rising edge. State comes from DFF `init` values — set them in edit mode by
 double-clicking.
+
+Clock components are all one shared signal: place as many as you like,
+anywhere (including inside abstractions, handy for testing a part on its
+own) — they tick in unison.

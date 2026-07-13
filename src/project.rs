@@ -61,6 +61,10 @@ pub struct ProjectAbstraction {
     /// Annotations on this abstraction's sheet.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<Note>,
+    /// Where each interface pin sits inside this abstraction's sheet, in
+    /// grid units. Pins without an entry get an automatic rail position.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub pin_positions: HashMap<String, [f32; 2]>,
 }
 
 fn default_width() -> f32 {
@@ -229,6 +233,7 @@ mod tests {
             name: "test".into(),
             steps: 0,
             abstractions: vec![ProjectAbstraction {
+                pin_positions: HashMap::new(),
                 notes: vec![],
                 name: "not".into(),
                 inputs: vec!["x".into()],

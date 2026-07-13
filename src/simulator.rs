@@ -69,7 +69,9 @@ impl<'a> Simulator<'a> {
     // ── Private helpers ──────────────────────────────────────────────────
 
     fn toggle_clock(&mut self) {
-        if let Some(clock_index) = self.circuit.clock_index {
+        // Every clk component carries the same shared signal: they all
+        // start at 0 and toggle together.
+        for &clock_index in &self.circuit.clock_indices {
             self.component_values[clock_index] = !self.component_values[clock_index];
         }
     }

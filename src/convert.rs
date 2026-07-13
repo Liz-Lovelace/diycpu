@@ -266,6 +266,7 @@ mod tests {
             name: "test".into(),
             steps: 0,
             abstractions: vec![ProjectAbstraction {
+                pin_positions: HashMap::new(),
                 notes: vec![],
                 name: "not".into(),
                 inputs: vec!["x".into()],
@@ -319,6 +320,7 @@ mod tests {
             name: "test".into(),
             steps: 0,
             abstractions: vec![ProjectAbstraction {
+                pin_positions: HashMap::new(),
                 notes: vec![],
                 name: "not".into(),
                 inputs: vec!["x".into()],

@@ -40,6 +40,8 @@ pub struct PaletteItem {
     pub rect: Rect,
     pub enabled: bool,
     pub armed: bool,
+    /// The "open this abstraction" affordance on abstraction rows.
+    pub edit_rect: Option<Rect>,
 }
 
 pub struct UiLayout {
@@ -63,10 +65,6 @@ pub fn ui_layout(app: &App) -> UiLayout {
     section_headers.push(("PRIMITIVES".to_string(), y + 12.0));
     y += 24.0;
 
-    let clk_placed = {
-        let (components, _) = app.editor.sheet_data();
-        components.iter().any(|c| c.component_type == "clk")
-    };
     let edited_abstraction = match app.editor.sheet {
         diycpu::editor::SheetRef::Abstraction(i) => {
             app.editor.project.abstractions.get(i).map(|a| a.name.clone())
@@ -90,11 +88,10 @@ pub fn ui_layout(app: &App) -> UiLayout {
             section_headers.push(("ABSTRACTIONS".to_string(), y + 12.0));
             y += 24.0;
         }
-        // Mirror the editor's placement rules so the palette telegraphs them:
-        // one clock, never inside abstractions; no recursive nesting.
+        // Mirror the editor's placement rules so the palette telegraphs
+        // them: no recursive nesting. (Clocks are a shared signal and may
+        // be placed anywhere, any number of times.)
         let enabled = match (item.as_str(), &edited_abstraction) {
-            ("clk", None) => !clk_placed,
-            ("clk", Some(_)) => false,
             (_, Some(host)) => !diycpu::editor::abstraction_uses(
                 &app.editor.project.abstractions,
                 &item,
@@ -102,11 +99,18 @@ pub fn ui_layout(app: &App) -> UiLayout {
             ),
             _ => true,
         };
+        let edit_rect = (!is_builtin(&item)).then_some(Rect {
+            x: x + w - 26.0,
+            y: y + 6.0,
+            w: 20.0,
+            h: 20.0,
+        });
         palette_items.push(PaletteItem {
             armed: armed_type.as_deref() == Some(item.as_str()),
             type_name: item,
             rect: Rect { x, y, w, h: 32.0 },
             enabled,
+            edit_rect,
         });
         y += 36.0;
     }
@@ -214,18 +218,12 @@ pub fn ui_layout(app: &App) -> UiLayout {
     }
 
     // The title doubles as the rename affordance; approximate its width
-    // from the displayed text length.
-    let title_len = app.editor.project.name.chars().count()
-        + match app.editor.sheet {
-            diycpu::editor::SheetRef::Abstraction(i) => app
-                .editor
-                .project
-                .abstractions
-                .get(i)
-                .map(|a| a.name.chars().count() + 3)
-                .unwrap_or(0),
-            diycpu::editor::SheetRef::Top => 0,
-        };
+    // from the displayed breadcrumb length.
+    let title_len: usize = app
+        .breadcrumb()
+        .iter()
+        .map(|p| p.chars().count() + 3)
+        .sum();
     let title_rect = Rect {
         x: 8.0,
         y: 6.0,

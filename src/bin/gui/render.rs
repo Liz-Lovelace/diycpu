@@ -3,13 +3,61 @@
 
 use femtovg::{renderer::OpenGl, Align, Baseline, Canvas, Color, Paint, Path};
 
-use diycpu::layout::{self, PortKind, Rect};
+use diycpu::layout::{self, PortKind};
 use diycpu::project::{ProjectComponent, WireNet};
 use diycpu::types::is_primitive;
 
-use crate::app::{App, Gesture, Mode, WireTarget};
+use crate::app::{App, Gesture, Mode, PathSeg, WireTarget};
+use crate::camera::View;
 use crate::theme;
 use crate::ui::UiLayout;
+use diycpu::editor::SheetRef;
+use diycpu::project::{Note, ProjectAbstraction};
+
+/// Instance size (relative to the viewport's smaller dimension) where the
+/// closed look starts fading into the contents, and where the fade is done.
+const OPEN_T0: f32 = 0.55;
+const OPEN_T1: f32 = 0.95;
+/// Recursion limits for drawing nested sheets.
+const MAX_DEPTH: usize = 8;
+const MIN_CHILD_SCALE: f32 = 2.0; // px per grid unit
+
+/// Everything needed to draw one sheet at one place on screen.
+struct SheetCtx<'a> {
+    components: &'a [diycpu::project::ProjectComponent],
+    wire_nets: &'a [WireNet],
+    notes: &'a [Note],
+    interface: Option<&'a ProjectAbstraction>,
+    view: View,
+    alpha: f32,
+    /// True only for the sheet being edited: selection, hover and run-mode
+    /// values render here.
+    focus: bool,
+}
+
+impl SheetCtx<'_> {
+    fn zoom(&self) -> f32 {
+        self.view.scale / crate::camera::CELL
+    }
+}
+
+fn make_ctx(app: &App, sheet: SheetRef, view: View, alpha: f32, focus: bool) -> Option<SheetCtx<'_>> {
+    let (components, wire_nets) = diycpu::editor::sheet_of(&app.editor.project, sheet)?;
+    let notes = diycpu::editor::sheet_notes(&app.editor.project, sheet)?;
+    let interface = match sheet {
+        SheetRef::Abstraction(i) => app.editor.project.abstractions.get(i),
+        SheetRef::Top => None,
+    };
+    Some(SheetCtx {
+        components,
+        wire_nets,
+        notes,
+        interface,
+        view,
+        alpha,
+        focus,
+    })
+}
 
 pub struct Renderer {
     font: femtovg::FontId,
@@ -29,15 +77,11 @@ impl Renderer {
 
         let view = app.canvas_rect();
         canvas.scissor(view.x, view.y, view.w, view.h);
-        self.draw_grid(canvas, app, view);
-        self.draw_notes(canvas, app);
-        self.draw_wires(canvas, app);
-        self.draw_derived_output_wires(canvas, app);
+        self.draw_world(canvas, app);
         self.draw_wire_preview(canvas, app);
-        self.draw_components(canvas, app);
-        self.draw_interface_pins(canvas, app);
         self.draw_drag_ghosts(canvas, app);
         self.draw_junction_drag_ghost(canvas, app);
+        self.draw_pin_drag_ghost(canvas, app);
         self.draw_placement_ghost(canvas, app);
         self.draw_band(canvas, app);
         canvas.reset_scissor();
@@ -51,22 +95,120 @@ impl Renderer {
 
     // ── Canvas layers ────────────────────────────────────────────────────
 
-    fn draw_grid(&self, canvas: &mut Canvas<OpenGl>, app: &App, view: Rect) {
-        let cell = app.camera.cell_px();
+    /// The whole zoomable world: the focused sheet plus up to a few levels
+    /// of ancestor context behind it, plus every big-enough instance's
+    /// contents cross-faded in — recursively. One canvas, any depth.
+    fn draw_world(&self, canvas: &mut Canvas<OpenGl>, app: &App) {
+        // Climb from the focus to an ancestor to start drawing from, by
+        // inverting each level's map. Levels further up are entirely
+        // off-screen anyway.
+        let mut view = app.camera.view();
+        let mut sheet = app.focus_sheet();
+        let mut start = app.path.len();
+        let mut climbed = 0;
+        while climbed < 3 && start > 0 {
+            let seg = &app.path[start - 1];
+            let Some(map) = app.seg_map(seg) else { break };
+            view = view.through(&map.inverse());
+            sheet = seg.parent;
+            start -= 1;
+            climbed += 1;
+        }
+
+        // The focus sheet's grid clips to its enclosing instance body.
+        let grid_clip = app.path.last().and_then(|seg| {
+            let map = app.seg_map(seg)?;
+            let pview = app.camera.view().through(&map.inverse());
+            let (comps, _) = diycpu::editor::sheet_of(&app.editor.project, seg.parent)?;
+            let comp = comps.iter().find(|c| c.id == seg.instance_id)?;
+            let r = layout::footprint(&app.editor.project.abstractions, comp);
+            let tl = pview.to_screen([r.x, r.y]);
+            Some([tl[0], tl[1], r.w * pview.scale, r.h * pview.scale])
+        });
+
+        self.draw_sheet_tree(
+            canvas,
+            app,
+            sheet,
+            view,
+            1.0,
+            &app.path[start..],
+            true,
+            0,
+            grid_clip,
+        );
+        canvas.set_global_alpha(1.0);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_sheet_tree(
+        &self,
+        canvas: &mut Canvas<OpenGl>,
+        app: &App,
+        sheet: SheetRef,
+        view: View,
+        alpha: f32,
+        slice: &[PathSeg],
+        on_path: bool,
+        depth: usize,
+        grid_clip: Option<[f32; 4]>,
+    ) {
+        let focus = on_path && slice.is_empty();
+        let Some(ctx) = make_ctx(app, sheet, view, alpha, focus) else {
+            return;
+        };
+        canvas.set_global_alpha(alpha);
+        if ctx.focus {
+            self.draw_focus_grid(canvas, app, view, grid_clip);
+        }
+        self.draw_notes(canvas, app, &ctx);
+        self.draw_wires(canvas, app, &ctx);
+        self.draw_derived_output_wires(canvas, app, &ctx);
+        for comp in ctx.components {
+            self.draw_component_tree(canvas, app, &ctx, comp, slice, on_path, depth, grid_clip);
+            canvas.set_global_alpha(alpha);
+        }
+        if ctx.interface.is_some() {
+            self.draw_interface_pins(canvas, app, &ctx);
+        }
+    }
+
+    fn draw_focus_grid(
+        &self,
+        canvas: &mut Canvas<OpenGl>,
+        app: &App,
+        view: View,
+        clip: Option<[f32; 4]>,
+    ) {
+        let cr = app.canvas_rect();
+        let (mut x0, mut y0, mut x1, mut y1) = (cr.x, cr.y, cr.x + cr.w, cr.y + cr.h);
+        if let Some([cx, cy, cw, ch]) = clip {
+            x0 = x0.max(cx);
+            y0 = y0.max(cy);
+            x1 = x1.min(cx + cw);
+            y1 = y1.min(cy + ch);
+        }
+        if x1 <= x0 || y1 <= y0 {
+            return;
+        }
+        let cell = view.scale;
         let minor_visible = cell >= 9.0;
-
-        let g0 = app.camera.screen_to_grid([view.x, view.y]);
-        let g1 = app.camera.screen_to_grid([view.x + view.w, view.y + view.h]);
-
-        for gx in (g0[0].floor() as i64)..=(g1[0].ceil() as i64) {
+        if cell < 4.0 {
+            return;
+        }
+        let g = |px: f32, o: f32| (px - o) / cell;
+        for gx in (g(x0, view.offset[0]).floor() as i64)..=(g(x1, view.offset[0]).ceil() as i64) {
             let major = gx.rem_euclid(5) == 0;
             if !major && !minor_visible {
                 continue;
             }
-            let x = app.camera.grid_to_screen([gx as f32, 0.0])[0];
+            let x = gx as f32 * cell + view.offset[0];
+            if x < x0 || x > x1 {
+                continue;
+            }
             let mut p = Path::new();
-            p.move_to(x, view.y);
-            p.line_to(x, view.y + view.h);
+            p.move_to(x, y0);
+            p.line_to(x, y1);
             let mut paint = Paint::color(if major {
                 theme::grid_line_major()
             } else {
@@ -75,15 +217,18 @@ impl Renderer {
             paint.set_line_width(1.0);
             canvas.stroke_path(&p, &paint);
         }
-        for gy in (g0[1].floor() as i64)..=(g1[1].ceil() as i64) {
+        for gy in (g(y0, view.offset[1]).floor() as i64)..=(g(y1, view.offset[1]).ceil() as i64) {
             let major = gy.rem_euclid(5) == 0;
             if !major && !minor_visible {
                 continue;
             }
-            let y = app.camera.grid_to_screen([0.0, gy as f32])[1];
+            let y = gy as f32 * cell + view.offset[1];
+            if y < y0 || y > y1 {
+                continue;
+            }
             let mut p = Path::new();
-            p.move_to(view.x, y);
-            p.line_to(view.x + view.w, y);
+            p.move_to(x0, y);
+            p.line_to(x1, y);
             let mut paint = Paint::color(if major {
                 theme::grid_line_major()
             } else {
@@ -96,13 +241,13 @@ impl Renderer {
 
     /// Sticky-note annotations: drawn behind the circuit, wrapped with the
     /// same deterministic algorithm layout uses for their hit rectangles.
-    fn draw_notes(&self, canvas: &mut Canvas<OpenGl>, app: &App) {
-        let zoom = app.camera.zoom;
-        let cell = app.camera.cell_px();
-        for note in app.editor.sheet_notes() {
+    fn draw_notes(&self, canvas: &mut Canvas<OpenGl>, app: &App, ctx: &SheetCtx) {
+        let zoom = ctx.zoom();
+        let cell = ctx.view.scale;
+        for note in ctx.notes {
             let bounds = layout::note_bounds(note);
-            let tl = app.camera.grid_to_screen([bounds.x, bounds.y]);
-            let selected = app.selection.notes.contains(&note.id);
+            let tl = ctx.view.to_screen([bounds.x, bounds.y]);
+            let selected = ctx.focus && app.selection.notes.contains(&note.id);
 
             let mut bg = Path::new();
             bg.rounded_rect(
@@ -142,11 +287,13 @@ impl Renderer {
     }
 
     /// The display color of a whole net.
-    fn net_color(&self, app: &App, net: &WireNet) -> Color {
+    fn net_color(&self, app: &App, ctx: &SheetCtx, net: &WireNet) -> Color {
+        if !ctx.focus {
+            return theme::wire();
+        }
         if let Mode::Run(session) = &app.mode {
             let energized = net.source.as_ref().and_then(|src| {
-                let (components, _) = app.editor.sheet_data();
-                let comp = components.iter().find(|c| c.id == src.component_id)?;
+                let comp = ctx.components.iter().find(|c| c.id == src.component_id)?;
                 session.port_value(is_primitive(&comp.component_type), src)
             });
             return match energized {
@@ -162,15 +309,16 @@ impl Renderer {
         }
     }
 
-    fn draw_wires(&self, canvas: &mut Canvas<OpenGl>, app: &App) {
+    fn draw_wires(&self, canvas: &mut Canvas<OpenGl>, app: &App, ctx: &SheetCtx) {
         let abstractions = &app.editor.project.abstractions;
-        let (components, wire_nets) = app.editor.sheet_data();
-        let zoom = app.camera.zoom;
-        let width = (2.5 * zoom).clamp(1.5, 4.5);
+        let (components, wire_nets) = (ctx.components, ctx.wire_nets);
+        let zoom = ctx.zoom();
+        let width = (2.5 * zoom).clamp(0.5, 4.5);
 
         for net in wire_nets {
-            let color = self.net_color(app, net);
-            let selected = app.selection.net.as_deref() == Some(net.id.as_str());
+            let color = self.net_color(app, ctx, net);
+            let selected =
+                ctx.focus && app.selection.net.as_deref() == Some(net.id.as_str());
             let mut paint = Paint::color(color);
             paint.set_line_width(if selected { width + 1.0 } else { width });
             paint.set_line_join(femtovg::LineJoin::Round);
@@ -178,13 +326,13 @@ impl Renderer {
 
             for i in 0..net.segments.len() {
                 let Some(pts) =
-                    layout::route_segment(abstractions, components, app.interface(), net, i)
+                    layout::route_segment(abstractions, components, ctx.interface, net, i)
                 else {
                     continue;
                 };
                 let mut p = Path::new();
                 for (k, pt) in pts.iter().enumerate() {
-                    let s = app.camera.grid_to_screen(*pt);
+                    let s = ctx.view.to_screen(*pt);
                     if k == 0 {
                         p.move_to(s[0], s[1]);
                     } else {
@@ -195,14 +343,15 @@ impl Renderer {
             }
 
             for junction in &net.junctions {
-                let hovered = matches!(
-                    &app.hover,
-                    layout::Hit::Junction { junction_id, net_id }
-                        if *junction_id == junction.id && *net_id == net.id
-                );
-                let s = app.camera.grid_to_screen(junction.pos);
+                let hovered = ctx.focus
+                    && matches!(
+                        &app.hover,
+                        layout::Hit::Junction { junction_id, net_id }
+                            if *junction_id == junction.id && *net_id == net.id
+                    );
+                let s = ctx.view.to_screen(junction.pos);
                 let mut p = Path::new();
-                p.circle(s[0], s[1], (3.5 * zoom).clamp(2.0, 5.5));
+                p.circle(s[0], s[1], (3.5 * zoom).clamp(1.0, 5.5));
                 canvas.fill_path(&p, &Paint::color(color));
                 if hovered && !app.is_running() {
                     let mut ring_path = Path::new();
@@ -378,40 +527,75 @@ impl Renderer {
         canvas.fill_path(&dot, &Paint::color(theme::accent()));
     }
 
-    fn draw_components(&self, canvas: &mut Canvas<OpenGl>, app: &App) {
-        let (components, _) = app.editor.sheet_data();
-        for comp in components {
-            self.draw_component(canvas, app, comp, 1.0);
-        }
+    /// Ghost for a pin being dragged to a new home.
+    fn draw_pin_drag_ghost(&self, canvas: &mut Canvas<OpenGl>, app: &App) {
+        let Gesture::DraggingPin { pos, .. } = &app.gesture else {
+            return;
+        };
+        let zoom = app.camera.zoom;
+        let s = app.camera.grid_to_screen(*pos);
+        let mut dot = Path::new();
+        dot.circle(s[0], s[1], (5.0 * zoom).clamp(2.5, 8.0));
+        let mut ring = Paint::color(theme::accent());
+        ring.set_line_width(2.0);
+        canvas.stroke_path(&dot, &ring);
     }
 
-    fn draw_component(
+    /// One component, plus — when it's an abstraction instance big enough
+    /// on screen — its contents cross-faded in, recursively.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_component_tree(
         &self,
         canvas: &mut Canvas<OpenGl>,
         app: &App,
-        comp: &ProjectComponent,
-        alpha: f32,
+        ctx: &SheetCtx,
+        comp: &diycpu::project::ProjectComponent,
+        slice: &[PathSeg],
+        on_path: bool,
+        depth: usize,
+        grid_clip: Option<[f32; 4]>,
     ) {
         let abstractions = &app.editor.project.abstractions;
         let rect = layout::footprint(abstractions, comp);
-        let tl = app.camera.grid_to_screen([rect.x, rect.y]);
-        let cell = app.camera.cell_px();
+        let tl = ctx.view.to_screen([rect.x, rect.y]);
+        let cell = ctx.view.scale;
         let (w, h) = (rect.w * cell, rect.h * cell);
-        let zoom = app.camera.zoom;
-        let selected = app.selection.components.contains(&comp.id);
-        let corner = (6.0 * zoom).clamp(2.0, 9.0);
+        let zoom = ctx.zoom();
+        let selected = ctx.focus && app.selection.components.contains(&comp.id);
+        let corner = (6.0 * zoom).clamp(1.0, 9.0);
 
-        canvas.set_global_alpha(alpha);
+        // How "open" is this instance? 0 = closed chip, 1 = showing its
+        // contents. Driven purely by its size relative to the viewport.
+        let def_index = abstractions
+            .iter()
+            .position(|a| a.name == comp.component_type);
+        let mut open_frac = 0.0f32;
+        if let Some(i) = def_index {
+            let viewport = {
+                let r = app.canvas_rect();
+                r.w.min(r.h)
+            };
+            let t = w.max(h) / viewport.max(1.0);
+            if depth < MAX_DEPTH {
+                let map =
+                    diycpu::layout::instance_inner_map(abstractions, &abstractions[i], rect);
+                if ctx.view.scale * map.s >= MIN_CHILD_SCALE {
+                    open_frac = ((t - OPEN_T0) / (OPEN_T1 - OPEN_T0)).clamp(0.0, 1.0);
+                    // Smoothstep for a gentler fade.
+                    open_frac = open_frac * open_frac * (3.0 - 2.0 * open_frac);
+                }
+            }
+        }
 
-        // Soft shadow.
+        // Soft shadow + body (always drawn: the body doubles as the child
+        // sheet's paper).
         let mut shadow = Path::new();
         shadow.rounded_rect(tl[0], tl[1] + 2.0 * zoom, w, h, corner);
         canvas.fill_path(&shadow, &Paint::color(theme::chip_shadow()));
 
-        // Body. A running flip-flop wears its stored bit as its fill color.
         let mut body = Path::new();
         body.rounded_rect(tl[0], tl[1], w, h, corner);
-        let fill = if comp.component_type == "dff" {
+        let fill = if comp.component_type == "dff" && ctx.focus {
             match &app.mode {
                 Mode::Run(session) => match session.component_value(&comp.id) {
                     Some(true) => theme::badge_on_bg(),
@@ -427,6 +611,43 @@ impl Renderer {
         if selected {
             canvas.fill_path(&body, &Paint::color(theme::accent_soft()));
         }
+
+        // Contents (under the border and ports).
+        if open_frac > 0.0 {
+            if let Some(i) = def_index {
+                let onscreen = tl[0] < app.window_size[0]
+                    && tl[1] < app.window_size[1]
+                    && tl[0] + w > 0.0
+                    && tl[1] + h > 0.0;
+                if onscreen {
+                    let map = diycpu::layout::instance_inner_map(
+                        abstractions,
+                        &abstractions[i],
+                        rect,
+                    );
+                    let (child_slice, child_on_path): (&[PathSeg], bool) =
+                        match (on_path, slice.first()) {
+                            (true, Some(seg)) if seg.instance_id == comp.id => {
+                                (&slice[1..], true)
+                            }
+                            _ => (&[], false),
+                        };
+                    self.draw_sheet_tree(
+                        canvas,
+                        app,
+                        SheetRef::Abstraction(i),
+                        ctx.view.through(&map),
+                        ctx.alpha * open_frac,
+                        child_slice,
+                        child_on_path,
+                        depth + 1,
+                        grid_clip,
+                    );
+                    canvas.set_global_alpha(ctx.alpha);
+                }
+            }
+        }
+
         let mut border = Paint::color(if selected {
             theme::accent()
         } else {
@@ -435,80 +656,91 @@ impl Renderer {
         border.set_line_width(if selected { 2.5 } else { 1.5 });
         canvas.stroke_path(&body, &border);
 
-        // Labels: primitives draw glyphs; abstractions show their name.
-        let label_size = (13.0 * zoom).clamp(5.0, 22.0);
-        if label_size >= 5.0 && !is_primitive(&comp.component_type) {
-            self.text(
-                canvas,
-                tl[0] + w / 2.0,
-                tl[1] + h / 2.0 - 1.0,
-                &comp.component_type,
-                label_size,
-                theme::chip_label(),
-                Align::Center,
-                Baseline::Middle,
-            );
-        }
+        // The closed chrome (name, glyph, value) fades out as the contents
+        // fade in.
+        let chrome_alpha = ctx.alpha * (1.0 - open_frac);
+        if chrome_alpha > 0.01 {
+            canvas.set_global_alpha(chrome_alpha);
 
-        match comp.component_type.as_str() {
-            "clk" => self.draw_clock_glyph(canvas, app, tl, w, h),
-            "nand" => self.draw_nand_glyph(canvas, app, tl, w, h),
-            "dff" => {
-                // The flip-flop's face IS its bit: init while editing,
-                // live state while running. Double-click flips the init.
-                let value = match &app.mode {
-                    Mode::Run(session) => session.component_value(&comp.id),
-                    Mode::Edit => comp.init,
-                }
-                .unwrap_or(false);
-                let digit_size = (20.0 * zoom).clamp(8.0, 32.0);
+            let label_size = (13.0 * zoom).clamp(5.0, 22.0);
+            if label_size >= 5.0 && !is_primitive(&comp.component_type) {
                 self.text(
                     canvas,
-                    tl[0] + w * 0.58,
-                    tl[1] + h / 2.0,
-                    if value { "1" } else { "0" },
-                    digit_size,
-                    if value {
-                        theme::value_digit_on()
-                    } else {
-                        theme::value_digit_off()
-                    },
+                    tl[0] + w / 2.0,
+                    tl[1] + h / 2.0 - 1.0,
+                    &comp.component_type,
+                    label_size,
+                    theme::chip_label(),
                     Align::Center,
                     Baseline::Middle,
                 );
             }
-            _ => {}
-        }
 
-        // Run-mode value badge for the primitives whose face doesn't
-        // already show it.
-        if let Mode::Run(session) = &app.mode {
-            if is_primitive(&comp.component_type) && comp.component_type != "dff" {
-                if let Some(v) = session.component_value(&comp.id) {
-                    self.draw_badge(canvas, zoom, tl, w, v);
+            match comp.component_type.as_str() {
+                "clk" => self.draw_clock_glyph(canvas, zoom, tl, w, h),
+                "nand" => self.draw_nand_glyph(canvas, zoom, tl, w, h),
+                "dff" => {
+                    // The flip-flop's face IS its bit: init while editing,
+                    // live state while running. Double-click flips the init.
+                    let value = match &app.mode {
+                        Mode::Run(session) if ctx.focus => {
+                            session.component_value(&comp.id)
+                        }
+                        _ => comp.init,
+                    }
+                    .unwrap_or(false);
+                    let digit_size = (20.0 * zoom).clamp(6.0, 32.0);
+                    self.text(
+                        canvas,
+                        tl[0] + w * 0.58,
+                        tl[1] + h / 2.0,
+                        if value { "1" } else { "0" },
+                        digit_size,
+                        if value {
+                            theme::value_digit_on()
+                        } else {
+                            theme::value_digit_off()
+                        },
+                        Align::Center,
+                        Baseline::Middle,
+                    );
+                }
+                _ => {}
+            }
+
+            // Run-mode value badge for the primitives whose face doesn't
+            // already show it.
+            if ctx.focus {
+                if let Mode::Run(session) = &app.mode {
+                    if is_primitive(&comp.component_type) && comp.component_type != "dff" {
+                        if let Some(v) = session.component_value(&comp.id) {
+                            self.draw_badge(canvas, zoom, tl, w, v);
+                        }
+                    }
                 }
             }
+            canvas.set_global_alpha(ctx.alpha);
         }
 
-        // Ports.
+        // Ports (the interface stays visible even when open).
         let hover_port = match &app.hover {
             layout::Hit::Port {
                 component_id,
                 port_name,
                 ..
-            } if *component_id == comp.id => Some(port_name.clone()),
+            } if ctx.focus && *component_id == comp.id => Some(port_name.clone()),
             _ => None,
         };
         let ports = layout::component_ports(abstractions, comp);
-        let show_port_labels =
-            zoom >= 0.5 && (comp.component_type == "dff" || !is_primitive(&comp.component_type));
+        let show_port_labels = zoom >= 0.5
+            && (comp.component_type == "dff" || !is_primitive(&comp.component_type));
         for port in &ports {
-            let s = app.camera.grid_to_screen(port.pos);
-            let r = (5.0 * zoom).clamp(2.5, 8.0);
+            let s = ctx.view.to_screen(port.pos);
+            let r = (5.0 * zoom).clamp(1.0, 8.0);
             let hovered = hover_port.as_deref() == Some(port.info.name.as_str());
 
             let fill = match (&app.mode, port.info.kind) {
-                (Mode::Run(session), PortKind::Output) => {
+                (Mode::Run(session), PortKind::Output) if ctx.focus => {
                     let port_ref = diycpu::project::PortRef {
                         component_id: comp.id.clone(),
                         port_name: port.info.name.clone(),
@@ -535,40 +767,43 @@ impl Renderer {
             canvas.stroke_path(&p, &ring);
 
             if show_port_labels {
-                let size = (9.0 * zoom).clamp(7.0, 13.0);
-                let pad = r + 4.0;
-                match port.side {
-                    layout::Side::Left => self.text(
-                        canvas,
-                        s[0] + pad,
-                        s[1],
-                        &port.info.name,
-                        size,
-                        theme::port_label(),
-                        Align::Left,
-                        Baseline::Middle,
-                    ),
-                    layout::Side::Right => self.text(
-                        canvas,
-                        s[0] - pad,
-                        s[1],
-                        &port.info.name,
-                        size,
-                        theme::port_label(),
-                        Align::Right,
-                        Baseline::Middle,
-                    ),
+                // Port names belong to the closed look.
+                if chrome_alpha > 0.01 {
+                    canvas.set_global_alpha(chrome_alpha);
+                    let size = (9.0 * zoom).clamp(7.0, 13.0);
+                    let pad = r + 4.0;
+                    match port.side {
+                        layout::Side::Left => self.text(
+                            canvas,
+                            s[0] + pad,
+                            s[1],
+                            &port.info.name,
+                            size,
+                            theme::port_label(),
+                            Align::Left,
+                            Baseline::Middle,
+                        ),
+                        layout::Side::Right => self.text(
+                            canvas,
+                            s[0] - pad,
+                            s[1],
+                            &port.info.name,
+                            size,
+                            theme::port_label(),
+                            Align::Right,
+                            Baseline::Middle,
+                        ),
+                    }
+                    canvas.set_global_alpha(ctx.alpha);
                 }
             }
         }
-
-        canvas.set_global_alpha(1.0);
     }
 
     fn draw_clock_glyph(
         &self,
         canvas: &mut Canvas<OpenGl>,
-        app: &App,
+        zoom: f32,
         tl: [f32; 2],
         w: f32,
         h: f32,
@@ -588,7 +823,7 @@ impl Renderer {
         p.line_to(cx + half_w / 2.0, cy - half_h);
         p.line_to(cx + half_w, cy - half_h);
         let mut paint = Paint::color(theme::chip_label());
-        paint.set_line_width((2.0 * app.camera.zoom).clamp(1.0, 3.0));
+        paint.set_line_width((2.0 * zoom).clamp(0.6, 3.0));
         paint.set_line_join(femtovg::LineJoin::Round);
         canvas.stroke_path(&p, &paint);
     }
@@ -597,7 +832,7 @@ impl Renderer {
     fn draw_nand_glyph(
         &self,
         canvas: &mut Canvas<OpenGl>,
-        app: &App,
+        zoom: f32,
         tl: [f32; 2],
         w: f32,
         h: f32,
@@ -623,12 +858,12 @@ impl Renderer {
             femtovg::Solidity::Solid,
         );
         let mut paint = Paint::color(theme::chip_label());
-        paint.set_line_width((2.0 * app.camera.zoom).clamp(1.0, 3.0));
+        paint.set_line_width((2.0 * zoom).clamp(0.6, 3.0));
         paint.set_line_join(femtovg::LineJoin::Round);
         canvas.stroke_path(&body, &paint);
 
         // Inversion bubble on the output.
-        let rb = (r * 0.22).max(1.5);
+        let rb = (r * 0.22).max(0.8);
         let mut bubble = Path::new();
         bubble.circle(flat + r + rb, cy, rb);
         canvas.stroke_path(&bubble, &paint);
@@ -665,30 +900,32 @@ impl Renderer {
 
     /// Interface pins on the rails beside an abstraction's content: a port
     /// circle plus a clickable name plate.
-    fn draw_interface_pins(&self, canvas: &mut Canvas<OpenGl>, app: &App) {
-        let Some(def) = app.interface() else {
+    fn draw_interface_pins(&self, canvas: &mut Canvas<OpenGl>, app: &App, ctx: &SheetCtx) {
+        let Some(def) = ctx.interface else {
             return;
         };
         let abstractions = &app.editor.project.abstractions;
-        let zoom = app.camera.zoom;
-        let cell = app.camera.cell_px();
+        let zoom = ctx.zoom();
+        let cell = ctx.view.scale;
 
         for pin in layout::interface_pins(abstractions, def) {
-            let s = app.camera.grid_to_screen(pin.pos);
-            let selected = app
-                .selection
-                .pin
-                .as_ref()
-                .is_some_and(|(k, n)| *k == pin.io && *n == pin.name);
-            let hovered_port = matches!(
-                &app.hover,
-                layout::Hit::Port { component_id, .. }
-                    if *component_id == pin.port_ref().component_id
-            );
+            let s = ctx.view.to_screen(pin.pos);
+            let selected = ctx.focus
+                && app
+                    .selection
+                    .pin
+                    .as_ref()
+                    .is_some_and(|(k, n)| *k == pin.io && *n == pin.name);
+            let hovered_port = ctx.focus
+                && matches!(
+                    &app.hover,
+                    layout::Hit::Port { component_id, .. }
+                        if *component_id == pin.port_ref().component_id
+                );
 
             // Name plate.
             let plate = pin.plate;
-            let tl = app.camera.grid_to_screen([plate.x, plate.y]);
+            let tl = ctx.view.to_screen([plate.x, plate.y]);
             let mut p = Path::new();
             p.rounded_rect(
                 tl[0],
@@ -712,7 +949,7 @@ impl Renderer {
             border.set_line_width(if selected { 2.0 } else { 1.2 });
             canvas.stroke_path(&p, &border);
 
-            let label_size = (12.0 * zoom).clamp(7.0, 16.0);
+            let label_size = (12.0 * zoom).clamp(4.0, 16.0);
             self.text(
                 canvas,
                 tl[0] + plate.w * cell / 2.0,
@@ -765,13 +1002,17 @@ impl Renderer {
     /// Output pin connections are stored in the abstraction's `outputs` map,
     /// so their wires are derived: routed fresh every frame from the target
     /// port to the pin. No stored geometry to go stale.
-    fn draw_derived_output_wires(&self, canvas: &mut Canvas<OpenGl>, app: &App) {
-        let Some(def) = app.interface() else {
+    fn draw_derived_output_wires(
+        &self,
+        canvas: &mut Canvas<OpenGl>,
+        app: &App,
+        ctx: &SheetCtx,
+    ) {
+        let Some(def) = ctx.interface else {
             return;
         };
         let abstractions = &app.editor.project.abstractions;
-        let (components, _) = app.editor.sheet_data();
-        let zoom = app.camera.zoom;
+        let zoom = ctx.zoom();
 
         let pins = layout::interface_pins(abstractions, def);
         for (name, target) in &def.outputs {
@@ -786,14 +1027,14 @@ impl Renderer {
             };
             let port = layout::output_target_port(target);
             let Some((from, from_side)) =
-                layout::port_geom_any(abstractions, components, Some(def), &port)
+                layout::port_geom_any(abstractions, ctx.components, Some(def), &port)
             else {
                 continue;
             };
             let pts = layout::route(from, Some(from_side), pin.pos, Some(layout::Side::Left));
             let mut p = Path::new();
             for (k, pt) in pts.iter().enumerate() {
-                let s = app.camera.grid_to_screen(*pt);
+                let s = ctx.view.to_screen(*pt);
                 if k == 0 {
                     p.move_to(s[0], s[1]);
                 } else {
@@ -801,7 +1042,7 @@ impl Renderer {
                 }
             }
             let mut paint = Paint::color(theme::wire());
-            paint.set_line_width((2.5 * zoom).clamp(1.5, 4.5));
+            paint.set_line_width((2.5 * zoom).clamp(0.5, 4.5));
             paint.set_line_join(femtovg::LineJoin::Round);
             paint.set_line_cap(femtovg::LineCap::Round);
             canvas.stroke_path(&p, &paint);
@@ -966,7 +1207,12 @@ impl Renderer {
             init: None,
             pos: [pos[0] as f32, pos[1] as f32],
         };
-        self.draw_component(canvas, app, &ghost, 0.55);
+        if let Some(ctx) = make_ctx(app, app.editor.sheet, app.camera.view(), 0.55, false) {
+            canvas.set_global_alpha(0.55);
+            // MAX_DEPTH suppresses the open-contents recursion for ghosts.
+            self.draw_component_tree(canvas, app, &ctx, &ghost, &[], false, MAX_DEPTH, None);
+            canvas.set_global_alpha(1.0);
+        }
         if !valid {
             let abstractions = &app.editor.project.abstractions;
             let rect = layout::footprint(abstractions, &ghost);
@@ -1092,6 +1338,28 @@ impl Renderer {
                 Align::Left,
                 Baseline::Middle,
             );
+
+            // Open-for-editing affordance on abstraction rows.
+            if let Some(er) = &item.edit_rect {
+                let hovered_edit = er.contains(app.cursor);
+                if hovered_edit || r.contains(app.cursor) {
+                    let mut bg = Path::new();
+                    bg.rounded_rect(er.x, er.y, er.w, er.h, 4.0);
+                    if hovered_edit {
+                        canvas.fill_path(&bg, &Paint::color(theme::accent_soft()));
+                    }
+                    self.text(
+                        canvas,
+                        er.x + er.w / 2.0,
+                        er.y + er.h / 2.0,
+                        "↗",
+                        13.0,
+                        if hovered_edit { theme::accent() } else { theme::text_dim() },
+                        Align::Center,
+                        Baseline::Middle,
+                    );
+                }
+            }
         }
     }
 
@@ -1107,13 +1375,8 @@ impl Renderer {
         dp.set_line_width(1.0);
         canvas.stroke_path(&divider, &dp);
 
-        // Title.
-        let mut title = app.editor.project.name.clone();
-        if let diycpu::editor::SheetRef::Abstraction(i) = app.editor.sheet {
-            if let Some(a) = app.editor.project.abstractions.get(i) {
-                title = format!("{title} ▸ {}", a.name);
-            }
-        }
+        // Title: the zoom breadcrumb.
+        let mut title = app.breadcrumb().join(" ▸ ");
         if app.editor.dirty {
             title.push_str(" •");
         }
@@ -1324,7 +1587,7 @@ impl Renderer {
                     "clk" => vec!["clock — toggles every step".to_string()],
                     "nand" => vec!["NAND gate".to_string()],
                     "dff" => vec![],
-                    other => vec![format!("{other} — double-click to open")],
+                    other => vec![format!("{other} — zoom in or double-click to open")],
                 };
                 if let Mode::Run(session) = &app.mode {
                     if let Some(v) = session.component_value(&comp.id) {

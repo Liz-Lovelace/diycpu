@@ -158,8 +158,33 @@ pub fn component_ports(
     };
     let rect = footprint(abstractions, comp);
 
-    let inputs: Vec<&PortInfo> = ports.iter().filter(|p| p.kind == PortKind::Input).collect();
-    let outputs: Vec<&PortInfo> = ports.iter().filter(|p| p.kind == PortKind::Output).collect();
+    let mut inputs: Vec<&PortInfo> =
+        ports.iter().filter(|p| p.kind == PortKind::Input).collect();
+    let mut outputs: Vec<&PortInfo> =
+        ports.iter().filter(|p| p.kind == PortKind::Output).collect();
+
+    // Abstraction instances order their ports the way the pins are laid
+    // out inside the sheet (top to bottom) — arranging the pins inside is
+    // how you arrange the ports outside.
+    if let Some(def) = abstractions.iter().find(|a| a.name == comp.component_type) {
+        let pins = interface_pins(abstractions, def);
+        let key = |name: &str| {
+            pins.iter()
+                .find(|p| p.name == name)
+                .map(|p| p.pos[1])
+                .unwrap_or(0.0)
+        };
+        inputs.sort_by(|a, b| {
+            key(&a.name)
+                .total_cmp(&key(&b.name))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        outputs.sort_by(|a, b| {
+            key(&a.name)
+                .total_cmp(&key(&b.name))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+    }
 
     let mut result = Vec::with_capacity(ports.len());
     for (list, side) in [(inputs, Side::Left), (outputs, Side::Right)] {
@@ -349,25 +374,41 @@ pub fn components_bounds(
     bounds
 }
 
-/// Pin rails for the abstraction currently being edited: inputs down a rail
-/// left of the content, outputs down a rail on the right.
-pub fn interface_pins(
+/// The rail position a pin defaults to before it has been dragged anywhere:
+/// inputs stack left of the content, outputs to the right.
+pub fn default_pin_position(
     abstractions: &[ProjectAbstraction],
     def: &ProjectAbstraction,
-) -> Vec<PinGeom> {
+    io: PortKind,
+    index: usize,
+) -> [f32; 2] {
     let bounds = components_bounds(abstractions, &def.components).unwrap_or(Rect {
         x: 0.0,
         y: 0.0,
         w: 10.0,
         h: 4.0,
     });
-    let in_x = (bounds.x - 4.0).floor();
-    let out_x = (bounds.x + bounds.w + 4.0).ceil();
-    let top = bounds.y;
+    let x = match io {
+        PortKind::Input => (bounds.x - 4.0).floor(),
+        PortKind::Output => (bounds.x + bounds.w + 4.0).ceil(),
+    };
+    [x, bounds.y + 0.5 + index as f32 * 2.0]
+}
 
+/// The interface pins of an abstraction, at their stored positions (pins
+/// are free-floating objects inside the sheet); un-dragged pins fall back
+/// to the rails.
+pub fn interface_pins(
+    abstractions: &[ProjectAbstraction],
+    def: &ProjectAbstraction,
+) -> Vec<PinGeom> {
     let mut pins = Vec::new();
     for (i, name) in def.inputs.iter().enumerate() {
-        let pos = [in_x, top + 0.5 + i as f32 * 2.0];
+        let pos = def
+            .pin_positions
+            .get(name)
+            .copied()
+            .unwrap_or_else(|| default_pin_position(abstractions, def, PortKind::Input, i));
         pins.push(PinGeom {
             name: name.clone(),
             io: PortKind::Input,
@@ -383,7 +424,11 @@ pub fn interface_pins(
     let mut outs: Vec<&String> = def.outputs.keys().collect();
     outs.sort();
     for (i, name) in outs.into_iter().enumerate() {
-        let pos = [out_x, top + 0.5 + i as f32 * 2.0];
+        let pos = def
+            .pin_positions
+            .get(name)
+            .copied()
+            .unwrap_or_else(|| default_pin_position(abstractions, def, PortKind::Output, i));
         pins.push(PinGeom {
             name: name.clone(),
             io: PortKind::Output,
@@ -438,6 +483,104 @@ pub fn output_target_port(target: &str) -> crate::project::PortRef {
             component_id: target.to_string(),
             port_name: "out".to_string(),
         },
+    }
+}
+
+// ── Nested-sheet transforms (infinite zoom) ──────────────────────────────────
+//
+// An abstraction instance displays its own sheet scaled into its footprint.
+// `SheetMap` is that similarity transform (child grid units → parent grid
+// units). Composing maps and camera views is how the whole "one infinitely
+// zoomable canvas" illusion is built.
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SheetMap {
+    /// Child units per parent unit.
+    pub s: f32,
+    /// Parent-space position of the child origin.
+    pub o: [f32; 2],
+}
+
+impl SheetMap {
+    pub fn apply(&self, p: [f32; 2]) -> [f32; 2] {
+        [p[0] * self.s + self.o[0], p[1] * self.s + self.o[1]]
+    }
+
+    pub fn inverse(&self) -> SheetMap {
+        SheetMap {
+            s: 1.0 / self.s,
+            o: [-self.o[0] / self.s, -self.o[1] / self.s],
+        }
+    }
+}
+
+/// Fraction of the instance rect the child content is inset to, leaving a
+/// margin inside the body border.
+pub const INNER_FIT: f32 = 0.92;
+
+/// Everything on an abstraction's sheet, padded — the region an instance
+/// shows when you look inside it.
+pub fn abstraction_inner_bounds(
+    abstractions: &[ProjectAbstraction],
+    def: &ProjectAbstraction,
+) -> Rect {
+    let mut bounds = components_bounds(abstractions, &def.components);
+    let mut extend = |r: Rect| {
+        bounds = Some(match bounds {
+            None => r,
+            Some(b) => {
+                let x = b.x.min(r.x);
+                let y = b.y.min(r.y);
+                let x2 = (b.x + b.w).max(r.x + r.w);
+                let y2 = (b.y + b.h).max(r.y + r.h);
+                Rect { x, y, w: x2 - x, h: y2 - y }
+            }
+        });
+    };
+    for note in &def.notes {
+        extend(note_bounds(note));
+    }
+    for pin in interface_pins(abstractions, def) {
+        extend(pin.plate);
+        extend(Rect {
+            x: pin.pos[0] - 0.5,
+            y: pin.pos[1] - 0.5,
+            w: 1.0,
+            h: 1.0,
+        });
+    }
+    let b = bounds.unwrap_or(Rect {
+        x: 0.0,
+        y: 0.0,
+        w: 10.0,
+        h: 6.0,
+    });
+    const PAD: f32 = 1.0;
+    Rect {
+        x: b.x - PAD,
+        y: b.y - PAD,
+        w: b.w + PAD * 2.0,
+        h: b.h + PAD * 2.0,
+    }
+}
+
+/// The transform that fits `def`'s sheet inside an instance footprint.
+pub fn instance_inner_map(
+    abstractions: &[ProjectAbstraction],
+    def: &ProjectAbstraction,
+    instance_rect: Rect,
+) -> SheetMap {
+    let b = abstraction_inner_bounds(abstractions, def);
+    let s = (instance_rect.w / b.w)
+        .min(instance_rect.h / b.h)
+        .max(1e-6)
+        * INNER_FIT;
+    SheetMap {
+        s,
+        o: [
+            instance_rect.x + (instance_rect.w - b.w * s) / 2.0 - b.x * s,
+            instance_rect.y + (instance_rect.h - b.h * s) / 2.0 - b.y * s,
+        ],
     }
 }
 
@@ -719,6 +862,7 @@ mod tests {
 
     fn abs_not() -> ProjectAbstraction {
         ProjectAbstraction {
+            pin_positions: HashMap::new(),
             name: "not".into(),
             inputs: vec!["x".into()],
             outputs: HashMap::from([("out".into(), "gate".into())]),

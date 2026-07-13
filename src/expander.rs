@@ -6,7 +6,6 @@ use crate::types::*;
 #[derive(Debug)]
 pub enum ExpandError {
     DuplicateAbstraction(String),
-    ClkInAbstraction(String),
     CircularAbstractions,
     SelfReferencingAbstraction(String),
     UnknownType {
@@ -34,9 +33,6 @@ impl fmt::Display for ExpandError {
         match self {
             Self::DuplicateAbstraction(name) => {
                 write!(f, "Duplicate abstraction name: \"{name}\"")
-            }
-            Self::ClkInAbstraction(name) => {
-                write!(f, "CLK component not allowed inside abstraction \"{name}\"")
             }
             Self::CircularAbstractions => {
                 write!(f, "Circular dependency detected among abstractions")
@@ -177,24 +173,9 @@ fn validate_abstractions(
         }
     }
 
-    // Check for CLK inside abstractions.
-    for abstraction in abstractions {
-        check_no_clk_in_abstraction(abstraction)?;
-    }
-
     // Check for self-references and circular dependencies.
     check_abstraction_cycles(abstractions, abstraction_map)?;
 
-    Ok(())
-}
-
-/// Check that no CLK component exists directly inside an abstraction.
-fn check_no_clk_in_abstraction(abstraction: &AbstractionDef) -> Result<(), ExpandError> {
-    for component in &abstraction.components {
-        if component.component_type == "clk" {
-            return Err(ExpandError::ClkInAbstraction(abstraction.name.clone()));
-        }
-    }
     Ok(())
 }
 
@@ -445,11 +426,15 @@ mod tests {
     }
 
     #[test]
-    fn reject_clk_in_abstraction() {
-        let bad_abs = AbstractionDef {
-            name: "bad".into(),
+    fn clk_in_abstraction_flattens_to_shared_clock() {
+        let ticker_abs = AbstractionDef {
+            name: "ticker".into(),
             inputs: vec![],
-            outputs: HashMap::new(),
+            outputs: {
+                let mut m = HashMap::new();
+                m.insert("out".into(), "clock".into());
+                m
+            },
             components: vec![ComponentDef {
                 component_type: "clk".into(),
                 name: "clock".into(),
@@ -458,10 +443,17 @@ mod tests {
             }],
         };
         let def = CircuitBuilder::new("test", 1)
-            .abstraction(bad_abs)
+            .abstraction(ticker_abs)
+            .component("ticker", "t1", &[])
             .build();
-        let err = expand(&def).unwrap_err();
-        assert!(matches!(err, ExpandError::ClkInAbstraction(n) if n == "bad"));
+        // Clocks inside abstractions are legal: they flatten into ordinary
+        // clk components that share the global clock signal.
+        let expanded = expand(&def).unwrap();
+        assert!(expanded
+            .def
+            .components
+            .iter()
+            .any(|c| c.component_type == "clk"));
     }
 
     #[test]

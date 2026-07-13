@@ -1,13 +1,44 @@
 //! Viewport transform between grid space (the document's coordinates) and
 //! screen pixels.
 
-use diycpu::layout::Rect;
+use diycpu::layout::{Rect, SheetMap};
 
 /// Pixels per grid cell at zoom 1.
 pub const CELL: f32 = 40.0;
 
-pub const MIN_ZOOM: f32 = 0.2;
-pub const MAX_ZOOM: f32 = 4.0;
+// Zoom limits per focus level: descending into an abstraction rebases the
+// camera into the child's coordinates, so these bound each level, not the
+// total depth — the zoom illusion is unbounded.
+pub const MIN_ZOOM: f32 = 0.05;
+pub const MAX_ZOOM: f32 = 60.0;
+
+/// A similarity transform from some sheet's grid units to screen pixels.
+#[derive(Debug, Clone, Copy)]
+pub struct View {
+    /// Pixels per grid unit.
+    pub scale: f32,
+    pub offset: [f32; 2],
+}
+
+impl View {
+    pub fn to_screen(&self, p: [f32; 2]) -> [f32; 2] {
+        [
+            p[0] * self.scale + self.offset[0],
+            p[1] * self.scale + self.offset[1],
+        ]
+    }
+
+    /// The view of a child sheet displayed through `map`.
+    pub fn through(&self, map: &SheetMap) -> View {
+        View {
+            scale: self.scale * map.s,
+            offset: [
+                map.o[0] * self.scale + self.offset[0],
+                map.o[1] * self.scale + self.offset[1],
+            ],
+        }
+    }
+}
 
 pub struct Camera {
     /// Screen-pixel position of grid origin.
@@ -25,6 +56,21 @@ impl Camera {
 
     pub fn cell_px(&self) -> f32 {
         CELL * self.zoom
+    }
+
+    /// The camera as a grid→screen transform.
+    pub fn view(&self) -> View {
+        View {
+            scale: self.cell_px(),
+            offset: self.offset,
+        }
+    }
+
+    /// Re-express the camera in another sheet's coordinates (descending
+    /// into or ascending out of an abstraction) — visually a no-op.
+    pub fn set_view(&mut self, view: View) {
+        self.zoom = view.scale / CELL;
+        self.offset = view.offset;
     }
 
     pub fn grid_to_screen(&self, g: [f32; 2]) -> [f32; 2] {

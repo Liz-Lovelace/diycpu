@@ -6,7 +6,6 @@ use crate::types::*;
 #[derive(Debug)]
 pub enum CompileError {
     DuplicateName(String),
-    MultipleClocks,
     UnknownInput {
         component: String,
         input_name: String,
@@ -29,9 +28,6 @@ impl fmt::Display for CompileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::DuplicateName(name) => write!(f, "Duplicate component name: \"{name}\""),
-            Self::MultipleClocks => {
-                write!(f, "Multiple CLK components defined (at most one allowed)")
-            }
             Self::UnknownInput {
                 component,
                 input_name,
@@ -77,15 +73,16 @@ pub struct CompiledCircuit {
     pub component_names: Vec<String>,
     pub components: Vec<CompiledComponent>,
     pub evaluation_order: Vec<usize>,
-    pub clock_index: Option<usize>,
+    /// Every clk component in the circuit. They all carry the same shared
+    /// clock signal and toggle together.
+    pub clock_indices: Vec<usize>,
     pub dff_indices: Vec<usize>,
 }
 
 pub fn compile(circuit_def: &CircuitDef) -> Result<CompiledCircuit, CompileError> {
     let mut name_to_index: HashMap<&str, usize> = HashMap::new();
     let mut component_names = Vec::new();
-    let mut clock_count = 0;
-    let mut clock_index = None;
+    let mut clock_indices = Vec::new();
     let mut dff_indices = Vec::new();
 
     // First pass: register all component names and validate uniqueness.
@@ -95,11 +92,7 @@ pub fn compile(circuit_def: &CircuitDef) -> Result<CompiledCircuit, CompileError
             return Err(CompileError::DuplicateName(component_name.to_string()));
         }
         if component.component_type == "clk" {
-            clock_count += 1;
-            if clock_count > 1 {
-                return Err(CompileError::MultipleClocks);
-            }
-            clock_index = Some(component_index);
+            clock_indices.push(component_index);
         }
         if component.component_type == "dff" {
             dff_indices.push(component_index);
@@ -116,7 +109,7 @@ pub fn compile(circuit_def: &CircuitDef) -> Result<CompiledCircuit, CompileError
     }
 
     let evaluation_order =
-        topological_sort(&compiled_components, clock_index, &dff_indices)?;
+        topological_sort(&compiled_components, &clock_indices, &dff_indices)?;
 
     Ok(CompiledCircuit {
         name: circuit_def.name.clone(),
@@ -124,7 +117,7 @@ pub fn compile(circuit_def: &CircuitDef) -> Result<CompiledCircuit, CompileError
         component_names,
         components: compiled_components,
         evaluation_order,
-        clock_index,
+        clock_indices,
         dff_indices,
     })
 }
@@ -211,7 +204,7 @@ fn resolve_input_reference(
 /// NAND gates are then sorted by their dependency graph.
 fn topological_sort(
     components: &[CompiledComponent],
-    clock_index: Option<usize>,
+    clock_indices: &[usize],
     dff_indices: &[usize],
 ) -> Result<Vec<usize>, CompileError> {
     let component_count = components.len();
@@ -238,8 +231,8 @@ fn topological_sort(
 
     let mut evaluation_order = Vec::with_capacity(component_count);
 
-    // Sources first: CLK, then DFFs (they don't depend on NAND gates).
-    if let Some(index) = clock_index {
+    // Sources first: CLKs, then DFFs (they don't depend on NAND gates).
+    for &index in clock_indices {
         evaluation_order.push(index);
     }
     for &index in dff_indices {
@@ -296,7 +289,7 @@ mod tests {
         let circuit = compile(&def).unwrap();
 
         assert_eq!(circuit.component_names, vec!["clock", "reg", "gate"]);
-        assert_eq!(circuit.clock_index, Some(0));
+        assert_eq!(circuit.clock_indices, vec![0]);
         assert_eq!(circuit.dff_indices, vec![1]);
         assert_eq!(circuit.evaluation_order, vec![0, 1, 2]);
     }
@@ -312,13 +305,18 @@ mod tests {
     }
 
     #[test]
-    fn reject_multiple_clocks() {
-        let def = CircuitBuilder::new("test", 1)
+    fn multiple_clocks_share_one_signal() {
+        use crate::simulator::simulate;
+        let def = CircuitBuilder::new("test", 4)
             .clk("clk1")
             .clk("clk2")
             .build();
-        let err = compile(&def).unwrap_err();
-        assert!(matches!(err, CompileError::MultipleClocks));
+        let circuit = compile(&def).unwrap();
+        assert_eq!(circuit.clock_indices.len(), 2);
+        for (step, state) in simulate(&circuit).iter().enumerate() {
+            assert_eq!(state["clk1"], state["clk2"], "clocks diverged at {step}");
+            assert_eq!(state["clk1"], step % 2 == 1);
+        }
     }
 
     #[test]
@@ -386,7 +384,7 @@ mod tests {
             .nand("not_a", "a", "a")
             .build();
         let circuit = compile(&def).unwrap();
-        assert!(circuit.clock_index.is_none());
+        assert!(circuit.clock_indices.is_empty());
     }
 
     #[test]

@@ -1293,6 +1293,7 @@ impl Renderer {
             ids,
             note_ids,
             delta,
+            copying,
             ..
         } = &app.gesture
         else {
@@ -1301,8 +1302,7 @@ impl Renderer {
         if *delta == [0, 0] {
             return;
         }
-        let valid = app.drag_is_valid(ids, *delta);
-        if valid {
+        if app.drag_is_valid(ids, *delta, *copying) {
             return;
         }
         let abstractions = &app.editor.project.abstractions;
@@ -1335,15 +1335,8 @@ impl Renderer {
                 rect.h * cell,
                 (6.0 * app.camera.zoom).clamp(2.0, 9.0),
             );
-            canvas.fill_path(
-                &p,
-                &Paint::color(if valid {
-                    theme::accent_soft()
-                } else {
-                    theme::ghost_invalid()
-                }),
-            );
-            let mut stroke = Paint::color(if valid { theme::accent() } else { theme::danger() });
+            canvas.fill_path(&p, &Paint::color(theme::ghost_invalid()));
+            let mut stroke = Paint::color(theme::danger());
             stroke.set_line_width(1.5);
             canvas.stroke_path(&p, &stroke);
         }

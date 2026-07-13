@@ -350,6 +350,8 @@ impl Shell {
     }
 }
 
+// One instance for the whole program; variant size is irrelevant.
+#[allow(clippy::large_enum_variant)]
 enum AppState {
     Uninitialized(CliArgs),
     Running(Shell),

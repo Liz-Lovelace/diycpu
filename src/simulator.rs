@@ -235,8 +235,8 @@ mod tests {
             .build();
         let results = run(def);
         for step_state in &results {
-            assert_eq!(step_state["high"], true);
-            assert_eq!(step_state["low"], false);
+            assert!(step_state["high"]);
+            assert!(!step_state["low"]);
         }
     }
 
@@ -249,8 +249,8 @@ mod tests {
         let results = run(def);
         // NAND(1,1) = 0
         for step_state in &results {
-            assert_eq!(step_state["input"], true);
-            assert_eq!(step_state["output"], false);
+            assert!(step_state["input"]);
+            assert!(!step_state["output"]);
         }
     }
 
@@ -263,26 +263,26 @@ mod tests {
             .build();
         let results = run(def);
 
-        assert_eq!(results[0]["clk"], false);
-        assert_eq!(results[0]["state"], false);
-        assert_eq!(results[0]["not_state"], true);
+        assert!(!results[0]["clk"]);
+        assert!(!results[0]["state"]);
+        assert!(results[0]["not_state"]);
 
-        assert_eq!(results[1]["clk"], true);
-        assert_eq!(results[1]["state"], true);
-        assert_eq!(results[1]["not_state"], false);
+        assert!(results[1]["clk"]);
+        assert!(results[1]["state"]);
+        assert!(!results[1]["not_state"]);
 
-        assert_eq!(results[2]["clk"], false);
-        assert_eq!(results[2]["state"], true);
-        assert_eq!(results[2]["not_state"], false);
+        assert!(!results[2]["clk"]);
+        assert!(results[2]["state"]);
+        assert!(!results[2]["not_state"]);
 
-        assert_eq!(results[3]["clk"], true);
-        assert_eq!(results[3]["state"], false);
-        assert_eq!(results[3]["not_state"], true);
+        assert!(results[3]["clk"]);
+        assert!(!results[3]["state"]);
+        assert!(results[3]["not_state"]);
 
-        assert_eq!(results[4]["state"], false);
-        assert_eq!(results[5]["state"], true);
-        assert_eq!(results[6]["state"], true);
-        assert_eq!(results[7]["state"], false);
+        assert!(!results[4]["state"]);
+        assert!(results[5]["state"]);
+        assert!(results[6]["state"]);
+        assert!(!results[7]["state"]);
     }
 
     #[test]
@@ -294,7 +294,7 @@ mod tests {
             .nand("and_ab", "nand_ab", "nand_ab")
             .build();
         let results = run(def);
-        assert_eq!(results[0]["and_ab"], true);
+        assert!(results[0]["and_ab"]);
     }
 
     #[test]
@@ -306,7 +306,7 @@ mod tests {
             .nand("and_ab", "nand_ab", "nand_ab")
             .build();
         let results = run(def);
-        assert_eq!(results[0]["and_ab"], false);
+        assert!(!results[0]["and_ab"]);
     }
 
     #[test]
@@ -319,7 +319,7 @@ mod tests {
             .nand("or_ab", "not_a", "not_b")
             .build();
         let results = run(def);
-        assert_eq!(results[0]["or_ab"], true);
+        assert!(results[0]["or_ab"]);
     }
 
     #[test]
@@ -332,7 +332,7 @@ mod tests {
             .nand("or_ab", "not_a", "not_b")
             .build();
         let results = run(def);
-        assert_eq!(results[0]["or_ab"], false);
+        assert!(!results[0]["or_ab"]);
     }
 
     #[test]
@@ -344,7 +344,7 @@ mod tests {
             .build();
         let results = run(def);
         for step_state in &results {
-            assert_eq!(step_state["result"], true);
+            assert!(step_state["result"]);
         }
     }
 
@@ -356,7 +356,7 @@ mod tests {
             .build();
         let results = run(def);
         for step_state in &results {
-            assert_eq!(step_state["target"], false);
+            assert!(!step_state["target"]);
         }
     }
 
@@ -368,12 +368,12 @@ mod tests {
             .dff("reg").init(false).d("one").clk("clk").done()
             .build();
         let results = run(def);
-        assert_eq!(results[0]["reg"], false);
-        assert_eq!(results[1]["reg"], true);
-        assert_eq!(results[2]["reg"], true);
-        assert_eq!(results[3]["reg"], true);
-        assert_eq!(results[4]["reg"], true);
-        assert_eq!(results[5]["reg"], true);
+        assert!(!results[0]["reg"]);
+        assert!(results[1]["reg"]);
+        assert!(results[2]["reg"]);
+        assert!(results[3]["reg"]);
+        assert!(results[4]["reg"]);
+        assert!(results[5]["reg"]);
     }
 
     #[test]
@@ -388,10 +388,10 @@ mod tests {
             .dff("reg_b").init(false).d("not_b").clk("clk").done()
             .build();
         let results = run(def);
-        assert_eq!(results[0]["reg_a"], false);
-        assert_eq!(results[0]["reg_b"], false);
-        assert_eq!(results[1]["reg_a"], false);
-        assert_eq!(results[1]["reg_b"], true);
+        assert!(!results[0]["reg_a"]);
+        assert!(!results[0]["reg_b"]);
+        assert!(!results[1]["reg_a"]);
+        assert!(results[1]["reg_b"]);
     }
 
     #[test]
@@ -402,7 +402,7 @@ mod tests {
             .build();
         let results = run(def);
         for step_state in &results {
-            assert_eq!(step_state["reg"], true);
+            assert!(step_state["reg"]);
         }
     }
 
@@ -476,29 +476,29 @@ mod tests {
         let results = run(def);
 
         // Step 0: initial state (CLK=0)
-        assert_eq!(results[0]["stage1"], false);
-        assert_eq!(results[0]["stage2"], false);
-        assert_eq!(results[0]["stage3"], false);
+        assert!(!results[0]["stage1"]);
+        assert!(!results[0]["stage2"]);
+        assert!(!results[0]["stage3"]);
 
         // Step 1: first rising edge — only stage1 latches "source"=1
-        assert_eq!(results[1]["stage1"], true);
-        assert_eq!(results[1]["stage2"], false);
-        assert_eq!(results[1]["stage3"], false);
+        assert!(results[1]["stage1"]);
+        assert!(!results[1]["stage2"]);
+        assert!(!results[1]["stage3"]);
 
         // Step 2: falling edge — no change
-        assert_eq!(results[2]["stage1"], true);
-        assert_eq!(results[2]["stage2"], false);
-        assert_eq!(results[2]["stage3"], false);
+        assert!(results[2]["stage1"]);
+        assert!(!results[2]["stage2"]);
+        assert!(!results[2]["stage3"]);
 
         // Step 3: second rising edge — stage2 latches stage1's OLD value (1)
-        assert_eq!(results[3]["stage1"], true);
-        assert_eq!(results[3]["stage2"], true);
-        assert_eq!(results[3]["stage3"], false);
+        assert!(results[3]["stage1"]);
+        assert!(results[3]["stage2"]);
+        assert!(!results[3]["stage3"]);
 
         // Step 5: third rising edge — stage3 latches stage2's OLD value (1)
-        assert_eq!(results[5]["stage1"], true);
-        assert_eq!(results[5]["stage2"], true);
-        assert_eq!(results[5]["stage3"], true);
+        assert!(results[5]["stage1"]);
+        assert!(results[5]["stage2"]);
+        assert!(results[5]["stage3"]);
     }
 
     #[test]
@@ -517,7 +517,7 @@ mod tests {
             .build();
         let results = run(def);
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0]["x"], true);
+        assert!(results[0]["x"]);
     }
 
     #[test]
@@ -626,12 +626,12 @@ mod tests {
             .component("not", "inv", &[("x", "state")])
             .build();
         let results = run(def);
-        assert_eq!(results[0]["state"], false);
-        assert_eq!(results[1]["state"], true);
-        assert_eq!(results[2]["state"], true);
-        assert_eq!(results[3]["state"], false);
-        assert_eq!(results[4]["state"], false);
-        assert_eq!(results[5]["state"], true);
+        assert!(!results[0]["state"]);
+        assert!(results[1]["state"]);
+        assert!(results[2]["state"]);
+        assert!(!results[3]["state"]);
+        assert!(!results[4]["state"]);
+        assert!(results[5]["state"]);
     }
 
     #[test]
@@ -680,10 +680,10 @@ mod tests {
             .component("register", "my_reg", &[("d", "one"), ("clk", "clk")])
             .build();
         let results = run(def);
-        assert_eq!(results[0]["my_reg.q"], false);
-        assert_eq!(results[1]["my_reg.q"], true);
-        assert_eq!(results[2]["my_reg.q"], true);
-        assert_eq!(results[3]["my_reg.q"], true);
+        assert!(!results[0]["my_reg.q"]);
+        assert!(results[1]["my_reg.q"]);
+        assert!(results[2]["my_reg.q"]);
+        assert!(results[3]["my_reg.q"]);
     }
 
     #[test]
@@ -707,8 +707,8 @@ mod tests {
             .component("split", "s", &[("x", "val")])
             .build();
         let results = run(def);
-        assert_eq!(results[0]["s.normal"], true);
-        assert_eq!(results[0]["s.inverted"], false);
+        assert!(results[0]["s.normal"]);
+        assert!(!results[0]["s.inverted"]);
     }
 
     #[test]

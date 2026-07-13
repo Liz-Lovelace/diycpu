@@ -21,7 +21,8 @@ exit), `--run N` (enter run mode and step N times first), `--sheet name`
 | Flip a DFF's start value | Double-click it — the big digit on its face is the stored bit. |
 | Constant signal | The “const” primitive is a toggleable 0/1 source (double-click flips it) — handy for feeding test inputs. Unconnected inputs always read as 0. |
 | Notes | Pick “note” in the palette, click the canvas, type. Double-click a note to edit it (empty text removes it); drag to move; notes can sit anywhere. |
-| Duplicate | Ctrl+D. |
+| Copy / cut / paste | Ctrl+C / Ctrl+X / Ctrl+V — the selection travels with the wiring that runs among the copied parts; paste lands centered on your cursor. Ctrl+D duplicates in place. |
+| Copy by dragging | Hold Ctrl and drag a selection: the originals stay, copies (wires included) land where you drop. Ctrl+click still toggles items in and out of the selection. |
 | Undo / redo | Ctrl+Z / Ctrl+Shift+Z (or Ctrl+Y). One action = one undo step; a cancelled gesture never becomes one. |
 | Cancel anything | Esc or right-click. |
 | Pan / zoom | Middle- or right-drag; scroll wheel zooms at the cursor. `F` fits the circuit, Ctrl+0 resets zoom. |

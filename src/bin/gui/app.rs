@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use diycpu::editor::{EditError, Editor, SheetRef, WirePoint};
+use diycpu::editor::{EditError, Editor, Fragment, SheetRef, WirePoint};
 use diycpu::layout::{self, Hit, PortKind, Rect};
 use diycpu::project::{PortRef, Project};
 
@@ -35,6 +35,8 @@ const ASCEND_AT: f32 = 1.10;
 /// Pixels the cursor must travel before a press becomes a drag.
 const DRAG_THRESHOLD_PX: f32 = 5.0;
 
+// The size difference between variants is fine: there is exactly one Mode.
+#[allow(clippy::large_enum_variant)]
 pub enum Mode {
     Edit,
     Run(SimSession),
@@ -55,16 +57,21 @@ pub enum Gesture {
     PressedComponent {
         id: String,
         press_screen: [f32; 2],
+        /// Ctrl was held: a click toggles selection, a drag copies.
+        ctrl: bool,
     },
     PressedNote {
         id: String,
         press_screen: [f32; 2],
+        ctrl: bool,
     },
     DraggingComponents {
         ids: Vec<String>,
         note_ids: Vec<String>,
         press_grid: [f32; 2],
         delta: [i32; 2],
+        /// Ctrl-drag: the originals stay put and copies land at the delta.
+        copying: bool,
     },
     /// Left button down on empty canvas; not yet decided click vs band.
     PressedEmpty {
@@ -202,6 +209,7 @@ pub struct App {
     pub hover: Hit,
     pub prompt: Option<Prompt>,
     pub layout_dialog: Option<LayoutDialog>,
+    pub clipboard: Option<Fragment>,
     /// Run mode advances the clock on a timer.
     pub playing: bool,
     /// Set when an action would discard unsaved changes; repeating the
@@ -256,6 +264,7 @@ impl App {
             hover: Hit::Empty,
             prompt: None,
             layout_dialog: None,
+            clipboard: None,
             playing: false,
             pending_discard: None,
             pending_fit: true,
@@ -482,6 +491,7 @@ impl App {
                 ids,
                 note_ids,
                 delta,
+                copying,
                 ..
             } if *delta != [0, 0] => {
                 let mut p = self.editor.project.clone();
@@ -492,13 +502,41 @@ impl App {
                         (&mut a.components, &mut a.notes)
                     }
                 };
-                for c in components.iter_mut().filter(|c| ids.contains(&c.id)) {
-                    c.pos[0] += delta[0] as f32;
-                    c.pos[1] += delta[1] as f32;
-                }
-                for n in notes.iter_mut().filter(|n| note_ids.contains(&n.id)) {
-                    n.pos[0] += delta[0] as f32;
-                    n.pos[1] += delta[1] as f32;
+                if *copying {
+                    // Preview phantoms at the target; the originals stay.
+                    let phantoms: Vec<_> = components
+                        .iter()
+                        .filter(|c| ids.contains(&c.id))
+                        .map(|c| {
+                            let mut ghost = c.clone();
+                            ghost.id = format!("__copy_{}", ghost.id);
+                            ghost.pos[0] += delta[0] as f32;
+                            ghost.pos[1] += delta[1] as f32;
+                            ghost
+                        })
+                        .collect();
+                    components.extend(phantoms);
+                    let note_phantoms: Vec<_> = notes
+                        .iter()
+                        .filter(|n| note_ids.contains(&n.id))
+                        .map(|n| {
+                            let mut ghost = n.clone();
+                            ghost.id = format!("__copy_{}", ghost.id);
+                            ghost.pos[0] += delta[0] as f32;
+                            ghost.pos[1] += delta[1] as f32;
+                            ghost
+                        })
+                        .collect();
+                    notes.extend(note_phantoms);
+                } else {
+                    for c in components.iter_mut().filter(|c| ids.contains(&c.id)) {
+                        c.pos[0] += delta[0] as f32;
+                        c.pos[1] += delta[1] as f32;
+                    }
+                    for n in notes.iter_mut().filter(|n| note_ids.contains(&n.id)) {
+                        n.pos[0] += delta[0] as f32;
+                        n.pos[1] += delta[1] as f32;
+                    }
                 }
                 Cow::Owned(p)
             }
@@ -653,7 +691,7 @@ impl App {
             .all(|c| !layout::footprint(abstractions, c).intersects(&rect))
     }
 
-    pub fn drag_is_valid(&self, ids: &[String], delta: [i32; 2]) -> bool {
+    pub fn drag_is_valid(&self, ids: &[String], delta: [i32; 2], copying: bool) -> bool {
         let abstractions = &self.editor.project.abstractions;
         let (components, _) = self.editor.sheet_data();
         let moved: Vec<Rect> = components
@@ -668,7 +706,8 @@ impl App {
             .collect();
         components
             .iter()
-            .filter(|c| !ids.contains(&c.id))
+            // Copies must clear everything, the originals included.
+            .filter(|c| copying || !ids.contains(&c.id))
             .all(|c| {
                 let r = layout::footprint(abstractions, c);
                 !moved.iter().any(|m| m.intersects(&r))
@@ -984,10 +1023,15 @@ impl App {
                 self.camera.pan(dx, dy);
                 self.update_focus();
             }
-            Gesture::PressedComponent { id, press_screen } => {
+            Gesture::PressedComponent {
+                id,
+                press_screen,
+                ctrl,
+            } => {
                 if dist(pos, *press_screen) > DRAG_THRESHOLD_PX {
                     // Promote to drag: the pressed component leads; if it's
                     // part of the selection the whole selection comes along.
+                    let copying = *ctrl;
                     let (ids, note_ids) = if self.selection.components.contains(id) {
                         (
                             self.selection.components.clone(),
@@ -1005,11 +1049,17 @@ impl App {
                         note_ids,
                         press_grid,
                         delta: [0, 0],
+                        copying,
                     };
                 }
             }
-            Gesture::PressedNote { id, press_screen } => {
+            Gesture::PressedNote {
+                id,
+                press_screen,
+                ctrl,
+            } => {
                 if dist(pos, *press_screen) > DRAG_THRESHOLD_PX {
+                    let copying = *ctrl;
                     let (ids, note_ids) = if self.selection.notes.contains(id) {
                         (
                             self.selection.components.clone(),
@@ -1027,6 +1077,7 @@ impl App {
                         note_ids,
                         press_grid,
                         delta: [0, 0],
+                        copying,
                     };
                 }
             }
@@ -1176,50 +1227,28 @@ impl App {
                 };
             }
             Hit::Component { component_id } => {
-                if self.ctrl {
-                    // Toggle in/out of the multi-selection immediately.
-                    if let Some(i) = self
-                        .selection
-                        .components
-                        .iter()
-                        .position(|c| c == &component_id)
-                    {
-                        self.selection.components.remove(i);
-                    } else {
-                        self.selection.components.push(component_id);
-                    }
-                    self.selection.net = None;
-                    self.selection.pin = None;
-                } else {
-                    if !self.selection.components.contains(&component_id) {
-                        self.selection.clear();
-                        self.selection.components = vec![component_id.clone()];
-                    }
-                    self.gesture = Gesture::PressedComponent {
-                        id: component_id,
-                        press_screen: self.cursor,
-                    };
+                // Plain press selects for dragging; a ctrl press stays
+                // undecided (click = toggle selection, drag = copy).
+                if !self.ctrl && !self.selection.components.contains(&component_id) {
+                    self.selection.clear();
+                    self.selection.components = vec![component_id.clone()];
                 }
+                self.gesture = Gesture::PressedComponent {
+                    id: component_id,
+                    press_screen: self.cursor,
+                    ctrl: self.ctrl,
+                };
             }
             Hit::Note { note_id } => {
-                if self.ctrl {
-                    if let Some(i) = self.selection.notes.iter().position(|n| n == &note_id) {
-                        self.selection.notes.remove(i);
-                    } else {
-                        self.selection.notes.push(note_id);
-                    }
-                    self.selection.net = None;
-                    self.selection.pin = None;
-                } else {
-                    if !self.selection.notes.contains(&note_id) {
-                        self.selection.clear();
-                        self.selection.notes = vec![note_id.clone()];
-                    }
-                    self.gesture = Gesture::PressedNote {
-                        id: note_id,
-                        press_screen: self.cursor,
-                    };
+                if !self.ctrl && !self.selection.notes.contains(&note_id) {
+                    self.selection.clear();
+                    self.selection.notes = vec![note_id.clone()];
                 }
+                self.gesture = Gesture::PressedNote {
+                    id: note_id,
+                    press_screen: self.cursor,
+                    ctrl: self.ctrl,
+                };
             }
             Hit::Pin { name, kind } => {
                 self.gesture = Gesture::PressedPin {
@@ -1313,24 +1342,63 @@ impl App {
                 // it alive or the press failed and the user gets to retry).
                 self.gesture = gesture;
             }
-            Gesture::PressedComponent { id, .. } => {
-                // A click (no drag): collapse the selection to this component.
-                self.selection.clear();
-                self.selection.components = vec![id];
+            Gesture::PressedComponent { id, ctrl, .. } => {
+                if ctrl {
+                    // Ctrl-click: toggle in/out of the multi-selection.
+                    if let Some(i) = self.selection.components.iter().position(|c| c == &id) {
+                        self.selection.components.remove(i);
+                    } else {
+                        self.selection.components.push(id);
+                    }
+                    self.selection.net = None;
+                    self.selection.pin = None;
+                } else {
+                    // A click (no drag): collapse the selection to this one.
+                    self.selection.clear();
+                    self.selection.components = vec![id];
+                }
             }
-            Gesture::PressedNote { id, .. } => {
-                self.selection.clear();
-                self.selection.notes = vec![id];
+            Gesture::PressedNote { id, ctrl, .. } => {
+                if ctrl {
+                    if let Some(i) = self.selection.notes.iter().position(|n| n == &id) {
+                        self.selection.notes.remove(i);
+                    } else {
+                        self.selection.notes.push(id);
+                    }
+                    self.selection.net = None;
+                    self.selection.pin = None;
+                } else {
+                    self.selection.clear();
+                    self.selection.notes = vec![id];
+                }
             }
             Gesture::DraggingComponents {
                 ids,
                 note_ids,
                 delta,
+                copying,
                 ..
-            } => match self.editor.move_items(&ids, &note_ids, delta) {
-                Ok(()) => {}
-                Err(e) => self.error(e.to_string()),
-            },
+            } => {
+                if copying {
+                    if delta != [0, 0] {
+                        let fragment = self.editor.fragment(&ids, &note_ids);
+                        match self.editor.paste_fragment(&fragment, delta, false) {
+                            Ok((new_ids, new_notes)) => {
+                                self.selection.clear();
+                                self.selection.components = new_ids;
+                                self.selection.notes = new_notes;
+                                self.info("Copied");
+                            }
+                            Err(e) => self.error(e.to_string()),
+                        }
+                    }
+                } else {
+                    match self.editor.move_items(&ids, &note_ids, delta) {
+                        Ok(()) => {}
+                        Err(e) => self.error(e.to_string()),
+                    }
+                }
+            }
             Gesture::PressedEmpty { .. } => {
                 self.selection.clear();
             }
@@ -1738,6 +1806,77 @@ impl App {
         }
     }
 
+    pub fn copy_selection(&mut self) {
+        let fragment = self
+            .editor
+            .fragment(&self.selection.components, &self.selection.notes);
+        if fragment.is_empty() {
+            self.info("Nothing selected to copy");
+            return;
+        }
+        let n = fragment.components.len() + fragment.notes.len();
+        self.clipboard = Some(fragment);
+        self.info(format!("Copied {n} item(s)"));
+    }
+
+    pub fn cut_selection(&mut self) {
+        if !self.require_edit_mode() {
+            return;
+        }
+        let fragment = self
+            .editor
+            .fragment(&self.selection.components, &self.selection.notes);
+        if fragment.is_empty() {
+            self.info("Nothing selected to cut");
+            return;
+        }
+        let ids = self.selection.components.clone();
+        let note_ids = self.selection.notes.clone();
+        match self.editor.delete_items(&ids, &note_ids) {
+            Ok(()) => {
+                let n = fragment.components.len() + fragment.notes.len();
+                self.clipboard = Some(fragment);
+                self.selection.clear();
+                self.info(format!("Cut {n} item(s)"));
+            }
+            Err(e) => self.error(e.to_string()),
+        }
+    }
+
+    pub fn paste_clipboard(&mut self) {
+        if !self.require_edit_mode() {
+            return;
+        }
+        let Some(fragment) = self.clipboard.clone() else {
+            self.info("Clipboard is empty");
+            return;
+        };
+        // Land centered on the cursor when it's over the canvas, otherwise
+        // just beside the originals.
+        let delta = if self.canvas_rect().contains(self.cursor) {
+            let bounds = fragment
+                .bounds(&self.editor.project.abstractions)
+                .unwrap_or(Rect { x: 0.0, y: 0.0, w: 0.0, h: 0.0 });
+            let g = self.cursor_grid();
+            [
+                (g[0] - bounds.x - bounds.w / 2.0).round() as i32,
+                (g[1] - bounds.y - bounds.h / 2.0).round() as i32,
+            ]
+        } else {
+            [1, 1]
+        };
+        match self.editor.paste_fragment(&fragment, delta, true) {
+            Ok((new_ids, new_notes)) => {
+                self.selection.clear();
+                self.selection.components = new_ids;
+                self.selection.notes = new_notes;
+                self.gesture = Gesture::Idle;
+                self.info("Pasted");
+            }
+            Err(e) => self.error(e.to_string()),
+        }
+    }
+
     pub fn duplicate(&mut self) {
         if !self.require_edit_mode() {
             return;
@@ -2010,6 +2149,9 @@ impl App {
                 }
             }
             ("d", true, _) => self.duplicate(),
+            ("c", true, _) => self.copy_selection(),
+            ("x", true, _) => self.cut_selection(),
+            ("v", true, _) => self.paste_clipboard(),
             ("p", false, _) => self.action_play_toggle(),
             ("f", false, _) => {
                 self.fit_view();
@@ -2135,7 +2277,7 @@ mod tests {
         }
     }
 
-    fn port_at(app: &App, comp: &str, port: &str) -> [f32; 2] {
+    pub fn port_at(app: &App, comp: &str, port: &str) -> [f32; 2] {
         let (components, _) = app.editor.sheet_data();
         let c = components.iter().find(|c| c.id == comp).unwrap();
         diycpu::layout::port_pos(&app.editor.project.abstractions, c, port)
@@ -2143,7 +2285,7 @@ mod tests {
             .pos
     }
 
-    fn center_of(app: &App, comp: &str) -> [f32; 2] {
+    pub fn center_of(app: &App, comp: &str) -> [f32; 2] {
         let (components, _) = app.editor.sheet_data();
         let c = components.iter().find(|c| c.id == comp).unwrap();
         let r = diycpu::layout::footprint(&app.editor.project.abstractions, c);
@@ -2889,5 +3031,92 @@ impl App {
             }
             None => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod clipboard_tests {
+    use super::tests::*;
+    use super::*;
+
+    #[test]
+    fn copy_paste_via_keyboard() {
+        let mut d = Driver::new();
+        d.place("nand", [1.0, 1.0]);
+        d.place("dff", [8.0, 1.0]);
+        // Wire them, band-select everything, copy.
+        d.drag(port_at(&d.app, "nand_1", "out"), port_at(&d.app, "dff_1", "d"));
+        d.drag([-4.0, -3.0], [12.0, 4.0]);
+        assert_eq!(d.app.selection.components.len(), 2);
+        d.app.ctrl = true;
+        d.app.handle_key(KeyInput::Char("c"));
+        d.app.ctrl = false;
+        assert!(d.app.clipboard.is_some());
+
+        // Paste at a spot lower on the canvas.
+        d.move_to([6.0, 12.0]);
+        d.app.ctrl = true;
+        d.app.handle_key(KeyInput::Char("v"));
+        d.app.ctrl = false;
+        assert_eq!(d.app.editor.project.components.len(), 4);
+        assert_eq!(d.app.editor.project.wire_nets.len(), 2, "wiring came along");
+        assert_eq!(d.app.selection.components.len(), 2, "copies are selected");
+        assert!(!d.app.status.is_error, "{}", d.app.status.text);
+    }
+
+    #[test]
+    fn cut_removes_and_paste_restores() {
+        let mut d = Driver::new();
+        d.place("nand", [1.0, 1.0]);
+        d.click(center_of(&d.app, "nand_1"));
+        d.app.ctrl = true;
+        d.app.handle_key(KeyInput::Char("x"));
+        d.app.ctrl = false;
+        assert!(d.app.editor.project.components.is_empty());
+        d.move_to([5.0, 5.0]);
+        d.app.ctrl = true;
+        d.app.handle_key(KeyInput::Char("v"));
+        d.app.ctrl = false;
+        assert_eq!(d.app.editor.project.components.len(), 1);
+    }
+
+    #[test]
+    fn ctrl_drag_copies_and_ctrl_click_still_toggles() {
+        let mut d = Driver::new();
+        d.place("nand", [1.0, 1.0]);
+        d.place("nand", [8.0, 1.0]);
+
+        // Ctrl-click toggles selection (no drag).
+        d.click(center_of(&d.app, "nand_1"));
+        d.app.ctrl = true;
+        d.click(center_of(&d.app, "nand_2"));
+        assert_eq!(d.app.selection.components.len(), 2);
+        d.click(center_of(&d.app, "nand_2"));
+        assert_eq!(d.app.selection.components.len(), 1);
+        d.app.ctrl = false;
+
+        // Ctrl-drag copies the selection to the drop point.
+        let original_pos = d.app.editor.project.components[0].pos;
+        let from = center_of(&d.app, "nand_1");
+        d.app.ctrl = true;
+        d.drag(from, [from[0], from[1] + 6.0]);
+        d.app.ctrl = false;
+        assert_eq!(d.app.editor.project.components.len(), 3);
+        let copy_id = &d.app.selection.components[0];
+        let copy = d
+            .app
+            .editor
+            .project
+            .components
+            .iter()
+            .find(|c| &c.id == copy_id)
+            .unwrap();
+        assert_eq!(
+            copy.pos,
+            [original_pos[0], original_pos[1] + 6.0],
+            "copy landed at the drop point"
+        );
+        // Original still where it was.
+        assert_eq!(d.app.editor.project.components[0].pos, original_pos);
     }
 }

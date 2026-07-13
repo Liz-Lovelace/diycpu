@@ -319,13 +319,13 @@ fn connect_orthogonal(
     // Leaving sa must not retrace a's stub; arriving at sb must not double
     // back over b's stub.
     let leaves_cleanly = |d: [f32; 2]| {
-        a_dir.map_or(true, |side| {
+        a_dir.is_none_or(|side| {
             let o = side.outward();
             d[0] * o[0] + d[1] * o[1] >= -1e-6
         })
     };
     let arrives_cleanly = |d: [f32; 2]| {
-        b_dir.map_or(true, |side| {
+        b_dir.is_none_or(|side| {
             let o = side.outward();
             d[0] * o[0] + d[1] * o[1] <= 1e-6
         })
@@ -337,11 +337,11 @@ fn connect_orthogonal(
     // A port that has to be approached from behind gets the wrap-around
     // detour below (so wires arc around components, not through them).
     let disp = [sb[0] - sa[0], sb[1] - sa[1]];
-    let a_faces = a_dir.map_or(true, |side| {
+    let a_faces = a_dir.is_none_or(|side| {
         let o = side.outward();
         disp[0] * o[0] + disp[1] * o[1] >= -1e-6
     });
-    let b_faces = b_dir.map_or(true, |side| {
+    let b_faces = b_dir.is_none_or(|side| {
         let o = side.outward();
         -(disp[0] * o[0] + disp[1] * o[1]) >= -1e-6
     });
@@ -1186,7 +1186,7 @@ mod tests {
         // sits near x=4 — probe a point on the wire.
         let pts = route_segment(&[], &comps, None, &net, 0).unwrap();
         let mid = pts[pts.len() / 2];
-        let hit = hit_test(&[], &comps, &[net.clone()], &[], None, mid);
+        let hit = hit_test(&[], &comps, std::slice::from_ref(&net), &[], None, mid);
         assert!(matches!(hit, Hit::Wire { ref net_id, .. } if net_id == "w1"));
     }
 

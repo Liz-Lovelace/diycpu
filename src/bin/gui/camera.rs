@@ -21,6 +21,9 @@ pub struct View {
 }
 
 impl View {
+    // Named for readability at call sites; View is Copy so the reference
+    // receiver is deliberate.
+    #[allow(clippy::wrong_self_convention)]
     pub fn to_screen(&self, p: [f32; 2]) -> [f32; 2] {
         [
             p[0] * self.scale + self.offset[0],

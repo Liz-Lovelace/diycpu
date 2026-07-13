@@ -713,6 +713,184 @@ impl Editor {
         })
     }
 
+    // ── Clipboard fragments ──────────────────────────────────────────────
+
+    /// A self-contained snippet of a sheet: components, notes, and the
+    /// wiring that runs among them. What Ctrl+C carries around.
+    pub fn fragment(&self, component_ids: &[String], note_ids: &[String]) -> Fragment {
+        let (components, wire_nets) = self.sheet_data();
+        let components: Vec<ProjectComponent> = components
+            .iter()
+            .filter(|c| component_ids.contains(&c.id))
+            .cloned()
+            .collect();
+        let notes: Vec<crate::project::Note> = self
+            .sheet_notes()
+            .iter()
+            .filter(|n| note_ids.contains(&n.id))
+            .cloned()
+            .collect();
+
+        // Keep only wiring fully inside the copied set: segments whose port
+        // endpoints all reference copied components (junction endpoints are
+        // free-standing and come along when used).
+        let mut nets = Vec::new();
+        for net in wire_nets {
+            let mut kept = net.clone();
+            kept.segments.retain(|seg| {
+                [&seg.from, &seg.to].iter().all(|e| match e {
+                    Endpoint::Port { component_id, .. } => {
+                        component_ids.contains(component_id)
+                            || component_id.starts_with(crate::convert::INPUT_PREFIX)
+                    }
+                    Endpoint::Junction { .. } => true,
+                })
+            });
+            drop_orphan_junctions(&mut kept);
+            if !kept.segments.is_empty() {
+                nets.push(kept);
+            }
+        }
+        Fragment {
+            components,
+            notes,
+            wire_nets: nets,
+        }
+    }
+
+    /// Insert a fragment's copies, offset by `delta` grid cells, with fresh
+    /// ids everywhere. With `search`, nearby offsets are tried until the
+    /// copies fit. Returns the new (component ids, note ids).
+    pub fn paste_fragment(
+        &mut self,
+        fragment: &Fragment,
+        delta: [i32; 2],
+        search: bool,
+    ) -> Result<(Vec<String>, Vec<String>), EditError> {
+        let fragment = fragment.clone();
+        self.mutate(move |project, sheet| {
+            let ctx = KindCtx::new(project, sheet)?;
+            let abstractions = project.abstractions.clone();
+
+            // Types must exist here, and pasting an abstraction into its
+            // own (or a using) sheet would recurse.
+            for comp in &fragment.components {
+                if layout::type_ports(&abstractions, &comp.component_type).is_none() {
+                    return Err(EditError::UnknownComponentType(
+                        comp.component_type.clone(),
+                    ));
+                }
+                if let SheetRef::Abstraction(i) = sheet {
+                    let host = abstractions.get(i).ok_or(EditError::BadSheet)?.name.clone();
+                    if abstraction_uses(&abstractions, &comp.component_type, &host) {
+                        return Err(EditError::RecursiveAbstraction(
+                            comp.component_type.clone(),
+                        ));
+                    }
+                }
+            }
+
+            // Find an offset where every copy fits.
+            let (components, _) = sheet_mut(project, sheet).ok_or(EditError::BadSheet)?;
+            let fits = |components: &[ProjectComponent], d: [f32; 2]| -> bool {
+                fragment.components.iter().all(|c| {
+                    let mut r = layout::footprint(&abstractions, c);
+                    r.x += d[0];
+                    r.y += d[1];
+                    components
+                        .iter()
+                        .all(|other| !layout::footprint(&abstractions, other).intersects(&r))
+                })
+            };
+            let base = [delta[0] as f32, delta[1] as f32];
+            let mut offset = None;
+            if fits(components, base) {
+                offset = Some(base);
+            } else if search {
+                'out: for ring in 1..60 {
+                    let s = ring as f32;
+                    for cand in [
+                        [base[0] + s, base[1] + s],
+                        [base[0] + s, base[1]],
+                        [base[0], base[1] + s],
+                        [base[0] - s, base[1]],
+                        [base[0], base[1] - s],
+                    ] {
+                        if fits(components, cand) {
+                            offset = Some(cand);
+                            break 'out;
+                        }
+                    }
+                }
+            }
+            let offset = offset.ok_or(EditError::Overlap)?;
+
+            // Fresh component ids, remembering the mapping for the wires.
+            let mut id_map: HashMap<String, String> = HashMap::new();
+            let mut new_component_ids = Vec::new();
+            for original in &fragment.components {
+                let id = generate_id(components, &original.component_type);
+                id_map.insert(original.id.clone(), id.clone());
+                components.push(ProjectComponent {
+                    id: id.clone(),
+                    component_type: original.component_type.clone(),
+                    init: original.init,
+                    pos: [original.pos[0] + offset[0], original.pos[1] + offset[1]],
+                });
+                new_component_ids.push(id);
+            }
+
+            // Wires: fresh net + junction ids, ports remapped, everything
+            // shifted; logical fields re-derived by the repair pass.
+            let (components, wire_nets) =
+                sheet_mut(project, sheet).ok_or(EditError::BadSheet)?;
+            for net in &fragment.wire_nets {
+                let mut copy = net.clone();
+                copy.id = generate_net_id(wire_nets);
+                copy.source = None;
+                copy.sinks.clear();
+                for junction in &mut copy.junctions {
+                    junction.pos[0] += offset[0];
+                    junction.pos[1] += offset[1];
+                }
+                for seg in &mut copy.segments {
+                    for e in [&mut seg.from, &mut seg.to] {
+                        if let Endpoint::Port { component_id, .. } = e {
+                            if let Some(new_id) = id_map.get(component_id) {
+                                *component_id = new_id.clone();
+                            }
+                        }
+                    }
+                }
+                wire_nets.push(copy);
+            }
+            repair_nets(wire_nets, components, &ctx)?;
+
+            let notes = sheet_notes_mut(project, sheet).ok_or(EditError::BadSheet)?;
+            let mut new_note_ids = Vec::new();
+            for original in &fragment.notes {
+                let id = {
+                    let mut n = 1;
+                    loop {
+                        let candidate = format!("note_{n}");
+                        if !notes.iter().any(|note| note.id == candidate) {
+                            break candidate;
+                        }
+                        n += 1;
+                    }
+                };
+                notes.push(crate::project::Note {
+                    id: id.clone(),
+                    text: original.text.clone(),
+                    pos: [original.pos[0] + offset[0], original.pos[1] + offset[1]],
+                });
+                new_note_ids.push(id);
+            }
+
+            Ok((new_component_ids, new_note_ids))
+        })
+    }
+
     // ── Abstraction interface ────────────────────────────────────────────
 
     /// Create a new, empty abstraction type. Returns its index.
@@ -1771,6 +1949,44 @@ fn repair_nets(
     Ok(())
 }
 
+/// A copyable snippet of a sheet.
+#[derive(Debug, Clone)]
+pub struct Fragment {
+    pub components: Vec<ProjectComponent>,
+    pub notes: Vec<crate::project::Note>,
+    pub wire_nets: Vec<WireNet>,
+}
+
+impl Fragment {
+    pub fn is_empty(&self) -> bool {
+        self.components.is_empty() && self.notes.is_empty()
+    }
+
+    /// Bounding box of the fragment's contents, in grid units.
+    pub fn bounds(&self, abstractions: &[crate::project::ProjectAbstraction]) -> Option<Rect> {
+        let mut bounds: Option<Rect> = None;
+        let mut extend = |r: Rect| {
+            bounds = Some(match bounds {
+                None => r,
+                Some(b) => {
+                    let x = b.x.min(r.x);
+                    let y = b.y.min(r.y);
+                    let x2 = (b.x + b.w).max(r.x + r.w);
+                    let y2 = (b.y + b.h).max(r.y + r.h);
+                    Rect { x, y, w: x2 - x, h: y2 - y }
+                }
+            });
+        };
+        for c in &self.components {
+            extend(layout::footprint(abstractions, c));
+        }
+        for n in &self.notes {
+            extend(layout::note_bounds(n));
+        }
+        bounds
+    }
+}
+
 /// A net exists as long as it has any wire in it. Stubs are legitimate;
 /// only truly empty nets are collected.
 fn gc_nets(wire_nets: &mut Vec<WireNet>) {
@@ -1852,7 +2068,7 @@ pub fn normalize(project: &mut Project) -> Vec<String> {
                 .iter()
                 .find(|c| c.id == port.component_id)
                 .and_then(|c| layout::type_ports(&abstractions, &c.component_type))
-                .map_or(false, |ports| {
+                .is_some_and(|ports| {
                     ports
                         .iter()
                         .any(|p| p.name == port.port_name && p.kind == PortKind::Output)
@@ -1871,7 +2087,7 @@ pub fn normalize(project: &mut Project) -> Vec<String> {
 
 fn normalize_sheet(
     abstractions: &[crate::project::ProjectAbstraction],
-    components: &mut Vec<ProjectComponent>,
+    components: &mut [ProjectComponent],
     wire_nets: &mut Vec<WireNet>,
     interface_inputs: Option<Vec<String>>,
     label: &str,
@@ -2421,8 +2637,8 @@ mod tests {
     fn toggle_init() {
         let mut e = Editor::empty();
         e.place_component("dff", [0, 0]).unwrap();
-        assert_eq!(e.toggle_dff_init("dff_1").unwrap(), true);
-        assert_eq!(e.toggle_dff_init("dff_1").unwrap(), false);
+        assert!(e.toggle_dff_init("dff_1").unwrap());
+        assert!(!e.toggle_dff_init("dff_1").unwrap());
         e.place_component("nand", [10, 0]).unwrap();
         assert!(matches!(
             e.toggle_dff_init("nand_1").unwrap_err(),
@@ -2839,7 +3055,7 @@ mod tests {
         };
         // buf2 is NOT(NOT... actually a single nand with both inputs = x,
         // so out = NAND(1,1) = 0.
-        assert_eq!(session_result[0]["buf2_1.out"], false);
+        assert!(!session_result[0]["buf2_1.out"]);
     }
 
     #[test]
@@ -2933,7 +3149,7 @@ mod tests {
     fn const_component_drives_signals() {
         let mut e = Editor::empty();
         e.place_component("const", [0, 0]).unwrap();
-        assert_eq!(e.toggle_dff_init("const_1").unwrap(), true);
+        assert!(e.toggle_dff_init("const_1").unwrap());
         e.place_component("nand", [6, 0]).unwrap();
         e.connect(port("const_1", "out"), port("nand_1", "a"), &[])
             .unwrap();
@@ -2956,7 +3172,7 @@ mod tests {
         let mut e = Editor::empty();
         let id = e.place_note([2.0, 3.0], "reset logic lives here").unwrap();
         assert_eq!(id, "note_1");
-        e.move_items(&[], &[id.clone()], [4, 1]).unwrap();
+        e.move_items(&[], std::slice::from_ref(&id), [4, 1]).unwrap();
         assert_eq!(e.project.notes[0].pos, [6.0, 4.0]);
         e.set_note_text(&id, "updated").unwrap();
         assert_eq!(e.project.notes[0].text, "updated");
@@ -3151,6 +3367,81 @@ mod tests {
         assert!(e.project.abstractions[i].pin_positions.contains_key("top"));
         e.remove_interface_pin(PortKind::Input, "top").unwrap();
         assert!(!e.project.abstractions[i].pin_positions.contains_key("top"));
+    }
+
+    // ── Clipboard ────────────────────────────────────────────────────────
+
+    #[test]
+    fn fragment_paste_preserves_internal_wiring() {
+        let mut e = editor_with_two_nands();
+        e.connect(port("nand_1", "out"), port("nand_2", "a"), &[[5.0, 1.0]])
+            .unwrap();
+        e.place_note([0.0, 5.0], "keep me").unwrap();
+
+        let frag = e.fragment(
+            &["nand_1".into(), "nand_2".into()],
+            &["note_1".into()],
+        );
+        let (new_comps, new_notes) = e.paste_fragment(&frag, [0, 8], true).unwrap();
+        assert_eq!(new_comps, vec!["nand_3", "nand_4"]);
+        assert_eq!(new_notes, vec!["note_2"]);
+
+        // The copies carry their own wire, junction included, and the
+        // original wiring is untouched.
+        assert_eq!(e.project.wire_nets.len(), 2);
+        let copied_net = e
+            .project
+            .wire_nets
+            .iter()
+            .find(|n| n.source == Some(port("nand_3", "out")))
+            .expect("copied net rewired to fresh ids");
+        assert_eq!(copied_net.sinks, vec![port("nand_4", "a")]);
+        assert_eq!(copied_net.junctions.len(), 1);
+        assert_eq!(copied_net.junctions[0].pos, [5.0, 9.0]);
+
+        // One undo removes the whole paste.
+        e.undo().unwrap();
+        assert_eq!(e.project.components.len(), 2);
+        assert_eq!(e.project.wire_nets.len(), 1);
+        assert_eq!(e.project.notes.len(), 1);
+    }
+
+    #[test]
+    fn fragment_excludes_wiring_to_uncopied_components() {
+        let mut e = editor_with_two_nands();
+        e.connect(port("nand_1", "out"), port("nand_2", "a"), &[])
+            .unwrap();
+        // Copy only one endpoint: the wire between them must not come.
+        let frag = e.fragment(&["nand_1".into()], &[]);
+        assert!(frag.wire_nets.is_empty());
+        let (ids, _) = e.paste_fragment(&frag, [0, 8], true).unwrap();
+        assert_eq!(ids.len(), 1);
+        assert_eq!(e.project.wire_nets.len(), 1, "no extra nets appeared");
+    }
+
+    #[test]
+    fn paste_searches_for_free_space_and_rejects_recursion() {
+        let mut e = editor_with_two_nands();
+        let frag = e.fragment(&["nand_1".into()], &[]);
+        // Zero offset collides with the original; search finds a spot.
+        let (ids, _) = e.paste_fragment(&frag, [0, 0], true).unwrap();
+        assert_eq!(ids.len(), 1);
+        // Without search, a collision is refused outright.
+        assert_eq!(
+            e.paste_fragment(&frag, [0, 0], false).unwrap_err(),
+            EditError::Overlap
+        );
+
+        // Recursion guard: an instance of X can't be pasted inside X.
+        let mut e = Editor::empty();
+        let i = e.create_abstraction("thing").unwrap();
+        e.place_component("thing", [0, 0]).unwrap();
+        let frag = e.fragment(&["thing_1".into()], &[]);
+        e.open_sheet(SheetRef::Abstraction(i)).unwrap();
+        assert!(matches!(
+            e.paste_fragment(&frag, [0, 0], true).unwrap_err(),
+            EditError::RecursiveAbstraction(_)
+        ));
     }
 
     // ── Normalization ────────────────────────────────────────────────────

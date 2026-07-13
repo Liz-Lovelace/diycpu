@@ -52,7 +52,7 @@ pub fn project_to_circuit(project: &Project) -> Result<CircuitDef, ConvertError>
     let abstractions = project
         .abstractions
         .iter()
-        .map(|pa| convert_abstraction(pa))
+        .map(convert_abstraction)
         .collect::<Result<Vec<_>, _>>()?;
 
     let components =
@@ -498,10 +498,10 @@ mod tests {
         let compiled = compile(&expanded.def).unwrap();
         let results = simulate(&compiled);
 
-        assert_eq!(results[0]["clk"], false);
-        assert_eq!(results[0]["state"], false);
-        assert_eq!(results[1]["clk"], true);
-        assert_eq!(results[1]["state"], true);
-        assert_eq!(results[3]["state"], false);
+        assert!(!results[0]["clk"]);
+        assert!(!results[0]["state"]);
+        assert!(results[1]["clk"]);
+        assert!(results[1]["state"]);
+        assert!(!results[3]["state"]);
     }
 }

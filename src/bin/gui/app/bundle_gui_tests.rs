@@ -1,0 +1,101 @@
+
+use diycpu::layout::PortKind;
+
+
+use super::*;
+
+use super::tests::*;
+
+#[test]
+fn bundle_wire_draws_between_bundle_ports_only() {
+    let mut d = Driver::new();
+    d.place("bundle", [2.0, 5.0]);
+    d.place("unbundle", [8.0, 5.0]);
+    d.place("nand", [14.0, 2.0]);
+
+    // Hovering a signal port while dragging a bundle wire reads as
+    // incompatible before the editor even gets asked.
+    d.move_to(port_at(&d.app, "bundle_1", "bundle"));
+    d.app.left_pressed();
+    d.move_to(port_at(&d.app, "nand_1", "a"));
+    assert!(matches!(d.app.wire_target(), WireTarget::Incompatible));
+    d.app.handle_key(KeyInput::Escape);
+
+    // Bundle port to bundle port connects and flags the net.
+    d.drag(
+        port_at(&d.app, "bundle_1", "bundle"),
+        port_at(&d.app, "unbundle_1", "bundle"),
+    );
+    let nets = &d.app.editor.project.wire_nets;
+    assert_eq!(nets.len(), 1, "{}", d.app.status.text);
+    assert!(nets[0].bundle);
+
+    // And lanes still take ordinary wires.
+    d.drag(
+        port_at(&d.app, "unbundle_1", "0"),
+        port_at(&d.app, "nand_1", "a"),
+    );
+    assert_eq!(d.app.editor.project.wire_nets.len(), 2);
+    assert!(!d.app.editor.project.wire_nets[1].bundle);
+}
+
+#[test]
+fn cog_on_a_bundler_prompts_for_lanes() {
+    let mut d = Driver::new();
+    d.place("bundle", [4.0, 2.0]);
+    d.move_to(center_of(&d.app, "bundle_1"));
+    let (rect, action) = d.app.cog().expect("bundlers have settings");
+    assert_eq!(
+        action,
+        CogAction::BundleWidth {
+            id: "bundle_1".into()
+        }
+    );
+    d.app.mouse_moved([rect.x + rect.w / 2.0, rect.y + rect.h / 2.0]);
+    d.app.left_pressed();
+    assert!(d.app.prompt.is_some());
+    d.app.prompt.as_mut().unwrap().value.clear();
+    d.type_text("4");
+    d.app.handle_key(KeyInput::Enter);
+    assert_eq!(d.app.editor.project.components[0].bits, Some(4));
+    // The body resized with the lane count.
+    let r = diycpu::layout::footprint(
+        &d.app.editor.project.abstractions,
+        &d.app.editor.project.components[0],
+    );
+    assert_eq!(r.h, 4.0);
+    // A bundle of one is refused, with the prompt kept for a retry.
+    d.move_to(center_of(&d.app, "bundle_1"));
+    let (rect, _) = d.app.cog().unwrap();
+    d.app.mouse_moved([rect.x + rect.w / 2.0, rect.y + rect.h / 2.0]);
+    d.app.left_pressed();
+    d.app.prompt.as_mut().unwrap().value.clear();
+    d.type_text("1");
+    d.app.handle_key(KeyInput::Enter);
+    assert!(d.app.status.is_error);
+    assert_eq!(d.app.editor.project.components[0].bits, Some(4));
+    d.app.handle_key(KeyInput::Escape);
+}
+
+#[test]
+fn bundle_pins_come_from_the_name_colon_width_syntax() {
+    let mut d = Driver::new();
+    d.app.action_new_abstraction();
+    d.type_text("bus");
+    d.app.handle_key(KeyInput::Enter);
+    d.app.action_add_pin(PortKind::Input);
+    d.type_text("data:8");
+    d.app.handle_key(KeyInput::Enter);
+    assert!(!d.app.status.is_error, "{}", d.app.status.text);
+    let def = &d.app.editor.project.abstractions[0];
+    assert_eq!(def.inputs, vec!["data".to_string()]);
+    assert_eq!(def.bundle_pins.get("data"), Some(&8));
+
+    // A bad width keeps the prompt for a retry.
+    d.app.action_add_pin(PortKind::Output);
+    d.type_text("q:1");
+    d.app.handle_key(KeyInput::Enter);
+    assert!(d.app.status.is_error);
+    assert!(d.app.prompt.is_some());
+    d.app.handle_key(KeyInput::Escape);
+}

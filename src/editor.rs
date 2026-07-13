@@ -43,6 +43,13 @@ pub enum EditError {
     NotAnAbstractionSheet,
     /// The wire would feed a signal combinationally back into itself.
     CombinationalLoop,
+    /// Bundle wires and signal wires can never join.
+    MixedWireKinds,
+    /// Two bundle ports of different lane counts on one net.
+    BundleWidthMismatch(u32, u32),
+    /// Lane counts are 2..=32 (a bundle of one is just a wire).
+    BadBundleWidth,
+    NotABundle(String),
     UnknownJunction(String),
     TwoSources(String),
     InputDoublyWired(String),
@@ -86,6 +93,16 @@ impl fmt::Display for EditError {
                     "That would loop a signal straight back into itself — put a flip-flop in the loop"
                 )
             }
+            Self::MixedWireKinds => {
+                write!(f, "Bundles and single wires don't mix — unbundle first")
+            }
+            Self::BundleWidthMismatch(a, b) => {
+                write!(f, "These bundles are different sizes ({a} vs {b} lines)")
+            }
+            Self::BadBundleWidth => {
+                write!(f, "Bundles carry 2 to 32 lines (a bundle of one is just a wire)")
+            }
+            Self::NotABundle(id) => write!(f, "\"{id}\" is not a bundler"),
             Self::UnknownJunction(id) => write!(f, "That wire node ({id}) no longer exists"),
             Self::TwoSources(existing) => {
                 write!(f, "This wire is already driven by {existing}")
@@ -272,6 +289,7 @@ impl Editor {
 
             let id = generate_id(components, &type_name);
             components.push(ProjectComponent {
+                bits: None,
                 id: id.clone(),
                 component_type: type_name.clone(),
                 init: (type_name == "dff" || type_name == "const").then_some(false),
@@ -557,6 +575,168 @@ impl Editor {
                 .find(|i| i.id == id)
                 .ok_or_else(|| EditError::UnknownImage(id.clone()))?;
             img.size = clamp_image_size([w, h]);
+            Ok(())
+        })
+    }
+
+    // ── Bundles ──────────────────────────────────────────────────────────
+
+    /// Change a bundler/unbundler's lane count. Wires on removed lanes and
+    /// on the (re-sized) bundle port are disconnected.
+    pub fn set_bundle_width(&mut self, id: &str, width: u32) -> Result<(), EditError> {
+        let id = id.to_string();
+        self.mutate(move |project, sheet| {
+            if !(2..=32).contains(&width) {
+                return Err(EditError::BadBundleWidth);
+            }
+            let ctx = KindCtx::new(project, sheet)?;
+            let abstractions = project.abstractions.clone();
+            let (components, wire_nets) =
+                sheet_mut(project, sheet).ok_or(EditError::BadSheet)?;
+            let index = components
+                .iter()
+                .position(|c| c.id == id)
+                .ok_or_else(|| EditError::UnknownComponent(id.clone()))?;
+            if !layout::is_bundle_component(&components[index].component_type) {
+                return Err(EditError::NotABundle(id.clone()));
+            }
+            let old = layout::bits_of(&components[index]);
+            if old == width {
+                return Ok(());
+            }
+            components[index].bits = Some(width);
+
+            // Growing the body must not run into neighbours.
+            let rect = layout::footprint(&abstractions, &components[index]);
+            for other in components.iter().filter(|c| c.id != id) {
+                if layout::footprint(&abstractions, other).intersects(&rect) {
+                    return Err(EditError::Overlap);
+                }
+            }
+
+            // Wires on lanes that no longer exist go away; the bundle port
+            // changed width, so its bundle wire goes too (reconnect it).
+            for net in wire_nets.iter_mut() {
+                net.segments.retain(|seg| {
+                    ![&seg.from, &seg.to].iter().any(|e| {
+                        matches!(e, Endpoint::Port { component_id, port_name }
+                            if *component_id == id
+                                && (*port_name == "bundle"
+                                    || port_name.parse::<u32>()
+                                        .is_ok_and(|k| k >= width)))
+                    })
+                });
+            }
+            repair_nets(wire_nets, components, &ctx)?;
+            Ok(())
+        })
+    }
+
+    /// Make an interface pin carry a bundle (or a single signal again).
+    /// Everything wired to the pin — inside the sheet and on every
+    /// instance — is disconnected: its kind changed.
+    pub fn set_pin_bundle_width(
+        &mut self,
+        name: &str,
+        width: Option<u32>,
+    ) -> Result<(), EditError> {
+        let name = name.to_string();
+        self.mutate(move |project, sheet| {
+            if let Some(w) = width {
+                if !(2..=32).contains(&w) {
+                    return Err(EditError::BadBundleWidth);
+                }
+            }
+            let SheetRef::Abstraction(i) = sheet else {
+                return Err(EditError::NotAnAbstractionSheet);
+            };
+            let def = project.abstractions.get_mut(i).ok_or(EditError::BadSheet)?;
+            let is_input = def.inputs.iter().any(|x| x == &name);
+            if !is_input && !def.outputs.contains_key(&name) {
+                return Err(EditError::UnknownComponent(name.clone()));
+            }
+            let before = def.bundle_pins.get(&name).copied();
+            if before == width {
+                return Ok(());
+            }
+            match width {
+                Some(w) => {
+                    def.bundle_pins.insert(name.clone(), w);
+                }
+                None => {
+                    def.bundle_pins.remove(&name);
+                }
+            }
+            // A passthrough output forwarding this pin can't survive a
+            // kind change.
+            let pseudo_in = format!("{}{name}", crate::convert::INPUT_PREFIX);
+            for target in def.outputs.values_mut() {
+                if *target == pseudo_in {
+                    target.clear();
+                }
+            }
+            if !is_input {
+                if let Some(t) = def.outputs.get_mut(&name) {
+                    t.clear();
+                }
+            }
+            let abs_name = def.name.clone();
+
+            // Scrub everything attached to the pin: its pseudo-port inside
+            // this sheet, and the matching port on every instance.
+            let pseudo_out = format!("{}{name}", layout::OUTPUT_PREFIX);
+            let abstractions_snapshot = project.abstractions.clone();
+            let sheet_count = project.abstractions.len() + 1;
+            for sheet_index in 0..sheet_count {
+                let (sheet_components, sheet_nets) = if sheet_index == 0 {
+                    (&project.components, &mut project.wire_nets)
+                } else {
+                    let a = &mut project.abstractions[sheet_index - 1];
+                    (&a.components, &mut a.wire_nets)
+                };
+                let own_sheet =
+                    sheet_index > 0 && abstractions_snapshot[sheet_index - 1].name == abs_name;
+                let instances: Vec<String> = sheet_components
+                    .iter()
+                    .filter(|c| c.component_type == abs_name)
+                    .map(|c| c.id.clone())
+                    .collect();
+                if instances.is_empty() && !own_sheet {
+                    continue;
+                }
+                for net in sheet_nets.iter_mut() {
+                    net.segments.retain(|seg| {
+                        ![&seg.from, &seg.to].iter().any(|e| {
+                            matches!(e, Endpoint::Port { component_id, port_name }
+                                if (instances.contains(component_id) && *port_name == name)
+                                    || (own_sheet
+                                        && (*component_id == pseudo_in
+                                            || *component_id == pseudo_out)))
+                        })
+                    });
+                }
+                let components_snapshot = sheet_components.clone();
+                let interface = if sheet_index == 0 {
+                    None
+                } else {
+                    abstractions_snapshot.get(sheet_index - 1)
+                };
+                let ctx = KindCtx {
+                    abstractions: abstractions_snapshot.clone(),
+                    interface_inputs: interface.map(|a| a.inputs.clone()),
+                    interface_outputs: interface
+                        .map(|a| a.outputs.keys().cloned().collect()),
+                    interface_bundles: interface
+                        .map(|a| a.bundle_pins.clone())
+                        .unwrap_or_default(),
+                };
+                let sheet_nets = if sheet_index == 0 {
+                    &mut project.wire_nets
+                } else {
+                    &mut project.abstractions[sheet_index - 1].wire_nets
+                };
+                repair_nets(sheet_nets, &components_snapshot, &ctx)?;
+            }
             Ok(())
         })
     }
@@ -920,6 +1100,7 @@ impl Editor {
                 let id = generate_id(components, &original.component_type);
                 id_map.insert(original.id.clone(), id.clone());
                 components.push(ProjectComponent {
+                    bits: None,
                     id: id.clone(),
                     component_type: original.component_type.clone(),
                     init: original.init,
@@ -1003,6 +1184,7 @@ impl Editor {
             }
             let [width, height] = layout::default_abstraction_size(&name, 0, 0);
             project.abstractions.push(crate::project::ProjectAbstraction {
+                bundle_pins: HashMap::new(),
                 pin_positions: HashMap::new(),
                 port_layout: HashMap::new(),
                 name: name.clone(),
@@ -1021,18 +1203,32 @@ impl Editor {
 
     /// Add an input or output pin to the abstraction being edited.
     /// An output pin starts unwired (empty target) until connected.
-    pub fn add_interface_pin(&mut self, kind: PortKind, name: &str) -> Result<(), EditError> {
+    /// Add an interface pin; `bundle` makes it carry that many lines.
+    pub fn add_interface_pin(
+        &mut self,
+        kind: PortKind,
+        name: &str,
+        bundle: Option<u32>,
+    ) -> Result<(), EditError> {
         let name = name.to_string();
         self.mutate(move |project, sheet| {
             let SheetRef::Abstraction(i) = sheet else {
                 return Err(EditError::NotAnAbstractionSheet);
             };
+            if let Some(w) = bundle {
+                if !(2..=32).contains(&w) {
+                    return Err(EditError::BadBundleWidth);
+                }
+            }
             let def = project.abstractions.get_mut(i).ok_or(EditError::BadSheet)?;
             if !valid_name(&name) {
                 return Err(EditError::InvalidName(name.clone()));
             }
             if def.inputs.iter().any(|x| x == &name) || def.outputs.contains_key(&name) {
                 return Err(EditError::NameTaken(name.clone()));
+            }
+            if let Some(w) = bundle {
+                def.bundle_pins.insert(name.clone(), w);
             }
             let index = match kind {
                 PortKind::Input => {
@@ -1139,6 +1335,7 @@ impl Editor {
                         abstractions: abstractions_snapshot,
                         interface_inputs: Some(def.inputs.clone()),
                         interface_outputs: Some(def.outputs.keys().cloned().collect()),
+                        interface_bundles: def.bundle_pins.clone(),
                     };
                     let components = def.components.clone();
                     repair_nets(&mut def.wire_nets, &components, &ctx)?;
@@ -1155,6 +1352,7 @@ impl Editor {
             let def = project.abstractions.get_mut(i).ok_or(EditError::BadSheet)?;
             def.pin_positions.remove(&name);
             def.port_layout.remove(&name);
+            def.bundle_pins.remove(&name);
             ensure_interface_fits(def);
             let abs_name = def.name.clone();
 
@@ -1197,6 +1395,9 @@ impl Editor {
                     interface_inputs: interface.map(|a| a.inputs.clone()),
                     interface_outputs: interface
                         .map(|a| a.outputs.keys().cloned().collect()),
+                    interface_bundles: interface
+                        .map(|a| a.bundle_pins.clone())
+                        .unwrap_or_default(),
                 };
                 let sheet_nets = if sheet_index == 0 {
                     &mut project.wire_nets
@@ -1324,6 +1525,9 @@ impl Editor {
             }
             if let Some(spot) = def.port_layout.remove(&old) {
                 def.port_layout.insert(new.clone(), spot);
+            }
+            if let Some(w) = def.bundle_pins.remove(&old) {
+                def.bundle_pins.insert(new.clone(), w);
             }
             match kind {
                 PortKind::Input => {
@@ -1742,6 +1946,7 @@ struct KindCtx {
     abstractions: Vec<crate::project::ProjectAbstraction>,
     interface_inputs: Option<Vec<String>>,
     interface_outputs: Option<Vec<String>>,
+    interface_bundles: HashMap<String, u32>,
 }
 
 impl KindCtx {
@@ -1756,11 +1961,48 @@ impl KindCtx {
                 )
             }
         };
+        let interface_bundles = match sheet {
+            SheetRef::Top => HashMap::new(),
+            SheetRef::Abstraction(i) => project
+                .abstractions
+                .get(i)
+                .map(|d| d.bundle_pins.clone())
+                .unwrap_or_default(),
+        };
         Ok(KindCtx {
             abstractions: project.abstractions.clone(),
             interface_inputs,
             interface_outputs,
+            interface_bundles,
         })
+    }
+
+    /// Signal or bundle — for any port, interface pseudo-ports included.
+    fn wire_kind_of(
+        &self,
+        components: &[ProjectComponent],
+        port: &PortRef,
+    ) -> Result<layout::WireKind, EditError> {
+        let pin_name = port
+            .component_id
+            .strip_prefix(crate::convert::INPUT_PREFIX)
+            .or_else(|| port.component_id.strip_prefix(layout::OUTPUT_PREFIX));
+        if let Some(name) = pin_name {
+            return Ok(match self.interface_bundles.get(name) {
+                Some(w) => layout::WireKind::Bundle(*w),
+                None => layout::WireKind::Signal,
+            });
+        }
+        let comp = components
+            .iter()
+            .find(|c| c.id == port.component_id)
+            .ok_or_else(|| EditError::UnknownComponent(port.component_id.clone()))?;
+        layout::component_port_info(&self.abstractions, comp)
+            .and_then(|ports| ports.into_iter().find(|p| p.name == port.port_name))
+            .map(|p| p.wire)
+            .ok_or_else(|| {
+                EditError::UnknownPort(port.component_id.clone(), port.port_name.clone())
+            })
     }
 
     /// Wire-direction kind of a port, including interface pseudo-ports.
@@ -1795,7 +2037,7 @@ impl KindCtx {
             .iter()
             .find(|c| c.id == port.component_id)
             .ok_or_else(|| EditError::UnknownComponent(port.component_id.clone()))?;
-        layout::type_ports(&self.abstractions, &comp.component_type)
+        layout::component_port_info(&self.abstractions, comp)
             .and_then(|ports| ports.into_iter().find(|p| p.name == port.port_name))
             .map(|p| p.kind)
             .ok_or_else(|| {
@@ -1831,9 +2073,13 @@ fn attach_wire(
 ) -> Result<WireAttach, EditError> {
     let ctx = KindCtx::new(project, sheet)?;
 
-    // Output-pin connections are outputs-map writes, not net edits.
+    // Output-pin connections are outputs-map writes, not net edits —
+    // except BUNDLE output pins, which take real bundle nets (the lowering
+    // pass reads their connectivity from the net graph).
     let is_output_pin = |wp: &WirePoint| {
-        matches!(wp, WirePoint::Port(p) if p.component_id.starts_with(layout::OUTPUT_PREFIX))
+        matches!(wp, WirePoint::Port(p)
+            if p.component_id.strip_prefix(layout::OUTPUT_PREFIX)
+                .is_some_and(|name| !ctx.interface_bundles.contains_key(name)))
     };
     if is_output_pin(from) || is_output_pin(to) {
         return attach_to_output_pin(project, sheet, &ctx, from, to);
@@ -1906,6 +2152,9 @@ fn attach_wire(
     let mut renames: Vec<(String, String)> = Vec::new();
     let net_index = match (net_from, net_to) {
         (Some(a), Some(b)) if a != b => {
+            if wire_nets[a].bundle != wire_nets[b].bundle {
+                return Err(EditError::MixedWireKinds);
+            }
             // Merging two live nets: at most one may be driven.
             if let (Some(sa), Some(sb)) = (&wire_nets[a].source, &wire_nets[b].source) {
                 if sa != sb {
@@ -1923,8 +2172,21 @@ fn attach_wire(
         (Some(a), _) => a,
         (_, Some(b)) => b,
         (None, None) => {
+            // A fresh net's lane comes from the ports starting it; mixing
+            // is rejected in sync either way.
+            let mut bundle = false;
+            for wp in [from, to] {
+                if let WirePoint::Port(p) = wp {
+                    if let Ok(layout::WireKind::Bundle(_)) =
+                        ctx.wire_kind_of(components, p)
+                    {
+                        bundle = true;
+                    }
+                }
+            }
             let id = generate_net_id(wire_nets);
             wire_nets.push(WireNet {
+                bundle,
                 id,
                 source: None,
                 sinks: vec![],
@@ -2090,6 +2352,7 @@ fn guard_no_combinational_loop(project: &Project, sheet: SheetRef) -> Result<(),
                 steps: 1,
                 abstractions: project.abstractions.clone(),
                 components: vec![ProjectComponent {
+                    bits: None,
                     id: "__probe_instance".into(),
                     component_type: def.name.clone(),
                     init: None,
@@ -2102,8 +2365,13 @@ fn guard_no_combinational_loop(project: &Project, sheet: SheetRef) -> Result<(),
             &probe
         }
     };
-    let Ok(def) = crate::convert::project_to_circuit(checked) else {
-        return Ok(());
+    let def = match crate::convert::project_to_circuit(checked) {
+        Ok(def) => def,
+        // A bundle that resolves through itself IS a combinational loop.
+        Err(crate::convert::ConvertError::BundleLoop { .. }) => {
+            return Err(EditError::CombinationalLoop)
+        }
+        Err(_) => return Ok(()),
     };
     let Ok(expanded) = crate::expander::expand(&def) else {
         return Ok(());
@@ -2135,6 +2403,7 @@ fn sync_net_logic(
 ) -> Result<(), EditError> {
     let mut source: Option<PortRef> = None;
     let mut sinks: Vec<PortRef> = Vec::new();
+    let mut lane_width: Option<u32> = None;
     for seg in &net.segments {
         for e in [&seg.from, &seg.to] {
             let Endpoint::Port {
@@ -2148,6 +2417,19 @@ fn sync_net_logic(
                 component_id: component_id.clone(),
                 port_name: port_name.clone(),
             };
+            // Bundle nets take only bundle ports (of one width); signal
+            // nets take only signal ports. The two lanes never mix.
+            match (net.bundle, ctx.wire_kind_of(components, &port)?) {
+                (false, layout::WireKind::Signal) => {}
+                (true, layout::WireKind::Bundle(w)) => match lane_width {
+                    None => lane_width = Some(w),
+                    Some(prev) if prev != w => {
+                        return Err(EditError::BundleWidthMismatch(prev, w))
+                    }
+                    _ => {}
+                },
+                _ => return Err(EditError::MixedWireKinds),
+            }
             match ctx.kind_of(components, &port)? {
                 PortKind::Output => match &source {
                     None => source = Some(port),
@@ -2202,9 +2484,11 @@ fn endpoint_key(e: &Endpoint) -> String {
 fn split_all_nets(wire_nets: &mut Vec<WireNet>) {
     let mut i = 0;
     while i < wire_nets.len() {
+        let bundle = wire_nets[i].bundle;
         for (junctions, segments) in split_off_islands(&mut wire_nets[i]) {
             let id = generate_net_id(wire_nets);
             wire_nets.push(WireNet {
+                bundle,
                 id,
                 source: None, // synced by the caller
                 sinks: vec![],
@@ -2376,11 +2660,17 @@ pub fn normalize(project: &mut Project) -> Vec<String> {
                     &mut a.wire_nets,
                 )
             };
+        let interface_bundles = if sheet_index == 0 {
+            HashMap::new()
+        } else {
+            abstractions[sheet_index - 1].bundle_pins.clone()
+        };
         normalize_sheet(
             &abstractions,
             components,
             wire_nets,
             interface_inputs,
+            interface_bundles,
             &label,
             &mut notes,
         );
@@ -2463,6 +2753,31 @@ pub fn normalize(project: &mut Project) -> Vec<String> {
         }
     }
 
+    // Bundle pins must name a real pin and carry a sane lane count.
+    for a in &mut project.abstractions {
+        let inputs = a.inputs.clone();
+        let output_names: Vec<String> = a.outputs.keys().cloned().collect();
+        a.bundle_pins.retain(|name, w| {
+            let exists =
+                inputs.iter().any(|i| i == name) || output_names.iter().any(|o| o == name);
+            if !exists {
+                notes.push(format!(
+                    "abstraction \"{}\": bundle entry for missing pin \"{name}\" dropped",
+                    a.name
+                ));
+                return false;
+            }
+            if !(2..=32).contains(w) {
+                notes.push(format!(
+                    "abstraction \"{}\": bundle pin \"{name}\" width clamped",
+                    a.name
+                ));
+                *w = (*w).clamp(2, 32);
+            }
+            true
+        });
+    }
+
     // Images: unique non-empty ids, finite positive sizes.
     sanitize_images(&mut project.images, "main circuit", &mut notes);
     for i in 0..project.abstractions.len() {
@@ -2504,11 +2819,13 @@ fn sanitize_images(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn normalize_sheet(
     abstractions: &[crate::project::ProjectAbstraction],
     components: &mut [ProjectComponent],
     wire_nets: &mut Vec<WireNet>,
     interface_inputs: Option<Vec<String>>,
+    interface_bundles: HashMap<String, u32>,
     label: &str,
     notes: &mut Vec<String>,
 ) {
@@ -2522,7 +2839,7 @@ fn normalize_sheet(
             };
         }
         let comp = components.iter().find(|c| c.id == port.component_id)?;
-        layout::type_ports(abstractions, &comp.component_type)?
+        layout::component_port_info(abstractions, comp)?
             .into_iter()
             .find(|p| p.name == port.port_name)
             .map(|p| p.kind)
@@ -2724,6 +3041,7 @@ fn normalize_sheet(
         abstractions: abstractions.to_vec(),
         interface_outputs: interface_inputs.as_ref().map(|_| vec![]),
         interface_inputs,
+        interface_bundles,
     };
     for net in wire_nets.iter_mut() {
         if let Err(e) = sync_net_logic(net, components, &ctx) {
@@ -2843,7 +3161,7 @@ mod tests {
         e.place_component("clk", [10, 0]).unwrap();
         let i = e.create_abstraction("ticker").unwrap();
         e.open_sheet(SheetRef::Abstraction(i)).unwrap();
-        e.add_interface_pin(PortKind::Output, "q").unwrap();
+        e.add_interface_pin(PortKind::Output, "q", None).unwrap();
         e.place_component("clk", [0, 0]).unwrap();
         e.place_component("dff", [6, 0]).unwrap();
         e.connect(port("clk_1", "out"), port("dff_1", "clk"), &[]).unwrap();
@@ -3083,6 +3401,7 @@ mod tests {
     fn project_with_not_abstraction() -> Editor {
         let mut e = Editor::empty();
         e.project.abstractions.push(ProjectAbstraction {
+            bundle_pins: HashMap::new(),
             pin_positions: HashMap::new(),
             port_layout: HashMap::new(),
             name: "not".into(),
@@ -3091,6 +3410,7 @@ mod tests {
             width: 4.0,
             height: 2.0,
             components: vec![ProjectComponent {
+                bits: None,
                 id: "gate".into(),
                 component_type: "nand".into(),
                 init: None,
@@ -3334,8 +3654,8 @@ mod tests {
         let mut e = Editor::empty();
         let i = e.create_abstraction("buf").unwrap();
         e.open_sheet(SheetRef::Abstraction(i)).unwrap();
-        e.add_interface_pin(PortKind::Input, "x").unwrap();
-        e.add_interface_pin(PortKind::Output, "q").unwrap();
+        e.add_interface_pin(PortKind::Input, "x", None).unwrap();
+        e.add_interface_pin(PortKind::Output, "q", None).unwrap();
         e.place_component("nand", [4, 0]).unwrap();
         e.connect(pin("INPUT:", "x"), port("nand_1", "a"), &[]).unwrap();
         e.connect(pin("INPUT:", "x"), port("nand_1", "b"), &[]).unwrap();
@@ -3392,11 +3712,11 @@ mod tests {
         ));
 
         e.open_sheet(SheetRef::Abstraction(i)).unwrap();
-        e.add_interface_pin(PortKind::Input, "a").unwrap();
-        e.add_interface_pin(PortKind::Input, "b").unwrap();
-        e.add_interface_pin(PortKind::Output, "sum").unwrap();
+        e.add_interface_pin(PortKind::Input, "a", None).unwrap();
+        e.add_interface_pin(PortKind::Input, "b", None).unwrap();
+        e.add_interface_pin(PortKind::Output, "sum", None).unwrap();
         assert!(matches!(
-            e.add_interface_pin(PortKind::Output, "a").unwrap_err(),
+            e.add_interface_pin(PortKind::Output, "a", None).unwrap_err(),
             EditError::NameTaken(_)
         ));
         let def = &e.project.abstractions[i];
@@ -3409,8 +3729,8 @@ mod tests {
         let mut e = Editor::empty();
         let i = e.create_abstraction("buf2").unwrap();
         e.open_sheet(SheetRef::Abstraction(i)).unwrap();
-        e.add_interface_pin(PortKind::Input, "x").unwrap();
-        e.add_interface_pin(PortKind::Output, "out").unwrap();
+        e.add_interface_pin(PortKind::Input, "x", None).unwrap();
+        e.add_interface_pin(PortKind::Output, "out", None).unwrap();
         e.place_component("nand", [4, 0]).unwrap();
 
         // Input pin drives both nand inputs (drawn from pin or port side).
@@ -3473,7 +3793,7 @@ mod tests {
         let mut e = Editor::empty();
         let i = e.create_abstraction("thing").unwrap();
         e.open_sheet(SheetRef::Abstraction(i)).unwrap();
-        e.add_interface_pin(PortKind::Input, "x").unwrap();
+        e.add_interface_pin(PortKind::Input, "x", None).unwrap();
         e.place_component("nand", [4, 0]).unwrap();
         e.connect(pin("INPUT:", "x"), port("nand_1", "a"), &[]).unwrap();
 
@@ -3493,7 +3813,7 @@ mod tests {
         let mut e = Editor::empty();
         let i = e.create_abstraction("thing").unwrap();
         e.open_sheet(SheetRef::Abstraction(i)).unwrap();
-        e.add_interface_pin(PortKind::Output, "q").unwrap();
+        e.add_interface_pin(PortKind::Output, "q", None).unwrap();
         e.place_component("nand", [4, 0]).unwrap();
         e.connect(port("nand_1", "out"), pin("OUTPUT:", "q"), &[])
             .unwrap();
@@ -3509,7 +3829,7 @@ mod tests {
         let mut e = Editor::empty();
         let i = e.create_abstraction("thing").unwrap();
         e.open_sheet(SheetRef::Abstraction(i)).unwrap();
-        e.add_interface_pin(PortKind::Input, "x").unwrap();
+        e.add_interface_pin(PortKind::Input, "x", None).unwrap();
         e.place_component("nand", [4, 0]).unwrap();
         e.connect(pin("INPUT:", "x"), port("nand_1", "a"), &[]).unwrap();
 
@@ -3613,8 +3933,8 @@ mod tests {
         let mut e = Editor::empty();
         let i = e.create_abstraction("buf").unwrap();
         e.open_sheet(SheetRef::Abstraction(i)).unwrap();
-        e.add_interface_pin(PortKind::Input, "x").unwrap();
-        e.add_interface_pin(PortKind::Output, "q").unwrap();
+        e.add_interface_pin(PortKind::Input, "x", None).unwrap();
+        e.add_interface_pin(PortKind::Output, "q", None).unwrap();
         e.place_component("nand", [4, 0]).unwrap();
         e.connect(pin("INPUT:", "x"), port("nand_1", "a"), &[]).unwrap();
         e.connect(pin("INPUT:", "x"), port("nand_1", "b"), &[]).unwrap();
@@ -3662,7 +3982,7 @@ mod tests {
         // Nest buf inside a second abstraction that exports its output.
         let j = e.create_abstraction("wrapper").unwrap();
         e.open_sheet(SheetRef::Abstraction(j)).unwrap();
-        e.add_interface_pin(PortKind::Output, "w").unwrap();
+        e.add_interface_pin(PortKind::Output, "w", None).unwrap();
         e.place_component("buf", [4, 0]).unwrap();
         e.connect(port("buf_1", "q"), pin("OUTPUT:", "w"), &[]).unwrap();
         assert_eq!(
@@ -3751,8 +4071,8 @@ mod tests {
         let mut e = Editor::empty();
         let i = e.create_abstraction("thing").unwrap();
         e.open_sheet(SheetRef::Abstraction(i)).unwrap();
-        e.add_interface_pin(PortKind::Input, "a").unwrap();
-        e.add_interface_pin(PortKind::Input, "b").unwrap();
+        e.add_interface_pin(PortKind::Input, "a", None).unwrap();
+        e.add_interface_pin(PortKind::Input, "b", None).unwrap();
         // Both pins got concrete homes at creation.
         assert!(e.project.abstractions[i].pin_positions.contains_key("a"));
         assert!(e.project.abstractions[i].pin_positions.contains_key("b"));
@@ -3858,13 +4178,14 @@ mod tests {
         let i = e.create_abstraction("box").unwrap();
         e.open_sheet(SheetRef::Abstraction(i)).unwrap();
         for name in ["a", "b", "c"] {
-            e.add_interface_pin(PortKind::Input, name).unwrap();
+            e.add_interface_pin(PortKind::Input, name, None).unwrap();
         }
-        e.add_interface_pin(PortKind::Output, "q").unwrap();
+        e.add_interface_pin(PortKind::Output, "q", None).unwrap();
         assert!(e.project.abstractions[i].port_layout.is_empty(), "auto until touched");
 
         // Positions before the first manual placement...
         let synth = ProjectComponent {
+            bits: None,
             id: String::new(),
             component_type: "box".into(),
             init: None,
@@ -3887,7 +4208,7 @@ mod tests {
         assert_eq!(e.project.abstractions[i].port_layout.len(), 4);
 
         // A new pin lands in a free slot instead of re-flowing the layout.
-        e.add_interface_pin(PortKind::Input, "d").unwrap();
+        e.add_interface_pin(PortKind::Input, "d", None).unwrap();
         let spots = &e.project.abstractions[i].port_layout;
         assert!(spots.contains_key("d"));
         let occupied: Vec<i64> = spots
@@ -3909,8 +4230,8 @@ mod tests {
         let mut e = Editor::empty();
         let n = e.create_abstraction("inv").unwrap();
         e.open_sheet(SheetRef::Abstraction(n)).unwrap();
-        e.add_interface_pin(PortKind::Input, "x").unwrap();
-        e.add_interface_pin(PortKind::Output, "q").unwrap();
+        e.add_interface_pin(PortKind::Input, "x", None).unwrap();
+        e.add_interface_pin(PortKind::Output, "q", None).unwrap();
         e.place_component("nand", [4, 0]).unwrap();
         e.connect(pin("INPUT:", "x"), port("nand_1", "a"), &[]).unwrap();
         e.connect(pin("INPUT:", "x"), port("nand_1", "b"), &[]).unwrap();
@@ -3918,7 +4239,7 @@ mod tests {
 
         let b = e.create_abstraction("buf2").unwrap();
         e.open_sheet(SheetRef::Abstraction(b)).unwrap();
-        e.add_interface_pin(PortKind::Output, "q").unwrap();
+        e.add_interface_pin(PortKind::Output, "q", None).unwrap();
         // Downstream instance placed FIRST, upstream second, wired
         // right-to-left: expansion must not depend on placement order.
         e.place_component("inv", [8, 0]).unwrap();
@@ -3980,12 +4301,14 @@ mod tests {
         e.create_abstraction("b").unwrap();
         e.create_abstraction("c").unwrap();
         e.project.abstractions[0].components.push(ProjectComponent {
+            bits: None,
             id: "x".into(),
             component_type: "b".into(),
             init: None,
             pos: [0.0, 0.0],
         });
         e.project.abstractions[1].components.push(ProjectComponent {
+            bits: None,
             id: "y".into(),
             component_type: "a".into(),
             init: None,
@@ -4009,7 +4332,7 @@ mod tests {
         let mut e = Editor::empty();
         let i = e.create_abstraction("thing").unwrap();
         e.open_sheet(SheetRef::Abstraction(i)).unwrap();
-        e.add_interface_pin(PortKind::Input, "x").unwrap();
+        e.add_interface_pin(PortKind::Input, "x", None).unwrap();
         e.place_component("nand", [4, 0]).unwrap();
         e.connect(pin("INPUT:", "x"), port("nand_1", "a"), &[]).unwrap();
         let frag = e.fragment(&["nand_1".into()], &[], &[]);
@@ -4038,7 +4361,7 @@ mod tests {
         let mut e = Editor::empty();
         let i = e.create_abstraction("thing").unwrap();
         e.open_sheet(SheetRef::Abstraction(i)).unwrap();
-        e.add_interface_pin(PortKind::Output, "q").unwrap();
+        e.add_interface_pin(PortKind::Output, "q", None).unwrap();
         e.place_component("nand", [4, 0]).unwrap();
         let mut p = e.project.clone();
         p.abstractions[i].outputs.insert("q".into(), "nand_1.out".into());
@@ -4066,6 +4389,7 @@ mod tests {
     fn normalize_merges_same_source_nets_and_dedups_drivers() {
         let mut project = editor_with_two_nands().project;
         let seg_less = |id: &str, sink: PortRef| WireNet {
+            bundle: false,
             id: id.into(),
             source: Some(port("nand_1", "out")),
             sinks: vec![sink],
@@ -4087,6 +4411,7 @@ mod tests {
     fn normalize_repairs_dangling_references() {
         let mut project = editor_with_two_nands().project;
         project.wire_nets = vec![WireNet {
+            bundle: false,
             id: "w1".into(),
             source: Some(port("ghost", "out")),
             sinks: vec![port("nand_2", "a"), port("nand_2", "bogus_port")],
@@ -4227,8 +4552,8 @@ mod passthrough_and_loop_tests {
     fn make_buf(e: &mut Editor) -> usize {
         let i = e.create_abstraction("buf").unwrap();
         e.open_sheet(SheetRef::Abstraction(i)).unwrap();
-        e.add_interface_pin(PortKind::Input, "x").unwrap();
-        e.add_interface_pin(PortKind::Output, "q").unwrap();
+        e.add_interface_pin(PortKind::Input, "x", None).unwrap();
+        e.add_interface_pin(PortKind::Output, "q", None).unwrap();
         e.connect(pin("INPUT:", "x"), pin("OUTPUT:", "q"), &[]).unwrap();
         assert_eq!(
             e.project.abstractions[i].outputs.get("q"),
@@ -4260,8 +4585,8 @@ mod passthrough_and_loop_tests {
         // buf2 wraps buf: r forwards y through the nested passthrough.
         let i2 = e.create_abstraction("buf2").unwrap();
         e.open_sheet(SheetRef::Abstraction(i2)).unwrap();
-        e.add_interface_pin(PortKind::Input, "y").unwrap();
-        e.add_interface_pin(PortKind::Output, "r").unwrap();
+        e.add_interface_pin(PortKind::Input, "y", None).unwrap();
+        e.add_interface_pin(PortKind::Output, "r", None).unwrap();
         e.place_component("buf", [4, 0]).unwrap();
         e.connect(pin("INPUT:", "y"), port("buf_1", "x"), &[]).unwrap();
         e.connect(port("buf_1", "q"), pin("OUTPUT:", "r"), &[]).unwrap();
@@ -4369,5 +4694,222 @@ mod passthrough_and_loop_tests {
         );
         assert_eq!(project.abstractions[0].outputs.get("r"), Some(&String::new()));
         assert!(notes.iter().any(|n| n.contains("ghost")));
+    }
+}
+
+#[cfg(test)]
+mod bundle_tests {
+    use super::*;
+    use crate::layout::PortKind;
+
+    fn port(c: &str, p: &str) -> PortRef {
+        PortRef {
+            component_id: c.into(),
+            port_name: p.into(),
+        }
+    }
+    fn pin(prefix: &str, name: &str) -> PortRef {
+        PortRef {
+            component_id: format!("{prefix}{name}"),
+            port_name: name.into(),
+        }
+    }
+
+    fn engine_inputs(e: &Editor, flat: &str) -> HashMap<String, String> {
+        let def = crate::convert::project_to_circuit(&e.project).unwrap();
+        let ex = crate::expander::expand(&def).unwrap();
+        crate::compiler::compile(&ex.def).unwrap();
+        ex.def
+            .components
+            .iter()
+            .find(|c| c.name == flat)
+            .unwrap_or_else(|| panic!("no {flat} in {:?}",
+                ex.def.components.iter().map(|c| &c.name).collect::<Vec<_>>()))
+            .inputs
+            .clone()
+    }
+
+    #[test]
+    fn bundle_carries_lanes_from_bundler_to_unbundler() {
+        let mut e = Editor::empty();
+        e.place_component("dff", [0, 0]).unwrap();
+        e.place_component("const", [0, 4]).unwrap();
+        e.place_component("bundle", [6, 0]).unwrap();
+        e.place_component("unbundle", [12, 0]).unwrap();
+        e.place_component("nand", [18, 0]).unwrap();
+
+        e.connect(port("dff_1", "out"), port("bundle_1", "0"), &[]).unwrap();
+        e.connect(port("const_1", "out"), port("bundle_1", "5"), &[]).unwrap();
+        e.connect(port("bundle_1", "bundle"), port("unbundle_1", "bundle"), &[]).unwrap();
+        assert!(
+            e.project.wire_nets.iter().any(|n| n.bundle),
+            "the bundle wire is flagged"
+        );
+        e.connect(port("unbundle_1", "0"), port("nand_1", "a"), &[]).unwrap();
+        e.connect(port("unbundle_1", "5"), port("nand_1", "b"), &[]).unwrap();
+
+        // The engine sees the lanes wired straight through.
+        let inputs = engine_inputs(&e, "nand_1");
+        assert_eq!(inputs.get("a"), Some(&"dff_1".to_string()));
+        assert_eq!(inputs.get("b"), Some(&"const_1".to_string()));
+    }
+
+    #[test]
+    fn bundles_and_wires_never_mix() {
+        let mut e = Editor::empty();
+        e.place_component("nand", [0, 0]).unwrap();
+        e.place_component("bundle", [6, 0]).unwrap();
+        e.place_component("unbundle", [12, 0]).unwrap();
+
+        assert_eq!(
+            e.connect(port("bundle_1", "bundle"), port("nand_1", "a"), &[]).unwrap_err(),
+            EditError::MixedWireKinds
+        );
+        assert_eq!(
+            e.connect(port("nand_1", "out"), port("unbundle_1", "bundle"), &[]).unwrap_err(),
+            EditError::MixedWireKinds
+        );
+        // Rolled back both times.
+        assert!(e.project.wire_nets.is_empty());
+    }
+
+    #[test]
+    fn bundle_widths_must_match_and_stay_sane() {
+        let mut e = Editor::empty();
+        e.place_component("bundle", [0, 0]).unwrap();
+        e.place_component("unbundle", [6, 0]).unwrap();
+        assert_eq!(
+            e.set_bundle_width("bundle_1", 1).unwrap_err(),
+            EditError::BadBundleWidth
+        );
+        e.set_bundle_width("unbundle_1", 4).unwrap();
+        assert_eq!(
+            e.connect(port("bundle_1", "bundle"), port("unbundle_1", "bundle"), &[])
+                .unwrap_err(),
+            EditError::BundleWidthMismatch(8, 4)
+        );
+        // Matching them up works.
+        e.set_bundle_width("bundle_1", 4).unwrap();
+        e.connect(port("bundle_1", "bundle"), port("unbundle_1", "bundle"), &[]).unwrap();
+    }
+
+    #[test]
+    fn shrinking_a_bundler_scrubs_lost_lanes_and_its_bundle_wire() {
+        let mut e = Editor::empty();
+        e.place_component("dff", [0, 0]).unwrap();
+        e.place_component("bundle", [6, 0]).unwrap();
+        e.place_component("unbundle", [12, 0]).unwrap();
+        e.connect(port("dff_1", "out"), port("bundle_1", "7"), &[]).unwrap();
+        e.connect(port("bundle_1", "bundle"), port("unbundle_1", "bundle"), &[]).unwrap();
+
+        e.set_bundle_width("bundle_1", 4).unwrap();
+        // The lane-7 wire and the (now mismatched) bundle wire are gone.
+        assert!(
+            e.project.wire_nets.iter().all(|n| n.segments.is_empty() || !n.bundle),
+            "bundle wire disconnected"
+        );
+        assert!(!e
+            .project
+            .wire_nets
+            .iter()
+            .any(|n| n.sinks.iter().any(|s| s.port_name == "7")));
+        // One undo restores everything.
+        e.undo().unwrap();
+        assert!(e.project.wire_nets.iter().any(|n| n.bundle));
+    }
+
+    #[test]
+    fn bundle_pins_cross_abstraction_boundaries() {
+        let mut e = Editor::empty();
+        // An abstraction taking an 8-line bus: nand(d0, d5) inside.
+        let i = e.create_abstraction("bus_nand").unwrap();
+        e.open_sheet(SheetRef::Abstraction(i)).unwrap();
+        e.add_interface_pin(PortKind::Input, "d", Some(8)).unwrap();
+        e.add_interface_pin(PortKind::Output, "q", None).unwrap();
+        e.place_component("unbundle", [4, 0]).unwrap();
+        e.place_component("nand", [10, 2]).unwrap();
+        e.connect(pin("INPUT:", "d"), port("unbundle_1", "bundle"), &[]).unwrap();
+        e.connect(port("unbundle_1", "0"), port("nand_1", "a"), &[]).unwrap();
+        e.connect(port("unbundle_1", "5"), port("nand_1", "b"), &[]).unwrap();
+        e.connect(port("nand_1", "out"), pin("OUTPUT:", "q"), &[]).unwrap();
+        e.open_sheet(SheetRef::Top).unwrap();
+
+        e.place_component("dff", [0, 0]).unwrap();
+        e.place_component("const", [0, 4]).unwrap();
+        e.place_component("bundle", [6, 0]).unwrap();
+        e.place_component("bus_nand", [12, 0]).unwrap();
+        e.connect(port("dff_1", "out"), port("bundle_1", "0"), &[]).unwrap();
+        e.connect(port("const_1", "out"), port("bundle_1", "5"), &[]).unwrap();
+        e.connect(port("bundle_1", "bundle"), port("bus_nand_1", "d"), &[]).unwrap();
+
+        // The flattened gate reads the top-level lane drivers directly.
+        let inputs = engine_inputs(&e, "bus_nand_1/nand_1");
+        assert_eq!(inputs.get("a"), Some(&"dff_1".to_string()));
+        assert_eq!(inputs.get("b"), Some(&"const_1".to_string()));
+    }
+
+    #[test]
+    fn bundle_output_pins_forward_lanes_out() {
+        let mut e = Editor::empty();
+        // An abstraction producing an 8-line bus from two internal sources.
+        let i = e.create_abstraction("two_bits").unwrap();
+        e.open_sheet(SheetRef::Abstraction(i)).unwrap();
+        e.add_interface_pin(PortKind::Output, "q", Some(8)).unwrap();
+        e.place_component("dff", [0, 0]).unwrap();
+        e.place_component("const", [0, 4]).unwrap();
+        e.place_component("bundle", [6, 0]).unwrap();
+        e.connect(port("dff_1", "out"), port("bundle_1", "1"), &[]).unwrap();
+        e.connect(port("const_1", "out"), port("bundle_1", "2"), &[]).unwrap();
+        e.connect(port("bundle_1", "bundle"), pin("OUTPUT:", "q"), &[]).unwrap();
+        // Bundle output pins connect through a REAL bundle net.
+        assert!(e.project.abstractions[i].wire_nets.iter().any(|n| n.bundle
+            && n.sinks.iter().any(|s| s.component_id == "OUTPUT:q")));
+        e.open_sheet(SheetRef::Top).unwrap();
+
+        e.place_component("two_bits", [0, 0]).unwrap();
+        e.place_component("unbundle", [8, 0]).unwrap();
+        e.place_component("nand", [14, 0]).unwrap();
+        e.connect(port("two_bits_1", "q"), port("unbundle_1", "bundle"), &[]).unwrap();
+        e.connect(port("unbundle_1", "1"), port("nand_1", "a"), &[]).unwrap();
+        e.connect(port("unbundle_1", "2"), port("nand_1", "b"), &[]).unwrap();
+
+        let inputs = engine_inputs(&e, "nand_1");
+        assert_eq!(inputs.get("a"), Some(&"two_bits_1/dff_1".to_string()));
+        assert_eq!(inputs.get("b"), Some(&"two_bits_1/const_1".to_string()));
+    }
+
+    #[test]
+    fn a_loop_through_a_bundle_is_refused() {
+        let mut e = Editor::empty();
+        e.place_component("nand", [0, 0]).unwrap();
+        e.place_component("bundle", [6, 0]).unwrap();
+        e.place_component("unbundle", [12, 0]).unwrap();
+        e.connect(port("nand_1", "out"), port("bundle_1", "0"), &[]).unwrap();
+        e.connect(port("bundle_1", "bundle"), port("unbundle_1", "bundle"), &[]).unwrap();
+        // Closing the loop: unbundle lane 0 back into the nand.
+        assert_eq!(
+            e.connect(port("unbundle_1", "0"), port("nand_1", "a"), &[]).unwrap_err(),
+            EditError::CombinationalLoop
+        );
+    }
+
+    #[test]
+    fn rebundling_after_unbundling_chains_through() {
+        let mut e = Editor::empty();
+        e.place_component("dff", [0, 0]).unwrap();
+        e.place_component("bundle", [4, 0]).unwrap();
+        e.place_component("unbundle", [8, 0]).unwrap();
+        e.place_component("bundle", [12, 0]).unwrap();
+        e.place_component("unbundle", [16, 0]).unwrap();
+        e.place_component("nand", [20, 0]).unwrap();
+        e.connect(port("dff_1", "out"), port("bundle_1", "3"), &[]).unwrap();
+        e.connect(port("bundle_1", "bundle"), port("unbundle_1", "bundle"), &[]).unwrap();
+        // The legal way to regroup: unbundle, then bundle again.
+        e.connect(port("unbundle_1", "3"), port("bundle_2", "6"), &[]).unwrap();
+        e.connect(port("bundle_2", "bundle"), port("unbundle_2", "bundle"), &[]).unwrap();
+        e.connect(port("unbundle_2", "6"), port("nand_1", "a"), &[]).unwrap();
+
+        let inputs = engine_inputs(&e, "nand_1");
+        assert_eq!(inputs.get("a"), Some(&"dff_1".to_string()));
     }
 }

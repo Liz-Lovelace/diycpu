@@ -57,6 +57,9 @@ pub struct ProjectComponent {
     pub component_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub init: Option<bool>,
+    /// Lane count for bundlers/unbundlers (None = the default 8).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bits: Option<u32>,
     #[serde(default)]
     pub pos: [f32; 2],
 }
@@ -92,6 +95,9 @@ pub struct ProjectAbstraction {
     /// without an entry lay out automatically (inputs left, outputs right).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub port_layout: HashMap<String, PortSpot>,
+    /// Interface pins that carry a whole bundle: pin name → lane count.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub bundle_pins: HashMap<String, u32>,
 }
 
 /// A port's spot on the closed rectangle: an edge plus a 0..1 fraction
@@ -161,6 +167,11 @@ pub struct Segment {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct WireNet {
     pub id: WireNetId,
+    /// A bundle net carries a whole bundle between bundle ports; it can
+    /// never mix with signal wires. Purely visual+structural — the engine
+    /// sees the individual lanes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bundle: bool,
     /// The output port that drives this net. None if unconnected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<PortRef>,
@@ -207,12 +218,14 @@ mod tests {
             abstractions: vec![],
             components: vec![
                 ProjectComponent {
+                    bits: None,
                     id: "clk_1".into(),
                     component_type: "clk".into(),
                     init: None,
                     pos: [0.0, 0.0],
                 },
                 ProjectComponent {
+                    bits: None,
                     id: "dff_1".into(),
                     component_type: "dff".into(),
                     init: Some(true),
@@ -233,6 +246,7 @@ mod tests {
     #[test]
     fn round_trip_wire_net() {
         let net = WireNet {
+            bundle: false,
             id: "w1".into(),
             source: Some(PortRef {
                 component_id: "clk_1".into(),
@@ -280,6 +294,7 @@ mod tests {
             name: "test".into(),
             steps: 0,
             abstractions: vec![ProjectAbstraction {
+                bundle_pins: HashMap::new(),
                 pin_positions: HashMap::new(),
                 port_layout: HashMap::new(),
                 notes: vec![],
@@ -294,12 +309,14 @@ mod tests {
                 width: 140.0,
                 height: 70.0,
                 components: vec![ProjectComponent {
+                    bits: None,
                     id: "gate_1".into(),
                     component_type: "nand".into(),
                     init: None,
                     pos: [50.0, 30.0],
                 }],
                 wire_nets: vec![WireNet {
+                    bundle: false,
                     id: "aw1".into(),
                     source: Some(PortRef {
                         component_id: "INPUT:x".into(),
@@ -384,6 +401,7 @@ mod tests {
     #[test]
     fn wire_net_with_no_source() {
         let net = WireNet {
+            bundle: false,
             id: "orphan".into(),
             source: None,
             sinks: vec![],
@@ -402,6 +420,7 @@ mod tests {
     #[test]
     fn direct_port_to_port_segment() {
         let net = WireNet {
+            bundle: false,
             id: "direct".into(),
             source: Some(PortRef {
                 component_id: "c1".into(),

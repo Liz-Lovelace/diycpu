@@ -175,6 +175,8 @@ pub enum PromptAction {
     SetAbstractionDim { index: usize, which: usize },
     /// Type a size for the image dialog (which: 0 = width, 1 = height).
     SetImageDim { id: String, which: usize },
+    /// Lane count for a bundler/unbundler.
+    SetBundleWidth { id: String },
     /// Name for a fresh project directory in the projects folder.
     NewProject,
     /// Name for a copy of the current project in the projects folder.
@@ -726,6 +728,8 @@ impl App {
             "nand".to_string(),
             "dff".to_string(),
             "const".to_string(),
+            "bundle".to_string(),
+            "unbundle".to_string(),
             "note".to_string(),
             "image".to_string(),
         ];
@@ -809,10 +813,43 @@ impl App {
         }
         let (components, _) = self.editor.sheet_data();
         let comp = components.iter().find(|c| c.id == port.component_id)?;
-        layout::type_ports(&self.editor.project.abstractions, &comp.component_type)?
+        layout::component_port_info(&self.editor.project.abstractions, comp)?
             .into_iter()
             .find(|p| p.name == port.port_name)
             .map(|p| p.kind)
+    }
+
+    /// Signal or bundle, for any port on the current sheet.
+    pub fn port_lane(&self, port: &PortRef) -> Option<layout::WireKind> {
+        let (components, _) = self.editor.sheet_data();
+        layout::wire_kind_any(
+            &self.editor.project.abstractions,
+            components,
+            self.interface(),
+            port,
+        )
+    }
+
+    /// The lane (signal / bundle) the wire being drawn from `anchor` is in.
+    fn anchor_lane(&self, anchor: &WirePoint) -> layout::WireKind {
+        match anchor {
+            WirePoint::Port(p) => self.port_lane(p).unwrap_or(layout::WireKind::Signal),
+            WirePoint::Junction { net_id, .. } => {
+                let (_, wire_nets) = self.editor.sheet_data();
+                let w = wire_nets
+                    .iter()
+                    .find(|n| &n.id == net_id)
+                    .filter(|n| n.bundle)
+                    .and_then(|n| {
+                        n.source
+                            .as_ref()
+                            .and_then(|s| self.port_lane(s))
+                            .or(Some(layout::WireKind::Bundle(0)))
+                    });
+                w.unwrap_or(layout::WireKind::Signal)
+            }
+            WirePoint::New(_) => layout::WireKind::Signal,
+        }
     }
 
     /// Does the wire being drawn already carry a driving source?
@@ -882,6 +919,15 @@ impl App {
                 if matches!(anchor, WirePoint::Port(p) if *p == target) {
                     return WireTarget::Free(snap_half(self.cursor_grid()));
                 }
+                // Bundles and single wires never join.
+                let same_lane = matches!(
+                    (self.anchor_lane(anchor), self.port_lane(&target)),
+                    (layout::WireKind::Signal, Some(layout::WireKind::Signal))
+                        | (layout::WireKind::Bundle(_), Some(layout::WireKind::Bundle(_)))
+                );
+                if !same_lane {
+                    return WireTarget::Incompatible;
+                }
                 // Two drivers can't share a wire.
                 if self.anchor_drives(anchor)
                     && self.port_wire_kind(&target) == Some(PortKind::Output)
@@ -898,8 +944,19 @@ impl App {
                 {
                     return WireTarget::Free(snap_half(self.cursor_grid()));
                 }
-                // Merging two driven nets is invalid (unless same source).
+                // Merging two driven nets is invalid (unless same source),
+                // and bundles never join signal wires.
                 let (_, wire_nets) = self.editor.sheet_data();
+                let target_bundle = wire_nets
+                    .iter()
+                    .find(|n| &n.id == net_id)
+                    .map(|n| n.bundle)
+                    .unwrap_or(false);
+                let anchor_bundle =
+                    matches!(self.anchor_lane(anchor), layout::WireKind::Bundle(_));
+                if target_bundle != anchor_bundle {
+                    return WireTarget::Incompatible;
+                }
                 let target_source = wire_nets
                     .iter()
                     .find(|n| &n.id == net_id)
@@ -2392,7 +2449,8 @@ impl App {
             KeyInput::Char(ch) if !self.ctrl => {
                 for c in ch.chars() {
                     let ok = if prompt.identifier {
-                        c.is_ascii_alphanumeric() || c == '_' || c == '-'
+                        // ':' carries the bundle-width suffix in pin prompts.
+                        c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == ':'
                     } else {
                         !c.is_control()
                     };
@@ -2443,8 +2501,25 @@ impl App {
                 } else {
                     PortKind::Output
                 };
-                match self.editor.add_interface_pin(kind, &name) {
-                    Ok(()) => self.info(format!("Added pin \"{name}\"")),
+                // "name:8" makes a bundle pin carrying 8 lines.
+                let (pin_name, bundle) = match name.split_once(':') {
+                    Some((n, w)) => match w.parse::<u32>() {
+                        Ok(w) => (n.to_string(), Some(w)),
+                        Err(_) => {
+                            self.error("After the colon goes the number of lines, e.g. data:8");
+                            self.prompt = Some(prompt);
+                            return;
+                        }
+                    },
+                    None => (name.clone(), None),
+                };
+                match self.editor.add_interface_pin(kind, &pin_name, bundle) {
+                    Ok(()) => match bundle {
+                        Some(w) => {
+                            self.info(format!("Added bundle pin \"{pin_name}\" ({w} lines)"))
+                        }
+                        None => self.info(format!("Added pin \"{pin_name}\"")),
+                    },
                     Err(e) => retry(self, e, prompt),
                 }
             }
@@ -2468,8 +2543,37 @@ impl App {
                 Err(e) => retry(self, e, prompt),
             },
             PromptAction::RenamePin { kind, old } => {
-                match self.editor.rename_interface_pin(kind, &old, &name) {
-                    Ok(()) => self.info(format!("Renamed pin to \"{name}\"")),
+                let (pin_name, bundle) = match name.split_once(':') {
+                    Some((n, w)) => match w.parse::<u32>() {
+                        Ok(w) => (n.to_string(), Some(Some(w))),
+                        Err(_) => {
+                            self.error("After the colon goes the number of lines, e.g. data:8");
+                            self.prompt = Some(prompt);
+                            return;
+                        }
+                    },
+                    // A plain rename keeps the pin's bundling as it is.
+                    None => (name.clone(), None),
+                };
+                let renamed = if pin_name == old {
+                    Ok(())
+                } else {
+                    self.editor.rename_interface_pin(kind, &old, &pin_name)
+                };
+                match renamed {
+                    Ok(()) => {
+                        if let Some(width) = bundle {
+                            match self.editor.set_pin_bundle_width(&pin_name, width) {
+                                Ok(()) => self.info(format!(
+                                    "Pin \"{pin_name}\" now carries {} lines — its wires were disconnected",
+                                    width.unwrap_or(0)
+                                )),
+                                Err(e) => self.error(e.to_string()),
+                            }
+                        } else {
+                            self.info(format!("Renamed pin to \"{pin_name}\""));
+                        }
+                    }
                     Err(e) => retry(self, e, prompt),
                 }
             }
@@ -2483,6 +2587,19 @@ impl App {
                 Ok(()) => self.info(format!("Project renamed to \"{name}\"")),
                 Err(e) => retry(self, e, prompt),
             },
+            PromptAction::SetBundleWidth { id } => {
+                let Ok(width) = name.parse::<u32>() else {
+                    self.error("Enter a number of lines (2–32)");
+                    self.prompt = Some(prompt);
+                    return;
+                };
+                match self.editor.set_bundle_width(&id, width) {
+                    Ok(()) => self.info(format!(
+                        "{width} lines — wires on removed or resized ports were disconnected"
+                    )),
+                    Err(e) => retry(self, e, prompt),
+                }
+            }
             PromptAction::NewProject => {
                 let create = || -> Result<PathBuf, String> {
                     let base = projects_base_dir().ok_or("No home folder found")?;
@@ -2588,8 +2705,8 @@ impl App {
         self.gesture = Gesture::Idle;
         self.prompt = Some(Prompt {
             title: match kind {
-                PortKind::Input => "Name the input pin".into(),
-                PortKind::Output => "Name the output pin".into(),
+                PortKind::Input => "Name the input pin (name:8 for a bundle)".into(),
+                PortKind::Output => "Name the output pin (name:8 for a bundle)".into(),
             },
             value: String::new(),
             action: match kind {
@@ -2874,6 +2991,55 @@ pub fn starter_project() -> Project {
         Ok(ed.project)
     }
     build().unwrap_or_else(|_| Editor::empty().project)
+}
+
+/// The true driver behind a port, for run-mode display: an unbundler's
+/// lane output resolves through the sheet's bundle wiring to whatever
+/// feeds that lane (chains included). Ordinary ports return themselves.
+/// None means "no defined driver here" — render neutral.
+pub fn resolve_lane_display(
+    components: &[diycpu::project::ProjectComponent],
+    wire_nets: &[diycpu::project::WireNet],
+    port: &PortRef,
+    depth: usize,
+) -> Option<PortRef> {
+    if depth > 16 {
+        return None;
+    }
+    let comp = components.iter().find(|c| c.id == port.component_id)?;
+    if comp.component_type != "unbundle" {
+        return Some(port.clone());
+    }
+    let lane = &port.port_name;
+    let feed = wire_nets
+        .iter()
+        .filter(|n| n.bundle)
+        .find(|n| {
+            n.sinks
+                .iter()
+                .any(|s| s.component_id == comp.id && s.port_name == "bundle")
+        })
+        .and_then(|n| n.source.clone())?;
+    match components.iter().find(|c| c.id == feed.component_id) {
+        Some(c) if c.component_type == "bundle" => {
+            let src = wire_nets
+                .iter()
+                .filter(|n| !n.bundle)
+                .find(|n| {
+                    n.sinks
+                        .iter()
+                        .any(|s| s.component_id == c.id && &s.port_name == lane)
+                })
+                .and_then(|n| n.source.clone())?;
+            resolve_lane_display(components, wire_nets, &src, depth + 1)
+        }
+        // An instance's bundle output: its per-lane engine port.
+        Some(_) => Some(PortRef {
+            component_id: feed.component_id.clone(),
+            port_name: format!("{}__b{lane}", feed.port_name),
+        }),
+        None => None, // fed by an interface pin: no unique value here
+    }
 }
 
 pub fn load_project(path: &std::path::Path) -> Result<(Project, Vec<String>), String> {
@@ -3575,6 +3741,7 @@ impl App {
             id: String::new(),
             component_type: def.name.clone(),
             init: None,
+            bits: None,
             pos: [0.0, 0.0],
         };
         let ports = layout::component_ports(&abstractions, &synthetic)
@@ -3759,6 +3926,8 @@ pub enum CogAction {
     EditNote { id: String },
     /// Flip a dff/const start value (the face shows it immediately).
     ToggleInit { id: String },
+    /// Prompt for a bundler/unbundler's lane count.
+    BundleWidth { id: String },
 }
 
 /// The gear button's screen-space size.
@@ -3816,6 +3985,9 @@ impl App {
                 let rect = layout::footprint(&self.editor.project.abstractions, comp);
                 let action = match comp.component_type.as_str() {
                     "dff" | "const" => CogAction::ToggleInit {
+                        id: comp.id.clone(),
+                    },
+                    "bundle" | "unbundle" => CogAction::BundleWidth {
                         id: comp.id.clone(),
                     },
                     "nand" | "clk" => return None, // nothing to configure
@@ -3901,6 +4073,22 @@ impl App {
                     title: "Edit note (empty text removes it)".into(),
                     value: text,
                     action: PromptAction::EditNote { id },
+                    identifier: false,
+                });
+            }
+            CogAction::BundleWidth { id } => {
+                let current = {
+                    let (components, _) = self.editor.sheet_data();
+                    components
+                        .iter()
+                        .find(|c| c.id == id)
+                        .map(layout::bits_of)
+                        .unwrap_or(8)
+                };
+                self.prompt = Some(Prompt {
+                    title: "Number of lines in the bundle (2–32)".into(),
+                    value: format!("{current}"),
+                    action: PromptAction::SetBundleWidth { id },
                     identifier: false,
                 });
             }
@@ -4874,5 +5062,105 @@ mod round9_tests {
             d.app.status.text
         );
         assert!(d.app.editor.project.wire_nets.is_empty(), "nothing was created");
+    }
+}
+
+#[cfg(test)]
+mod bundle_gui_tests {
+    use super::tests::*;
+    use super::*;
+
+    #[test]
+    fn bundle_wire_draws_between_bundle_ports_only() {
+        let mut d = Driver::new();
+        d.place("bundle", [2.0, 5.0]);
+        d.place("unbundle", [8.0, 5.0]);
+        d.place("nand", [14.0, 2.0]);
+
+        // Hovering a signal port while dragging a bundle wire reads as
+        // incompatible before the editor even gets asked.
+        d.move_to(port_at(&d.app, "bundle_1", "bundle"));
+        d.app.left_pressed();
+        d.move_to(port_at(&d.app, "nand_1", "a"));
+        assert!(matches!(d.app.wire_target(), WireTarget::Incompatible));
+        d.app.handle_key(KeyInput::Escape);
+
+        // Bundle port to bundle port connects and flags the net.
+        d.drag(
+            port_at(&d.app, "bundle_1", "bundle"),
+            port_at(&d.app, "unbundle_1", "bundle"),
+        );
+        let nets = &d.app.editor.project.wire_nets;
+        assert_eq!(nets.len(), 1, "{}", d.app.status.text);
+        assert!(nets[0].bundle);
+
+        // And lanes still take ordinary wires.
+        d.drag(
+            port_at(&d.app, "unbundle_1", "0"),
+            port_at(&d.app, "nand_1", "a"),
+        );
+        assert_eq!(d.app.editor.project.wire_nets.len(), 2);
+        assert!(!d.app.editor.project.wire_nets[1].bundle);
+    }
+
+    #[test]
+    fn cog_on_a_bundler_prompts_for_lanes() {
+        let mut d = Driver::new();
+        d.place("bundle", [4.0, 2.0]);
+        d.move_to(center_of(&d.app, "bundle_1"));
+        let (rect, action) = d.app.cog().expect("bundlers have settings");
+        assert_eq!(
+            action,
+            CogAction::BundleWidth {
+                id: "bundle_1".into()
+            }
+        );
+        d.app.mouse_moved([rect.x + rect.w / 2.0, rect.y + rect.h / 2.0]);
+        d.app.left_pressed();
+        assert!(d.app.prompt.is_some());
+        d.app.prompt.as_mut().unwrap().value.clear();
+        d.type_text("4");
+        d.app.handle_key(KeyInput::Enter);
+        assert_eq!(d.app.editor.project.components[0].bits, Some(4));
+        // The body resized with the lane count.
+        let r = diycpu::layout::footprint(
+            &d.app.editor.project.abstractions,
+            &d.app.editor.project.components[0],
+        );
+        assert_eq!(r.h, 4.0);
+        // A bundle of one is refused, with the prompt kept for a retry.
+        d.move_to(center_of(&d.app, "bundle_1"));
+        let (rect, _) = d.app.cog().unwrap();
+        d.app.mouse_moved([rect.x + rect.w / 2.0, rect.y + rect.h / 2.0]);
+        d.app.left_pressed();
+        d.app.prompt.as_mut().unwrap().value.clear();
+        d.type_text("1");
+        d.app.handle_key(KeyInput::Enter);
+        assert!(d.app.status.is_error);
+        assert_eq!(d.app.editor.project.components[0].bits, Some(4));
+        d.app.handle_key(KeyInput::Escape);
+    }
+
+    #[test]
+    fn bundle_pins_come_from_the_name_colon_width_syntax() {
+        let mut d = Driver::new();
+        d.app.action_new_abstraction();
+        d.type_text("bus");
+        d.app.handle_key(KeyInput::Enter);
+        d.app.action_add_pin(PortKind::Input);
+        d.type_text("data:8");
+        d.app.handle_key(KeyInput::Enter);
+        assert!(!d.app.status.is_error, "{}", d.app.status.text);
+        let def = &d.app.editor.project.abstractions[0];
+        assert_eq!(def.inputs, vec!["data".to_string()]);
+        assert_eq!(def.bundle_pins.get("data"), Some(&8));
+
+        // A bad width keeps the prompt for a retry.
+        d.app.action_add_pin(PortKind::Output);
+        d.type_text("q:1");
+        d.app.handle_key(KeyInput::Enter);
+        assert!(d.app.status.is_error);
+        assert!(d.app.prompt.is_some());
+        d.app.handle_key(KeyInput::Escape);
     }
 }

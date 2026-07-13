@@ -737,15 +737,26 @@ impl Renderer {
         }
     }
 
-    /// The display color of a whole net.
+    /// The display color of a whole net. Bundles carry many values, so
+    /// they stay neutral; signal nets fed by an unbundler resolve through
+    /// the bundle wiring to their true driver.
     fn net_color(&self, app: &App, ctx: &SheetCtx, net: &WireNet) -> Color {
+        if net.bundle {
+            return theme::wire();
+        }
         if let (Some(path), Mode::Run(session)) = (&ctx.sim_path, &app.mode) {
             let energized = net.source.as_ref().and_then(|src| {
                 if src.component_id.starts_with(diycpu::convert::INPUT_PREFIX) {
                     return None; // pin values arrive via the instance inputs
                 }
+                let src = crate::app::resolve_lane_display(
+                    ctx.components,
+                    ctx.wire_nets,
+                    src,
+                    0,
+                )?;
                 let comp = ctx.components.iter().find(|c| c.id == src.component_id)?;
-                session.port_value_at(path, is_primitive(&comp.component_type), src)
+                session.port_value_at(path, is_primitive(&comp.component_type), &src)
             });
             return match energized {
                 Some(true) => theme::wire_on(),
@@ -765,6 +776,13 @@ impl Renderer {
 
         for net in wire_nets {
             let color = self.net_color(app, ctx, net);
+            // Bundles draw as a wide rail with a light core: visibly "many
+            // wires running together".
+            let width = if net.bundle {
+                (6.0 * zoom).clamp(2.5, 10.0)
+            } else {
+                width
+            };
 
             for i in 0..net.segments.len() {
                 let Some(pts) =
@@ -794,6 +812,50 @@ impl Renderer {
                     }
                 }
                 canvas.stroke_path(&p, &paint);
+                if net.bundle {
+                    let mut core = Paint::color(theme::canvas_bg());
+                    core.set_line_width((width * 0.3).max(1.0));
+                    core.set_line_join(femtovg::LineJoin::Round);
+                    canvas.stroke_path(&p, &core);
+                }
+            }
+
+            // The classic bus tick with the lane count, on the first segment.
+            if net.bundle && zoom >= 0.45 {
+                if let Some(pts) =
+                    layout::route_segment(abstractions, components, ctx.interface, net, 0)
+                {
+                    if let [a, b] = pts[..] {
+                        let m = ctx.view.to_screen([(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0]);
+                        let t = (9.0 * zoom).clamp(6.0, 13.0);
+                        let mut tick = Path::new();
+                        tick.move_to(m[0] - t * 0.4, m[1] + t * 0.6);
+                        tick.line_to(m[0] + t * 0.4, m[1] - t * 0.6);
+                        let mut tp = Paint::color(theme::wire());
+                        tp.set_line_width(1.5);
+                        canvas.stroke_path(&tick, &tp);
+                        let w = net
+                            .source
+                            .as_ref()
+                            .and_then(|s| app.port_lane(s))
+                            .and_then(|k| match k {
+                                layout::WireKind::Bundle(w) => Some(w),
+                                layout::WireKind::Signal => None,
+                            });
+                        if let Some(w) = w {
+                            self.text(
+                                canvas,
+                                m[0] + t * 0.7,
+                                m[1] - t * 0.6,
+                                &format!("{w}"),
+                                t,
+                                theme::text_dim(),
+                                Align::Left,
+                                Baseline::Middle,
+                            );
+                        }
+                    }
+                }
             }
 
             for junction in &net.junctions {
@@ -881,8 +943,23 @@ impl Renderer {
         // The exact same straight line the committed wire will get.
         let pts = layout::route(from_pos, end);
         let zoom = app.camera.zoom;
+        let bundle_preview = match anchor {
+            diycpu::editor::WirePoint::Port(p) => matches!(
+                app.port_lane(p),
+                Some(layout::WireKind::Bundle(_))
+            ),
+            diycpu::editor::WirePoint::Junction { net_id, .. } => wire_nets
+                .iter()
+                .find(|n| &n.id == net_id)
+                .is_some_and(|n| n.bundle),
+            _ => false,
+        };
         let mut paint = Paint::color(color);
-        paint.set_line_width((2.5 * zoom).clamp(1.5, 4.5));
+        paint.set_line_width(if bundle_preview {
+            (6.0 * zoom).clamp(2.5, 10.0)
+        } else {
+            (2.5 * zoom).clamp(1.5, 4.5)
+        });
         paint.set_line_join(femtovg::LineJoin::Round);
         paint.set_line_cap(femtovg::LineCap::Round);
         let mut p = Path::new();
@@ -1048,7 +1125,10 @@ impl Renderer {
             canvas.set_global_alpha(chrome_alpha);
 
             let label_size = (13.0 * zoom).clamp(5.0, 22.0);
-            if label_size >= 5.0 && !is_primitive(&comp.component_type) {
+            if label_size >= 5.0
+                && !is_primitive(&comp.component_type)
+                && !layout::is_bundle_component(&comp.component_type)
+            {
                 self.text(
                     canvas,
                     tl[0] + w / 2.0,
@@ -1062,6 +1142,8 @@ impl Renderer {
             }
 
             match comp.component_type.as_str() {
+                "bundle" => self.draw_bundle_glyph(canvas, zoom, tl, w, h, false),
+                "unbundle" => self.draw_bundle_glyph(canvas, zoom, tl, w, h, true),
                 "clk" => self.draw_clock_glyph(canvas, zoom, tl, w, h),
                 "nand" => self.draw_nand_glyph(canvas, zoom, tl, w, h),
                 "const" => {
@@ -1168,11 +1250,23 @@ impl Renderer {
                         component_id: comp.id.clone(),
                         port_name: port.info.name.clone(),
                     };
-                    match session.port_value_at(
-                        path,
-                        is_primitive(&comp.component_type),
+                    // Unbundler lanes resolve to their true driver.
+                    let value = crate::app::resolve_lane_display(
+                        ctx.components,
+                        ctx.wire_nets,
                         &port_ref,
-                    ) {
+                        0,
+                    )
+                    .and_then(|src| {
+                        let is_prim = ctx
+                            .components
+                            .iter()
+                            .find(|c| c.id == src.component_id)
+                            .map(|c| is_primitive(&c.component_type))
+                            .unwrap_or(true);
+                        session.port_value_at(path, is_prim, &src)
+                    });
+                    match value {
                         Some(true) => theme::value_on(),
                         Some(false) => theme::wire_off(),
                         None => theme::port_fill_output(),
@@ -1182,8 +1276,15 @@ impl Renderer {
                 (_, _, PortKind::Input) => theme::port_fill_input(),
             };
 
+            // Bundle ports are square: a different socket for a different
+            // kind of plug.
             let mut p = Path::new();
-            p.circle(s[0], s[1], r);
+            match port.info.wire {
+                layout::WireKind::Bundle(_) => {
+                    p.rounded_rect(s[0] - r, s[1] - r, r * 2.0, r * 2.0, r * 0.3)
+                }
+                layout::WireKind::Signal => p.circle(s[0], s[1], r),
+            }
             canvas.fill_path(&p, &Paint::color(fill));
             let mut ring = Paint::color(if hovered {
                 theme::port_hover()
@@ -1228,6 +1329,46 @@ impl Renderer {
                 }
             }
         }
+    }
+
+    /// Many thin lines gathering into one thick rail (mirrored for the
+    /// unbundler).
+    #[allow(clippy::too_many_arguments)]
+    fn draw_bundle_glyph(
+        &self,
+        canvas: &mut Canvas<OpenGl>,
+        zoom: f32,
+        tl: [f32; 2],
+        w: f32,
+        h: f32,
+        unbundle: bool,
+    ) {
+        let cx = tl[0] + w / 2.0;
+        let cy = tl[1] + h / 2.0;
+        let span = (h * 0.28).min(w * 1.2);
+        let reach = w * 0.26;
+        let (many_x, one_x) = if unbundle {
+            (cx + reach, cx - reach)
+        } else {
+            (cx - reach, cx + reach)
+        };
+        let mut paint = Paint::color(theme::chip_label());
+        paint.set_line_width((1.6 * zoom).clamp(0.5, 2.4));
+        paint.set_line_cap(femtovg::LineCap::Round);
+        let mut p = Path::new();
+        for i in 0..4 {
+            let t = i as f32 / 3.0 - 0.5;
+            p.move_to(many_x, cy + t * span);
+            p.line_to(cx, cy);
+        }
+        canvas.stroke_path(&p, &paint);
+        let mut rail = Path::new();
+        rail.move_to(cx, cy);
+        rail.line_to(one_x, cy);
+        let mut rp = Paint::color(theme::chip_label());
+        rp.set_line_width((4.0 * zoom).clamp(1.5, 6.0));
+        rp.set_line_cap(femtovg::LineCap::Round);
+        canvas.stroke_path(&rail, &rp);
     }
 
     fn draw_clock_glyph(
@@ -1380,22 +1521,31 @@ impl Renderer {
             canvas.stroke_path(&p, &border);
 
             let label_size = (12.0 * zoom).clamp(4.0, 16.0);
+            let label = match pin.bundle {
+                Some(w) => format!("{} ×{w}", pin.name),
+                None => pin.name.clone(),
+            };
             self.text(
                 canvas,
                 tl[0] + plate.w * cell / 2.0,
                 tl[1] + plate.h * cell / 2.0,
-                &pin.name,
+                &label,
                 label_size,
                 theme::pin_label(),
                 Align::Center,
                 Baseline::Middle,
             );
 
-            // Port circle (wire attachment point). Input pins drive wires,
-            // so they get the filled "source" look.
+            // Port circle (wire attachment point) — square when the pin
+            // carries a bundle. Input pins drive wires, so they get the
+            // filled "source" look.
             let r = (5.0 * zoom).clamp(2.5, 8.0);
             let mut c = Path::new();
-            c.circle(s[0], s[1], r);
+            if pin.bundle.is_some() {
+                c.rounded_rect(s[0] - r, s[1] - r, r * 2.0, r * 2.0, r * 0.3);
+            } else {
+                c.circle(s[0], s[1], r);
+            }
             canvas.fill_path(
                 &c,
                 &Paint::color(match pin.io {
@@ -1865,6 +2015,7 @@ impl Renderer {
             id: String::new(),
             component_type: type_name.clone(),
             init: None,
+            bits: None,
             pos: [pos[0] as f32, pos[1] as f32],
         };
         let project = &app.editor.project;
@@ -1979,6 +2130,27 @@ impl Renderer {
                     line.line_to(glyph_x + 14.5, glyph_y + dy);
                     canvas.stroke_path(&line, &cp);
                 }
+            } else if item.type_name == "bundle" || item.type_name == "unbundle" {
+                // Lines gathering into a rail.
+                let flip = item.type_name == "unbundle";
+                let (many_x, one_x) = if flip {
+                    (glyph_x + 18.0, glyph_x)
+                } else {
+                    (glyph_x, glyph_x + 18.0)
+                };
+                let mid = glyph_y;
+                let mut fan = Path::new();
+                for dy in [-6.0, -2.0, 2.0, 6.0] {
+                    fan.move_to(many_x, mid + dy);
+                    fan.line_to(glyph_x + 9.0, mid);
+                }
+                canvas.stroke_path(&fan, &cp);
+                let mut rail = Path::new();
+                rail.move_to(glyph_x + 9.0, mid);
+                rail.line_to(one_x, mid);
+                let mut rp = Paint::color(color);
+                rp.set_line_width(3.0);
+                canvas.stroke_path(&rail, &rp);
             } else if item.type_name == "image" {
                 // A tiny landscape: frame, sun, mountains.
                 let mut frame = Path::new();

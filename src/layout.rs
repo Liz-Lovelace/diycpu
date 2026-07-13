@@ -26,10 +26,29 @@ pub enum PortKind {
     Output,
 }
 
+/// What a port carries: one signal, or a whole bundle of them. Bundle
+/// ports only accept bundle wires and vice versa.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireKind {
+    Signal,
+    Bundle(u32),
+}
+
 #[derive(Debug, Clone)]
 pub struct PortInfo {
     pub name: String,
     pub kind: PortKind,
+    pub wire: WireKind,
+}
+
+/// Lane count of a bundler/unbundler (stored per component; default 8).
+pub fn bits_of(comp: &ProjectComponent) -> u32 {
+    comp.bits.unwrap_or(8).clamp(2, 32)
+}
+
+/// Is this a bundler or unbundler — the GUI-only bus components?
+pub fn is_bundle_component(component_type: &str) -> bool {
+    matches!(component_type, "bundle" | "unbundle")
 }
 
 /// Axis-aligned rectangle in grid units.
@@ -72,8 +91,13 @@ pub fn type_ports(
     let port = |name: &str, kind| PortInfo {
         name: name.to_string(),
         kind,
+        wire: WireKind::Signal,
     };
     match component_type {
+        // Bundlers need the per-component lane count; this type-level view
+        // assumes the default (callers with a component at hand use
+        // `component_port_info`).
+        "bundle" | "unbundle" => Some(bundle_ports(component_type, 8)),
         "clk" | "const" => Some(vec![port("out", PortKind::Output)]),
         "nand" => Some(vec![
             port("a", PortKind::Input),
@@ -87,23 +111,72 @@ pub fn type_ports(
         ]),
         name => {
             let def = abstractions.iter().find(|a| a.name == name)?;
+            let wire_of = |pin: &str| match def.bundle_pins.get(pin) {
+                Some(w) => WireKind::Bundle(*w),
+                None => WireKind::Signal,
+            };
             let mut ports: Vec<PortInfo> = def
                 .inputs
                 .iter()
-                .map(|i| port(i, PortKind::Input))
+                .map(|i| PortInfo {
+                    name: i.clone(),
+                    kind: PortKind::Input,
+                    wire: wire_of(i),
+                })
                 .collect();
             // HashMap order is unstable; sort output names for determinism.
             let mut outs: Vec<&String> = def.outputs.keys().collect();
             outs.sort();
-            ports.extend(outs.into_iter().map(|o| port(o, PortKind::Output)));
+            ports.extend(outs.into_iter().map(|o| PortInfo {
+                name: o.clone(),
+                kind: PortKind::Output,
+                wire: wire_of(o),
+            }));
             Some(ports)
         }
     }
 }
 
+/// The ports of a bundler/unbundler with `bits` lanes: numbered signal
+/// ports on one side, the single bundle port on the other.
+fn bundle_ports(component_type: &str, bits: u32) -> Vec<PortInfo> {
+    let mut ports = Vec::new();
+    let (lane_kind, bundle_kind) = if component_type == "bundle" {
+        (PortKind::Input, PortKind::Output)
+    } else {
+        (PortKind::Output, PortKind::Input)
+    };
+    for k in 0..bits {
+        ports.push(PortInfo {
+            name: format!("{k}"),
+            kind: lane_kind,
+            wire: WireKind::Signal,
+        });
+    }
+    ports.push(PortInfo {
+        name: "bundle".into(),
+        kind: bundle_kind,
+        wire: WireKind::Bundle(bits),
+    });
+    ports
+}
+
+/// The port list of a specific component — like [`type_ports`], but aware
+/// of per-component state (a bundler's lane count).
+pub fn component_port_info(
+    abstractions: &[ProjectAbstraction],
+    comp: &ProjectComponent,
+) -> Option<Vec<PortInfo>> {
+    if is_bundle_component(&comp.component_type) {
+        return Some(bundle_ports(&comp.component_type, bits_of(comp)));
+    }
+    type_ports(abstractions, &comp.component_type)
+}
+
 /// Footprint size in grid units for a component type. None for unknown types.
 pub fn type_size(abstractions: &[ProjectAbstraction], component_type: &str) -> Option<[f32; 2]> {
     match component_type {
+        "bundle" | "unbundle" => Some([2.0, 8.0]),
         "clk" | "const" => Some([2.0, 2.0]),
         "nand" | "dff" => Some([3.0, 2.0]),
         name => {
@@ -122,7 +195,11 @@ pub fn default_abstraction_size(name: &str, n_inputs: usize, n_outputs: usize) -
 
 /// Footprint rectangle of a placed component.
 pub fn footprint(abstractions: &[ProjectAbstraction], comp: &ProjectComponent) -> Rect {
-    let [w, h] = type_size(abstractions, &comp.component_type).unwrap_or([3.0, 2.0]);
+    let [w, h] = if is_bundle_component(&comp.component_type) {
+        [2.0, bits_of(comp) as f32]
+    } else {
+        type_size(abstractions, &comp.component_type).unwrap_or([3.0, 2.0])
+    };
     Rect {
         x: comp.pos[0],
         y: comp.pos[1],
@@ -184,7 +261,7 @@ pub fn component_ports(
     abstractions: &[ProjectAbstraction],
     comp: &ProjectComponent,
 ) -> Vec<PortGeom> {
-    let Some(ports) = type_ports(abstractions, &comp.component_type) else {
+    let Some(ports) = component_port_info(abstractions, comp) else {
         return Vec::new();
     };
     let rect = footprint(abstractions, comp);
@@ -277,6 +354,7 @@ pub fn current_port_spots(
     def: &ProjectAbstraction,
 ) -> Vec<(String, crate::project::PortSide, f32)> {
     let synthetic = ProjectComponent {
+        bits: None,
         id: String::new(),
         component_type: def.name.clone(),
         init: None,
@@ -337,6 +415,8 @@ pub struct PinGeom {
     pub pos: [f32; 2],
     /// Clickable name-plate rectangle next to the pin circle.
     pub plate: Rect,
+    /// Lane count when this pin carries a bundle.
+    pub bundle: Option<u32>,
 }
 
 impl PinGeom {
@@ -420,6 +500,7 @@ pub fn interface_pins(
                 w: 2.2,
                 h: 0.9,
             },
+            bundle: def.bundle_pins.get(name).copied(),
         });
     }
     let mut outs: Vec<&String> = def.outputs.keys().collect();
@@ -440,9 +521,38 @@ pub fn interface_pins(
                 w: 2.2,
                 h: 0.9,
             },
+            bundle: def.bundle_pins.get(name).copied(),
         });
     }
     pins
+}
+
+/// What a port reference on this sheet carries (signal or bundle),
+/// including the pseudo-ports of interface pins. None for unknown refs.
+pub fn wire_kind_any(
+    abstractions: &[ProjectAbstraction],
+    components: &[ProjectComponent],
+    interface: Option<&ProjectAbstraction>,
+    port: &crate::project::PortRef,
+) -> Option<WireKind> {
+    let pin_kind = |name: &str| {
+        let def = interface?;
+        Some(match def.bundle_pins.get(name) {
+            Some(w) => WireKind::Bundle(*w),
+            None => WireKind::Signal,
+        })
+    };
+    if let Some(name) = port.component_id.strip_prefix(crate::convert::INPUT_PREFIX) {
+        return pin_kind(name);
+    }
+    if let Some(name) = port.component_id.strip_prefix(OUTPUT_PREFIX) {
+        return pin_kind(name);
+    }
+    let comp = components.iter().find(|c| c.id == port.component_id)?;
+    component_port_info(abstractions, comp)?
+        .into_iter()
+        .find(|p| p.name == port.port_name)
+        .map(|p| p.wire)
 }
 
 /// Position + exit direction for any port reference on a sheet, including
@@ -939,6 +1049,7 @@ mod tests {
 
     fn comp(id: &str, ty: &str, x: f32, y: f32) -> ProjectComponent {
         ProjectComponent {
+            bits: None,
             id: id.into(),
             component_type: ty.into(),
             init: None,
@@ -948,6 +1059,7 @@ mod tests {
 
     fn abs_not() -> ProjectAbstraction {
         ProjectAbstraction {
+            bundle_pins: HashMap::new(),
             pin_positions: HashMap::new(),
             port_layout: HashMap::new(),
             name: "not".into(),
@@ -1067,6 +1179,7 @@ mod tests {
     fn hit_wire_segment() {
         let comps = vec![comp("c1", "clk", 0.0, 0.0), comp("n1", "nand", 6.0, 0.0)];
         let net = WireNet {
+            bundle: false,
             id: "w1".into(),
             source: Some(PortRef {
                 component_id: "c1".into(),
@@ -1103,6 +1216,7 @@ mod tests {
     #[test]
     fn dangling_segment_resolves_to_none() {
         let net = WireNet {
+            bundle: false,
             id: "w1".into(),
             source: None,
             sinks: vec![],

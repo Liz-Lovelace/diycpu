@@ -28,6 +28,7 @@ point), `--image-dialog`, `--anim-t seconds`.
 | Delete | Select, then Delete/Backspace. Deleting a component cleans up its connections but leaves your routed wires as stubs. |
 | Flip a DFF's start value | Double-click it — the big digit on its face is the stored bit. |
 | Constant signal | The “const” primitive is a toggleable 0/1 source (double-click flips it) — handy for feeding test inputs. Unconnected inputs always read as 0. |
+| Bundles | The “bundle” component gathers its numbered inputs into one **bundle port**; “unbundle” splits one back out. From a bundle port you draw a **bundle wire** — routed exactly like any wire (nodes, branches, box-select), drawn as a wide rail with a ⧸n lane tick — but bundles and single wires never mix, and two bundles only connect when their lane counts match. The cog on a bundler sets its lane count (2–32; there's no bundle of one). Lane k in is lane k out. Abstraction pins carry bundles too: name a pin `data:8` and its port becomes a square 8-line bundle port. The engine never sees any of this — bundles lower to their individual lanes. |
 | Notes | Pick “note” in the palette, click the canvas, type. Double-click a note to edit it (empty text removes it); drag to move; notes can sit anywhere. |
 | Images | Pick “image” in the palette, choose a file (png/jpeg/gif/webp, up to 20 MB — the file is copied into the project's `media/` folder), click to place. Animated GIFs play right on the canvas. Images select, drag, box-select, copy and delete like everything else; the cog on a hovered image opens its settings (swap the file, resize with sliders). Video files (webm) aren't supported. |
 | The cog ⚙ | Hover anything configurable and a little gear appears in its corner — that's where its settings live. On an abstraction instance it opens the layout dialog, on an image the image settings, on a note the text editor, and on a dff/const it flips the start value. |
@@ -64,7 +65,10 @@ level. The title bar shows where you are (`project ▸ alu ▸ adder`).
   connected, so the drop is refused. The vertical order of the
   pins inside is the port order on the closed rectangle outside.
   Double-click a pin's name plate to rename it (every wire and instance
-  follows); click it and press Delete to remove it.
+  follows); click it and press Delete to remove it. Naming a pin
+  `data:8` (on creation or rename) makes it a **bundle pin** carrying 8
+  lines; renaming with a new `:n` re-sizes it (its wires disconnect —
+  the kind changed).
 - **Closed-rectangle layout**: the “Layout” button opens a dialog where
   you drag each port to any edge (top and bottom included); width and
   height have sliders below (click a value to type it) — make a tiny XOR

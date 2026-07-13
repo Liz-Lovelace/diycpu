@@ -41,7 +41,8 @@ pub enum EditError {
     InvalidName(String),
     NameTaken(String),
     NotAnAbstractionSheet,
-    PassthroughNotAllowed,
+    /// The wire would feed a signal combinationally back into itself.
+    CombinationalLoop,
     UnknownJunction(String),
     TwoSources(String),
     InputDoublyWired(String),
@@ -79,8 +80,11 @@ impl fmt::Display for EditError {
             Self::NotAnAbstractionSheet => {
                 write!(f, "Pins can only be edited inside an abstraction")
             }
-            Self::PassthroughNotAllowed => {
-                write!(f, "Route inputs to outputs through at least one component")
+            Self::CombinationalLoop => {
+                write!(
+                    f,
+                    "That would loop a signal straight back into itself — put a flip-flop in the loop"
+                )
             }
             Self::UnknownJunction(id) => write!(f, "That wire node ({id}) no longer exists"),
             Self::TwoSources(existing) => {
@@ -601,6 +605,7 @@ impl Editor {
                 };
             }
             attach_wire(project, sheet, &anchor, &WirePoint::Port(to))?;
+            guard_no_combinational_loop(project, sheet)?;
             Ok(())
         })
     }
@@ -611,7 +616,11 @@ impl Editor {
     /// already-connected input replaces its old connection. Each call is one
     /// undo step, so Ctrl+Z peels wires back click by click.
     pub fn add_wire(&mut self, from: WirePoint, to: WirePoint) -> Result<WireAttach, EditError> {
-        self.mutate(move |project, sheet| attach_wire(project, sheet, &from, &to))
+        self.mutate(move |project, sheet| {
+            let attach = attach_wire(project, sheet, &from, &to)?;
+            guard_no_combinational_loop(project, sheet)?;
+            Ok(attach)
+        })
     }
 
     /// Move a wire node to a new grid position.
@@ -1112,6 +1121,12 @@ impl Editor {
                     }
                     def.inputs.retain(|x| x != &name);
                     let pseudo_id = format!("{}{name}", crate::convert::INPUT_PREFIX);
+                    // Output pins that forwarded this input become unwired.
+                    for target in def.outputs.values_mut() {
+                        if *target == pseudo_id {
+                            target.clear();
+                        }
+                    }
                     for net in def.wire_nets.iter_mut() {
                         net.segments.retain(|seg| {
                             ![&seg.from, &seg.to].iter().any(|e| {
@@ -1327,6 +1342,12 @@ impl Editor {
                             p.port_name = new.clone();
                         }
                     };
+                    // Output pins forwarding this input follow the rename.
+                    for target in def.outputs.values_mut() {
+                        if *target == old_id {
+                            *target = new_id.clone();
+                        }
+                    }
                     for net in def.wire_nets.iter_mut() {
                         if let Some(s) = &mut net.source {
                             rewrite(s);
@@ -2008,9 +2029,8 @@ fn attach_to_output_pin(
     // Find the port that will drive this pin.
     let source_port: PortRef = match other {
         WirePoint::Port(p) => {
-            if p.component_id.starts_with(crate::convert::INPUT_PREFIX) {
-                return Err(EditError::PassthroughNotAllowed);
-            }
+            // kind_of also validates that an INPUT: pseudo-port names a
+            // declared input pin.
             if ctx.kind_of(components, p)? != PortKind::Output {
                 return Err(EditError::NotAnInputAndOutput);
             }
@@ -2021,32 +2041,80 @@ fn attach_to_output_pin(
                 .iter()
                 .find(|n| &n.id == net_id)
                 .ok_or_else(|| EditError::UnknownJunction(net_id.clone()))?;
-            let source = net
-                .source
+            net.source
                 .clone()
-                .ok_or(EditError::OutputPinNeedsSource)?;
-            if source.component_id.starts_with(crate::convert::INPUT_PREFIX) {
-                return Err(EditError::PassthroughNotAllowed);
-            }
-            source
+                .ok_or(EditError::OutputPinNeedsSource)?
         }
         WirePoint::New(_) => return Err(EditError::OutputPinNeedsSource),
     };
 
-    let source_comp = components
-        .iter()
-        .find(|c| c.id == source_port.component_id)
-        .ok_or_else(|| EditError::UnknownComponent(source_port.component_id.clone()))?;
-    let target = if crate::types::is_primitive(&source_comp.component_type) {
-        source_comp.id.clone()
+    // An input pin wired straight into an output pin is a passthrough:
+    // the output simply forwards that input.
+    let target = if source_port.component_id.starts_with(crate::convert::INPUT_PREFIX) {
+        source_port.component_id.clone()
     } else {
-        format!("{}.{}", source_port.component_id, source_port.port_name)
+        let source_comp = components
+            .iter()
+            .find(|c| c.id == source_port.component_id)
+            .ok_or_else(|| EditError::UnknownComponent(source_port.component_id.clone()))?;
+        if crate::types::is_primitive(&source_comp.component_type) {
+            source_comp.id.clone()
+        } else {
+            format!("{}.{}", source_port.component_id, source_port.port_name)
+        }
     };
     project.abstractions[index].outputs.insert(pin_name, target);
     Ok(WireAttach {
         net_id: String::new(),
         new_junction: None,
     })
+}
+
+/// Refuse wire edits that feed a signal combinationally back into itself
+/// (a loop with no flip-flop in it). This runs the real engine pipeline —
+/// convert, expand, toposort — so it can never disagree with Run. The sheet
+/// being edited is checked as its own probe instance, since an abstraction
+/// may not be placed anywhere yet. Pipeline failures for OTHER reasons are
+/// ignored: unfinished circuits are legal editing states, and Run reports
+/// its own errors.
+fn guard_no_combinational_loop(project: &Project, sheet: SheetRef) -> Result<(), EditError> {
+    let probe;
+    let checked: &Project = match sheet {
+        SheetRef::Top => project,
+        SheetRef::Abstraction(i) => {
+            let Some(def) = project.abstractions.get(i) else {
+                return Ok(());
+            };
+            probe = Project {
+                name: "__probe".into(),
+                steps: 1,
+                abstractions: project.abstractions.clone(),
+                components: vec![ProjectComponent {
+                    id: "__probe_instance".into(),
+                    component_type: def.name.clone(),
+                    init: None,
+                    pos: [0.0, 0.0],
+                }],
+                wire_nets: vec![],
+                notes: vec![],
+                images: vec![],
+            };
+            &probe
+        }
+    };
+    let Ok(def) = crate::convert::project_to_circuit(checked) else {
+        return Ok(());
+    };
+    let Ok(expanded) = crate::expander::expand(&def) else {
+        return Ok(());
+    };
+    match crate::compiler::compile(&expanded.def) {
+        Err(
+            crate::compiler::CompileError::CyclicGraph
+            | crate::compiler::CompileError::SelfReference { .. },
+        ) => Err(EditError::CombinationalLoop),
+        _ => Ok(()),
+    }
 }
 
 /// Remove every segment touching `port`, across all nets. Orphaned nodes and
@@ -2348,6 +2416,18 @@ pub fn normalize(project: &mut Project) -> Vec<String> {
         for (pin, target) in a.outputs.iter_mut() {
             if target.is_empty() {
                 continue; // unwired pin — legal while editing
+            }
+            // A passthrough: the output forwards a declared input pin.
+            if let Some(input_name) = target.strip_prefix(crate::convert::INPUT_PREFIX) {
+                if a.inputs.iter().any(|i| i == input_name) {
+                    continue;
+                }
+                notes.push(format!(
+                    "abstraction \"{}\": output \"{pin}\" forwarded missing input \"{input_name}\"; unwired it",
+                    a.name
+                ));
+                target.clear();
+                continue;
             }
             let port = layout::output_target_port(target);
             let comp = comps.iter().find(|c| c.id == port.component_id);
@@ -3348,12 +3428,15 @@ mod tests {
             Some(&"nand_1".to_string())
         );
 
-        // Direct input→output passthrough is rejected.
+        // Direct input→output passthrough is allowed: the output pin
+        // simply forwards the input. (It replaces the nand_1 wiring.)
+        e.connect(pin("INPUT:", "x"), pin("OUTPUT:", "out"), &[])
+            .unwrap();
         assert_eq!(
-            e.connect(pin("INPUT:", "x"), pin("OUTPUT:", "out"), &[])
-                .unwrap_err(),
-            EditError::PassthroughNotAllowed
+            e.project.abstractions[i].outputs.get("out"),
+            Some(&"INPUT:x".to_string())
         );
+        e.undo().unwrap(); // back to the nand-driven output
 
         // The finished abstraction actually works end to end.
         e.open_sheet(SheetRef::Top).unwrap();
@@ -4119,5 +4202,172 @@ mod image_tests {
         assert_ne!(project.images[0].id, project.images[1].id);
         assert_eq!(project.images[1].size[0], 0.5);
         assert_eq!(project.images[1].pos[0], 0.0);
+    }
+}
+
+#[cfg(test)]
+mod passthrough_and_loop_tests {
+    use super::*;
+    use crate::layout::PortKind;
+
+    fn port(c: &str, p: &str) -> PortRef {
+        PortRef {
+            component_id: c.into(),
+            port_name: p.into(),
+        }
+    }
+    fn pin(prefix: &str, name: &str) -> PortRef {
+        PortRef {
+            component_id: format!("{prefix}{name}"),
+            port_name: name.into(),
+        }
+    }
+
+    /// A pure wire abstraction: output q forwards input x, no components.
+    fn make_buf(e: &mut Editor) -> usize {
+        let i = e.create_abstraction("buf").unwrap();
+        e.open_sheet(SheetRef::Abstraction(i)).unwrap();
+        e.add_interface_pin(PortKind::Input, "x").unwrap();
+        e.add_interface_pin(PortKind::Output, "q").unwrap();
+        e.connect(pin("INPUT:", "x"), pin("OUTPUT:", "q"), &[]).unwrap();
+        assert_eq!(
+            e.project.abstractions[i].outputs.get("q"),
+            Some(&"INPUT:x".to_string())
+        );
+        e.open_sheet(SheetRef::Top).unwrap();
+        i
+    }
+
+    #[test]
+    fn passthrough_resolves_through_the_engine() {
+        let mut e = Editor::empty();
+        make_buf(&mut e);
+        e.place_component("dff", [0, 0]).unwrap();
+        e.place_component("buf", [6, 0]).unwrap();
+        e.connect(port("dff_1", "out"), port("buf_1", "x"), &[]).unwrap();
+
+        let def = crate::convert::project_to_circuit(&e.project).unwrap();
+        let expanded = crate::expander::expand(&def).unwrap();
+        // The instance's output IS the signal wired into its input.
+        assert_eq!(expanded.aliases.get("buf_1.q"), Some(&"dff_1".to_string()));
+        crate::compiler::compile(&expanded.def).unwrap();
+    }
+
+    #[test]
+    fn passthrough_chains_across_nesting_and_consumers() {
+        let mut e = Editor::empty();
+        make_buf(&mut e);
+        // buf2 wraps buf: r forwards y through the nested passthrough.
+        let i2 = e.create_abstraction("buf2").unwrap();
+        e.open_sheet(SheetRef::Abstraction(i2)).unwrap();
+        e.add_interface_pin(PortKind::Input, "y").unwrap();
+        e.add_interface_pin(PortKind::Output, "r").unwrap();
+        e.place_component("buf", [4, 0]).unwrap();
+        e.connect(pin("INPUT:", "y"), port("buf_1", "x"), &[]).unwrap();
+        e.connect(port("buf_1", "q"), pin("OUTPUT:", "r"), &[]).unwrap();
+        e.open_sheet(SheetRef::Top).unwrap();
+
+        e.place_component("dff", [0, 0]).unwrap();
+        e.place_component("buf2", [6, 0]).unwrap();
+        e.place_component("nand", [12, 0]).unwrap();
+        e.connect(port("dff_1", "out"), port("buf2_1", "y"), &[]).unwrap();
+        e.connect(port("buf2_1", "r"), port("nand_1", "a"), &[]).unwrap();
+
+        let def = crate::convert::project_to_circuit(&e.project).unwrap();
+        let expanded = crate::expander::expand(&def).unwrap();
+        assert_eq!(
+            expanded.aliases.get("buf2_1.r"),
+            Some(&"dff_1".to_string()),
+            "the alias climbs through both passthrough levels"
+        );
+        // The consumer's input followed the whole alias chain to the flat
+        // driver.
+        let nand = expanded
+            .def
+            .components
+            .iter()
+            .find(|c| c.name == "nand_1")
+            .unwrap();
+        assert_eq!(nand.inputs.get("a"), Some(&"dff_1".to_string()));
+        crate::compiler::compile(&expanded.def).unwrap();
+    }
+
+    #[test]
+    fn combinational_loops_are_refused_when_wired() {
+        let mut e = Editor::empty();
+        e.place_component("nand", [0, 0]).unwrap();
+        // Straight self-loop.
+        assert_eq!(
+            e.connect(port("nand_1", "out"), port("nand_1", "a"), &[]).unwrap_err(),
+            EditError::CombinationalLoop
+        );
+        assert!(e.project.wire_nets.is_empty(), "the refused wire rolled back");
+
+        // A loop through a second gate.
+        e.place_component("nand", [6, 0]).unwrap();
+        e.connect(port("nand_1", "out"), port("nand_2", "a"), &[]).unwrap();
+        assert_eq!(
+            e.connect(port("nand_2", "out"), port("nand_1", "a"), &[]).unwrap_err(),
+            EditError::CombinationalLoop
+        );
+
+        // The same loop with a flip-flop in it is a legitimate register.
+        e.place_component("dff", [12, 0]).unwrap();
+        e.connect(port("nand_2", "out"), port("dff_1", "d"), &[]).unwrap();
+        e.connect(port("dff_1", "out"), port("nand_1", "a"), &[]).unwrap();
+    }
+
+    #[test]
+    fn loops_are_refused_inside_an_uninstantiated_abstraction() {
+        let mut e = Editor::empty();
+        let i = e.create_abstraction("loopy").unwrap();
+        e.open_sheet(SheetRef::Abstraction(i)).unwrap();
+        e.place_component("nand", [0, 0]).unwrap();
+        // No instance of "loopy" exists anywhere, but the loop is still
+        // caught (the guard probes the sheet as its own instance).
+        assert_eq!(
+            e.connect(port("nand_1", "out"), port("nand_1", "b"), &[]).unwrap_err(),
+            EditError::CombinationalLoop
+        );
+        assert!(e.project.abstractions[i].wire_nets.is_empty());
+    }
+
+    #[test]
+    fn renaming_and_removing_a_forwarded_input_updates_the_output() {
+        let mut e = Editor::empty();
+        let i = make_buf(&mut e);
+        e.open_sheet(SheetRef::Abstraction(i)).unwrap();
+        e.rename_interface_pin(PortKind::Input, "x", "z").unwrap();
+        assert_eq!(
+            e.project.abstractions[i].outputs.get("q"),
+            Some(&"INPUT:z".to_string())
+        );
+        e.remove_interface_pin(PortKind::Input, "z").unwrap();
+        assert_eq!(
+            e.project.abstractions[i].outputs.get("q"),
+            Some(&String::new()),
+            "the forwarding output became unwired"
+        );
+    }
+
+    #[test]
+    fn normalize_keeps_valid_passthroughs_and_clears_ghosts() {
+        let json = r#"{
+            "name": "t", "steps": 1, "components": [],
+            "abstractions": [{
+                "name": "buf", "inputs": ["x"],
+                "outputs": {"q": "INPUT:x", "r": "INPUT:ghost"},
+                "components": []
+            }]
+        }"#;
+        let mut project: Project = serde_json::from_str(json).unwrap();
+        let notes = normalize(&mut project);
+        assert_eq!(
+            project.abstractions[0].outputs.get("q"),
+            Some(&"INPUT:x".to_string()),
+            "a declared input stays forwarded"
+        );
+        assert_eq!(project.abstractions[0].outputs.get("r"), Some(&String::new()));
+        assert!(notes.iter().any(|n| n.contains("ghost")));
     }
 }

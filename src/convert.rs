@@ -174,7 +174,18 @@ fn convert_abstraction(pa: &ProjectAbstraction) -> Result<AbstractionDef, Conver
     Ok(AbstractionDef {
         name: pa.name.clone(),
         inputs: pa.inputs.clone(),
-        outputs: pa.outputs.clone(),
+        // Unwired pins are dropped (an editing state, not an error);
+        // `INPUT:x` passthrough targets lower to the bare input name the
+        // expander resolves through the instance's bindings.
+        outputs: pa
+            .outputs
+            .iter()
+            .filter(|(_, target)| !target.is_empty())
+            .map(|(name, target)| {
+                let lowered = target.strip_prefix(INPUT_PREFIX).unwrap_or(target);
+                (name.clone(), lowered.to_string())
+            })
+            .collect(),
         components,
     })
 }

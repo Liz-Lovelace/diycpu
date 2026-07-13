@@ -202,6 +202,11 @@ impl Shell {
                     }
                 }
             });
+        // The projects folder exists from the very first launch, whatever
+        // path the session was started with.
+        if let Some(base) = app::projects_base_dir() {
+            let _ = std::fs::create_dir_all(&base);
+        }
         let mut app = App::new(project_path);
         app.window_size = [size.width as f32, size.height as f32];
         if let Some(sheet_name) = &args.sheet {

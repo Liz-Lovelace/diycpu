@@ -869,6 +869,45 @@ pub fn hit_test(
     Hit::Empty
 }
 
+/// Does the segment a—b touch the rectangle at all (endpoint inside, or
+/// crossing an edge)? Used by box-select so grabbing any part of a wire
+/// grabs the wire — the same feel components have.
+pub fn segment_intersects_rect(a: [f32; 2], b: [f32; 2], r: &Rect) -> bool {
+    if r.contains(a) || r.contains(b) {
+        return true;
+    }
+    let corners = [
+        [r.x, r.y],
+        [r.x + r.w, r.y],
+        [r.x + r.w, r.y + r.h],
+        [r.x, r.y + r.h],
+    ];
+    (0..4).any(|i| segments_cross(a, b, corners[i], corners[(i + 1) % 4]))
+}
+
+/// Proper or touching intersection of segments p1—p2 and p3—p4.
+fn segments_cross(p1: [f32; 2], p2: [f32; 2], p3: [f32; 2], p4: [f32; 2]) -> bool {
+    let cross = |a: [f32; 2], b: [f32; 2], c: [f32; 2]| {
+        (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0])
+    };
+    let d1 = cross(p3, p4, p1);
+    let d2 = cross(p3, p4, p2);
+    let d3 = cross(p1, p2, p3);
+    let d4 = cross(p1, p2, p4);
+    if ((d1 > 0.0) != (d2 > 0.0)) && ((d3 > 0.0) != (d4 > 0.0)) {
+        return true;
+    }
+    // Collinear/touching cases.
+    let on = |a: [f32; 2], b: [f32; 2], c: [f32; 2], d: f32| {
+        d.abs() < 1e-6
+            && c[0] >= a[0].min(b[0]) - 1e-6
+            && c[0] <= a[0].max(b[0]) + 1e-6
+            && c[1] >= a[1].min(b[1]) - 1e-6
+            && c[1] <= a[1].max(b[1]) + 1e-6
+    };
+    on(p3, p4, p1, d1) || on(p3, p4, p2, d2) || on(p1, p2, p3, d3) || on(p1, p2, p4, d4)
+}
+
 fn dist(a: [f32; 2], b: [f32; 2]) -> f32 {
     ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2)).sqrt()
 }
@@ -1079,5 +1118,26 @@ mod tests {
             }],
         };
         assert!(route_segment(&[], &[], None, &net, 0).is_none());
+    }
+}
+
+#[cfg(test)]
+mod band_tests {
+    use super::*;
+
+    #[test]
+    fn segment_rect_intersection_matches_the_band_select_feel() {
+        let band = Rect { x: 0.0, y: 0.0, w: 4.0, h: 4.0 };
+        // Crossing straight through — endpoints both outside.
+        assert!(segment_intersects_rect([-2.0, 2.0], [6.0, 2.0], &band));
+        // Diagonal cutting a corner.
+        assert!(segment_intersects_rect([3.0, -1.0], [6.0, 2.0], &band));
+        // One endpoint inside.
+        assert!(segment_intersects_rect([1.0, 1.0], [9.0, 9.0], &band));
+        // Fully inside.
+        assert!(segment_intersects_rect([1.0, 1.0], [2.0, 3.0], &band));
+        // Clear miss alongside.
+        assert!(!segment_intersects_rect([5.0, 0.0], [5.0, 4.0], &band));
+        assert!(!segment_intersects_rect([-1.0, 5.0], [5.0, 5.0], &band));
     }
 }

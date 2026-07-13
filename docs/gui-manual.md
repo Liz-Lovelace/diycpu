@@ -5,8 +5,8 @@ cargo run --features gui --bin diycpu-gui -- [project-dir | project.json]
 ```
 
 Projects are **folders** — `<name>/project.json` plus a `media/` directory
-for pictures — and they all live together in `Documents/diycpu` (or
-`~/diycpu`). Started with no argument, the app opens whichever project you
+for pictures — and they all live together in `~/.local/share/diycpu`
+(the XDG data directory; `$XDG_DATA_HOME` is respected). Started with no argument, the app opens whichever project you
 touched last; on the very first launch it creates a little “welcome”
 blinker for you. Everything autosaves on every change.
 
@@ -21,8 +21,8 @@ point), `--image-dialog`, `--anim-t seconds`.
 |---|---|
 | Place a component | Click it in the palette, then click the canvas. Shift-click the canvas to place several. |
 | Move | Drag a component. Multi-selections move together. |
-| Select | Click a component; Ctrl-click to add/remove; drag on empty canvas for a box select; click a wire to select its net. |
-| Wire | Click or drag from any port. Click a compatible port to connect; click empty canvas to drop a **node** and keep drawing from it; right-click or Esc to stop (everything placed stays). Wires are straight lines (diagonals welcome) — route them your way by placing nodes. Wiring an already-connected input replaces its old connection. |
+| Select | Click a component; Ctrl-click to add/remove; drag on empty canvas for a box select — anything the box touches is selected, wires included. |
+| Wire | Click or drag from any port. Click a compatible port to connect; click empty canvas to drop a **node** and keep drawing from it; right-click or Esc to stop (everything placed stays). Wires are straight lines (diagonals welcome) — route them your way by placing nodes. Wiring an already-connected input replaces its old connection. A wire that would loop a signal combinationally back into itself (no flip-flop in the loop) is refused on the spot instead of failing later at Run. |
 | Wire nodes | Click a node to draw a new branch from it (fan-out). Drag a node to move it. Drag anywhere on a wire to tear a new node out of it and place it in the same motion. Stubs are fine: wires don't need to connect anything to exist. |
 | Wire selection | Wires select like components: click a segment (Ctrl-click adds more), box-select sweeps them up alongside parts, Delete removes exactly what's selected — the wire splits where it was cut. The wire feeding an output pin selects and deletes the same way. |
 | Delete | Select, then Delete/Backspace. Deleting a component cleans up its connections but leaves your routed wires as stubs. |
@@ -57,7 +57,11 @@ level. The title bar shows where you are (`project ▸ alu ▸ adder`).
 - **Pins** are free-floating objects inside the sheet: “+ input” /
   “+ output” create them, and you drag them anywhere you like. Wire from
   an input pin into the circuit like any port; wire a component output
-  into an output pin to define what it emits. The vertical order of the
+  into an output pin to define what it emits. Wiring an input pin
+  **straight into an output pin** is fine — the output simply forwards
+  that input (handy for splitters and plain feed-throughs). A pin can't
+  be dropped on top of a port, node or wire: that would only look
+  connected, so the drop is refused. The vertical order of the
   pins inside is the port order on the closed rectangle outside.
   Double-click a pin's name plate to rename it (every wire and instance
   follows); click it and press Delete to remove it.

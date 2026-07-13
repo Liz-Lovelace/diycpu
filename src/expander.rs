@@ -134,11 +134,18 @@ pub fn expand(circuit_def: &CircuitDef) -> Result<ExpandedCircuit, ExpandError> 
         }
     }
 
-    // Resolve dot-notation references in all flat components.
+    // Resolve dot-notation references in all flat components. Passthrough
+    // outputs can alias to another instance's output, so follow chains
+    // (bounded — a self-alias would otherwise spin).
     for component in &mut flat_components {
         for input_value in component.inputs.values_mut() {
-            if let Some(resolved) = aliases.get(input_value.as_str()) {
+            let mut hops = 0;
+            while let Some(resolved) = aliases.get(input_value.as_str()) {
+                if resolved == input_value || hops > 64 {
+                    break;
+                }
                 *input_value = resolved.clone();
+                hops += 1;
             }
         }
     }
@@ -237,35 +244,62 @@ fn check_abstraction_cycles(
     Ok(())
 }
 
-/// The flattened component name an abstraction output will resolve to,
-/// computed structurally (no expansion needed). `target` is an outputs-map
-/// value: a bare internal component, or `"instance.output"` dotted form.
-fn resolve_output_flat(
-    prefix: &str,
-    abstraction: &AbstractionDef,
-    target: &str,
+/// A lexical scope for structural (pre-expansion) name resolution: which
+/// abstraction we're inside, its flat-name prefix, and how its declared
+/// inputs resolve.
+struct Scope<'a> {
+    prefix: &'a str,
+    abstraction: &'a AbstractionDef,
+    inputs: ScopeInputs<'a>,
+}
+
+enum ScopeInputs<'a> {
+    /// Bindings that are already flat signal names (the instance being
+    /// expanded right now).
+    Flat(&'a HashMap<String, String>),
+    /// References into an enclosing scope (a sub-instance's inputs map).
+    Refs(&'a HashMap<String, String>, &'a Scope<'a>),
+}
+
+/// The flattened component name a reference will resolve to, computed
+/// structurally (no expansion needed). A reference is an input name, a
+/// bare internal component, or `"instance.output"` dotted form — outputs
+/// may forward inputs (passthrough), so resolution can climb scopes.
+fn resolve_ref_flat(
+    scope: &Scope,
+    reference: &str,
     abstraction_map: &HashMap<&str, &AbstractionDef>,
     depth: usize,
 ) -> Option<String> {
     if depth > 64 {
         return None; // cyclic files are rejected elsewhere; stay safe
     }
-    match target.split_once('.') {
-        None => Some(format!("{prefix}/{target}")),
+    // Declared inputs shadow everything (matches resolve_reference).
+    if scope.abstraction.inputs.iter().any(|i| i == reference) {
+        return match &scope.inputs {
+            ScopeInputs::Flat(bindings) => bindings.get(reference).cloned(),
+            ScopeInputs::Refs(refs, parent) => {
+                resolve_ref_flat(parent, refs.get(reference)?, abstraction_map, depth + 1)
+            }
+        };
+    }
+    match reference.split_once('.') {
+        None => Some(format!("{}/{}", scope.prefix, reference)),
         Some((inner_instance, inner_output)) => {
-            let inner = abstraction
+            let inner = scope
+                .abstraction
                 .components
                 .iter()
                 .find(|c| c.name == inner_instance)?;
             let inner_abs = abstraction_map.get(inner.component_type.as_str())?;
             let inner_target = inner_abs.outputs.get(inner_output)?;
-            resolve_output_flat(
-                &format!("{prefix}/{inner_instance}"),
-                inner_abs,
-                inner_target,
-                abstraction_map,
-                depth + 1,
-            )
+            let inner_prefix = format!("{}/{}", scope.prefix, inner_instance);
+            let inner_scope = Scope {
+                prefix: &inner_prefix,
+                abstraction: inner_abs,
+                inputs: ScopeInputs::Refs(&inner.inputs, scope),
+            };
+            resolve_ref_flat(&inner_scope, inner_target, abstraction_map, depth + 1)
         }
     }
 }
@@ -329,15 +363,25 @@ fn expand_instance(
 
     // Phase 1.5: Pre-register every sub-instance output's flat name, so a
     // sub-instance may reference another regardless of definition order.
+    let parent_scope = Scope {
+        prefix: name_prefix,
+        abstraction,
+        inputs: ScopeInputs::Flat(input_bindings),
+    };
     for component in &abstraction.components {
         if is_primitive(&component.component_type) {
             continue;
         }
         if let Some(sub_abstraction) = abstraction_map.get(component.component_type.as_str()) {
             let sub_prefix = format!("{name_prefix}/{}", component.name);
+            let sub_scope = Scope {
+                prefix: &sub_prefix,
+                abstraction: sub_abstraction,
+                inputs: ScopeInputs::Refs(&component.inputs, &parent_scope),
+            };
             for (output_name, target) in &sub_abstraction.outputs {
                 if let Some(flat) =
-                    resolve_output_flat(&sub_prefix, sub_abstraction, target, abstraction_map, 0)
+                    resolve_ref_flat(&sub_scope, target, abstraction_map, 0)
                 {
                     internal_name_map
                         .insert(format!("{}.{}", component.name, output_name), flat);

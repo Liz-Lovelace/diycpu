@@ -96,6 +96,14 @@ pub enum Gesture {
         junction_id: String,
         pos: [f32; 2],
     },
+    /// Left button down on a wire segment; a click selects it, a drag
+    /// tears a new node out of it and carries it along.
+    PressedWire {
+        net_id: String,
+        segment_index: usize,
+        press_screen: [f32; 2],
+        ctrl: bool,
+    },
     /// Left button down on a pin's name plate; not yet decided click vs drag.
     PressedPin {
         kind: PortKind,
@@ -112,7 +120,10 @@ pub enum Gesture {
 pub struct Selection {
     pub components: Vec<String>,
     pub notes: Vec<String>,
-    pub net: Option<String>,
+    /// Individual wire segments, by (net id, segment index).
+    pub segments: Vec<(String, usize)>,
+    /// Derived output-pin wires, by pin name.
+    pub pin_wires: Vec<String>,
     /// A selected interface pin (kind, name) inside an abstraction sheet.
     pub pin: Option<(PortKind, String)>,
 }
@@ -121,13 +132,15 @@ impl Selection {
     pub fn clear(&mut self) {
         self.components.clear();
         self.notes.clear();
-        self.net = None;
+        self.segments.clear();
+        self.pin_wires.clear();
         self.pin = None;
     }
     pub fn is_empty(&self) -> bool {
         self.components.is_empty()
             && self.notes.is_empty()
-            && self.net.is_none()
+            && self.segments.is_empty()
+            && self.pin_wires.is_empty()
             && self.pin.is_none()
     }
 }
@@ -143,6 +156,8 @@ pub enum PromptAction {
     RenamePin { kind: PortKind, old: String },
     RenameAbstraction { index: usize },
     RenameProject,
+    /// Type a size for the layout dialog (which: 0 = width, 1 = height).
+    SetAbstractionDim { index: usize, which: usize },
 }
 
 pub struct Prompt {
@@ -185,7 +200,8 @@ pub struct LayoutDialog {
 #[derive(Clone, PartialEq)]
 pub enum DialogDrag {
     Port(String),
-    Resize,
+    /// Dragging one of the size sliders (0 = width, 1 = height).
+    Slider(usize),
 }
 
 pub struct App {
@@ -967,21 +983,11 @@ impl App {
                 self.info("Back to editing");
             }
             Mode::Edit => {
-                // Compile first: a failed run must not yank the user out of
-                // whatever they were zoomed into.
+                // The whole project simulates, but the view stays exactly
+                // where the user is — zoomed into an abstraction included.
                 match SimSession::new(&self.editor.project) {
                     Ok(session) => {
                         self.gesture = Gesture::Idle;
-                        // Simulation always runs the whole design from the top.
-                        if self.editor.sheet != SheetRef::Top
-                            || self.view_root != SheetRef::Top
-                        {
-                            let _ = self.editor.open_sheet(SheetRef::Top);
-                            self.view_root = SheetRef::Top;
-                            self.path.clear();
-                            self.selection.clear();
-                            self.pending_fit = true;
-                        }
                         self.mode = Mode::Run(session);
                         self.info("Running — ←/→ step the clock, Esc to stop");
                     }
@@ -1133,6 +1139,31 @@ impl App {
             Gesture::DraggingJunction { pos: drag_pos, .. } => {
                 *drag_pos = snap_half(self.camera.screen_to_grid(pos));
             }
+            Gesture::PressedWire {
+                net_id,
+                segment_index,
+                press_screen,
+                ..
+            } => {
+                if dist(pos, *press_screen) > DRAG_THRESHOLD_PX {
+                    let net_id = net_id.clone();
+                    let segment_index = *segment_index;
+                    let grab = snap_half(self.camera.screen_to_grid(*press_screen));
+                    match self.editor.insert_junction(&net_id, segment_index, grab) {
+                        Ok(junction_id) => {
+                            self.gesture = Gesture::DraggingJunction {
+                                net_id,
+                                junction_id,
+                                pos: snap_half(self.camera.screen_to_grid(pos)),
+                            };
+                        }
+                        Err(e) => {
+                            self.error(e.to_string());
+                            self.gesture = Gesture::Idle;
+                        }
+                    }
+                }
+            }
             Gesture::PressedPin {
                 name, press_screen, ..
             } => {
@@ -1210,9 +1241,12 @@ impl App {
                     self.selection.clear();
                     self.selection.components = vec![component_id];
                 }
-                Hit::Wire { net_id, .. } => {
+                Hit::Wire {
+                    net_id,
+                    segment_index,
+                } => {
                     self.selection.clear();
-                    self.selection.net = Some(net_id);
+                    self.selection.segments = vec![(net_id, segment_index)];
                 }
                 _ => self.selection.clear(),
             }
@@ -1276,9 +1310,28 @@ impl App {
                     press_screen: self.cursor,
                 };
             }
-            Hit::Wire { net_id, .. } => {
-                self.selection.clear();
-                self.selection.net = Some(net_id);
+            Hit::Wire {
+                net_id,
+                segment_index,
+            } => {
+                self.gesture = Gesture::PressedWire {
+                    net_id,
+                    segment_index,
+                    press_screen: self.cursor,
+                    ctrl: self.ctrl,
+                };
+            }
+            Hit::OutputWire { pin } => {
+                if self.ctrl {
+                    if let Some(i) = self.selection.pin_wires.iter().position(|p| p == &pin) {
+                        self.selection.pin_wires.remove(i);
+                    } else {
+                        self.selection.pin_wires.push(pin);
+                    }
+                } else {
+                    self.selection.clear();
+                    self.selection.pin_wires = vec![pin];
+                }
             }
             Hit::Empty => {
                 self.gesture = Gesture::PressedEmpty {
@@ -1369,7 +1422,6 @@ impl App {
                     } else {
                         self.selection.components.push(id);
                     }
-                    self.selection.net = None;
                     self.selection.pin = None;
                 } else {
                     // A click (no drag): collapse the selection to this one.
@@ -1384,7 +1436,6 @@ impl App {
                     } else {
                         self.selection.notes.push(id);
                     }
-                    self.selection.net = None;
                     self.selection.pin = None;
                 } else {
                     self.selection.clear();
@@ -1438,9 +1489,32 @@ impl App {
                     .filter(|n| layout::note_bounds(n).intersects(&band))
                     .map(|n| n.id.clone())
                     .collect();
+                // Wire segments come along when both their endpoints are in
+                // the band — wires select like anything else.
+                let (sheet_components, wire_nets) = self.editor.sheet_data();
+                let mut segments: Vec<(String, usize)> = Vec::new();
+                for net in wire_nets {
+                    for (i, seg) in net.segments.iter().enumerate() {
+                        let ends = [&seg.from, &seg.to].map(|e| {
+                            layout::resolve_endpoint(
+                                abstractions,
+                                sheet_components,
+                                self.interface(),
+                                &net.junctions,
+                                e,
+                            )
+                        });
+                        if let [Some(a), Some(b)] = ends {
+                            if band.contains(a) && band.contains(b) {
+                                segments.push((net.id.clone(), i));
+                            }
+                        }
+                    }
+                }
                 self.selection.clear();
                 self.selection.components = components;
                 self.selection.notes = notes;
+                self.selection.segments = segments;
             }
             gesture @ Gesture::DrawingWire { .. } => {
                 // Drag-style wiring: releasing over a port or node commits.
@@ -1476,6 +1550,24 @@ impl App {
                 Ok(()) => {}
                 Err(e) => self.error(e.to_string()),
             },
+            Gesture::PressedWire {
+                net_id,
+                segment_index,
+                ctrl,
+                ..
+            } => {
+                let key = (net_id, segment_index);
+                if ctrl {
+                    if let Some(i) = self.selection.segments.iter().position(|s| s == &key) {
+                        self.selection.segments.remove(i);
+                    } else {
+                        self.selection.segments.push(key);
+                    }
+                } else {
+                    self.selection.clear();
+                    self.selection.segments = vec![key];
+                }
+            }
             Gesture::PressedPin { kind, name, .. } => {
                 // A click: select the pin.
                 self.selection.clear();
@@ -1571,22 +1663,7 @@ impl App {
             });
             return;
         }
-        if let Hit::Wire {
-            net_id,
-            segment_index,
-        } = self.hover.clone()
-        {
-            // Double-click a wire: drop a node right there.
-            let pos = snap_half(self.cursor_grid());
-            match self.editor.insert_junction(&net_id, segment_index, pos) {
-                Ok(_) => {
-                    self.info("Node added — click it to branch a wire");
-                    self.recompute_hover();
-                }
-                Err(e) => self.error(e.to_string()),
-            }
-            return;
-        }
+
         if let Hit::Component { component_id } = self.hover.clone() {
             let (components, _) = self.editor.sheet_data();
             let Some(comp) = components.iter().find(|c| c.id == component_id) else {
@@ -1762,7 +1839,7 @@ impl App {
                 Ok(()) => self.info("Removed wire segment"),
                 Err(e) => self.error(e.to_string()),
             }
-            self.selection.net = None;
+            self.selection.segments.clear();
             self.recompute_hover();
             return;
         }
@@ -1774,19 +1851,16 @@ impl App {
                 }
                 Err(e) => self.error(e.to_string()),
             }
-        } else if let Some(net_id) = self.selection.net.clone() {
-            match self.editor.delete_net(&net_id) {
-                Ok(()) => {
-                    self.selection.net = None;
-                    self.info("Deleted wire");
-                }
-                Err(e) => self.error(e.to_string()),
-            }
-        } else if !self.selection.components.is_empty() || !self.selection.notes.is_empty() {
+        } else if !self.selection.is_empty() {
             let ids = self.selection.components.clone();
             let note_ids = self.selection.notes.clone();
-            let n = ids.len() + note_ids.len();
-            match self.editor.delete_items(&ids, &note_ids) {
+            let segments = self.selection.segments.clone();
+            let pin_wires = self.selection.pin_wires.clone();
+            let n = ids.len() + note_ids.len() + segments.len() + pin_wires.len();
+            match self
+                .editor
+                .delete_mixed(&ids, &note_ids, &segments, &pin_wires)
+            {
                 Ok(()) => {
                     self.selection.clear();
                     self.info(if n == 1 {
@@ -2070,6 +2144,30 @@ impl App {
                 Ok(()) => self.info(format!("Project renamed to \"{name}\"")),
                 Err(e) => retry(self, e, prompt),
             },
+            PromptAction::SetAbstractionDim { index, which } => {
+                let Ok(value) = name.parse::<f32>() else {
+                    self.error("Enter a number of grid cells");
+                    self.prompt = Some(prompt);
+                    return;
+                };
+                let value = value.clamp(DIALOG_SIZE_MIN, DIALOG_SIZE_MAX);
+                let current = self
+                    .editor
+                    .project
+                    .abstractions
+                    .get(index)
+                    .map(|a| (a.width, a.height))
+                    .unwrap_or((4.0, 2.0));
+                let (w, h) = if which == 0 {
+                    (value, current.1)
+                } else {
+                    (current.0, value)
+                };
+                match self.editor.set_abstraction_size(index, w, h) {
+                    Ok(()) => self.info("Resized"),
+                    Err(e) => retry(self, e, prompt),
+                }
+            }
         }
     }
 
@@ -2862,15 +2960,25 @@ pub struct DialogGeom {
     pub panel: Rect,
     /// The preview rectangle of the closed component, in pixels.
     pub preview: Rect,
-    /// Pixels per grid unit inside the preview.
-    pub scale: f32,
     /// (name, px position, is_input) for every port.
     pub ports: Vec<(String, [f32; 2], bool)>,
-    pub resize_handle: Rect,
+    /// Width and height sliders: (label, track, value_rect, value).
+    pub sliders: [DialogSlider; 2],
     /// Current (possibly pending) size in grid units.
     pub size: (f32, f32),
     pub close_rect: Rect,
 }
+
+pub struct DialogSlider {
+    pub label: &'static str,
+    pub track: Rect,
+    pub value_rect: Rect,
+    pub value: f32,
+}
+
+/// Size sliders cover this range of grid cells.
+pub const DIALOG_SIZE_MIN: f32 = 2.0;
+pub const DIALOG_SIZE_MAX: f32 = 24.0;
 
 impl App {
     pub fn action_open_layout_dialog(&mut self) {
@@ -2960,14 +3068,28 @@ impl App {
             })
             .collect();
 
+        let slider_row = |row: usize, label: &'static str, value: f32| DialogSlider {
+            label,
+            track: Rect {
+                x: panel.x + 90.0,
+                y: panel.y + panel.h - 72.0 + row as f32 * 30.0,
+                w: panel.w - 220.0,
+                h: 14.0,
+            },
+            value_rect: Rect {
+                x: panel.x + panel.w - 110.0,
+                y: panel.y + panel.h - 78.0 + row as f32 * 30.0,
+                w: 84.0,
+                h: 24.0,
+            },
+            value,
+        };
         Some(DialogGeom {
             panel,
-            resize_handle: Rect {
-                x: preview.x + preview.w - 9.0,
-                y: preview.y + preview.h - 9.0,
-                w: 18.0,
-                h: 18.0,
-            },
+            sliders: [
+                slider_row(0, "Width", def.width),
+                slider_row(1, "Height", def.height),
+            ],
             close_rect: Rect {
                 x: panel.x + panel.w - 34.0,
                 y: panel.y + 10.0,
@@ -2975,7 +3097,6 @@ impl App {
                 h: 24.0,
             },
             preview,
-            scale,
             ports,
             size: (def.width, def.height),
         })
@@ -2989,11 +3110,32 @@ impl App {
             self.layout_dialog = None;
             return;
         }
-        if geom.resize_handle.contains(self.cursor) {
-            if let Some(d) = &mut self.layout_dialog {
-                d.drag = Some(DialogDrag::Resize);
+        for (i, slider) in geom.sliders.iter().enumerate() {
+            // A generous grab zone around the track.
+            let grab = Rect {
+                x: slider.track.x - 8.0,
+                y: slider.track.y - 8.0,
+                w: slider.track.w + 16.0,
+                h: slider.track.h + 16.0,
+            };
+            if grab.contains(self.cursor) {
+                if let Some(d) = &mut self.layout_dialog {
+                    d.drag = Some(DialogDrag::Slider(i));
+                }
+                self.dialog_mouse_moved(); // jump the value to the click
+                return;
             }
-            return;
+            if slider.value_rect.contains(self.cursor) {
+                // Type the number instead.
+                let index = self.layout_dialog.as_ref().unwrap().index;
+                self.prompt = Some(Prompt {
+                    title: format!("{} in grid cells", slider.label),
+                    value: format!("{}", slider.value),
+                    action: PromptAction::SetAbstractionDim { index, which: i },
+                    identifier: false,
+                });
+                return;
+            }
         }
         for (name, pos, _) in &geom.ports {
             let dx = self.cursor[0] - pos[0];
@@ -3040,10 +3182,13 @@ impl App {
                 let t = ((t * 20.0).round() / 20.0).clamp(0.02, 0.98);
                 dialog.pending_port = Some((name, side, t));
             }
-            Some(DialogDrag::Resize) => {
-                let w = ((cursor[0] - geom.preview.x) / geom.scale * 2.0).round() / 2.0;
-                let h = ((cursor[1] - geom.preview.y) / geom.scale * 2.0).round() / 2.0;
-                dialog.pending_size = Some((w.clamp(2.0, 40.0), h.clamp(1.5, 40.0)));
+            Some(DialogDrag::Slider(i)) => {
+                let track = &geom.sliders[i].track;
+                let f = ((cursor[0] - track.x) / track.w).clamp(0.0, 1.0);
+                let value = (DIALOG_SIZE_MIN + f * (DIALOG_SIZE_MAX - DIALOG_SIZE_MIN))
+                    .round();
+                let (w, h) = geom.size;
+                dialog.pending_size = Some(if i == 0 { (value, h) } else { (w, value) });
             }
             None => {}
         }
@@ -3065,7 +3210,7 @@ impl App {
                     }
                 }
             }
-            Some(DialogDrag::Resize) => {
+            Some(DialogDrag::Slider(_)) => {
                 if let Some((w, h)) = pending_size {
                     if let Err(e) = self.editor.set_abstraction_size(index, w, h) {
                         self.error(e.to_string());
@@ -3161,5 +3306,101 @@ mod clipboard_tests {
         );
         // Original still where it was.
         assert_eq!(d.app.editor.project.components[0].pos, original_pos);
+    }
+}
+
+#[cfg(test)]
+mod wire_selection_tests {
+    use super::tests::*;
+    use super::*;
+
+    fn wired_pair(d: &mut Driver) {
+        d.place("nand", [1.0, 1.0]);
+        d.place("nand", [9.0, 5.0]);
+        d.drag(port_at(&d.app, "nand_1", "out"), port_at(&d.app, "nand_2", "a"));
+        assert_eq!(d.app.editor.project.wire_nets.len(), 1);
+        d.app.handle_key(KeyInput::Escape); // clear selection
+    }
+
+    fn segment_mid(d: &Driver) -> [f32; 2] {
+        let a = port_at(&d.app, "nand_1", "out");
+        let b = port_at(&d.app, "nand_2", "a");
+        [(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0]
+    }
+
+    #[test]
+    fn click_selects_a_segment_and_delete_removes_it() {
+        let mut d = Driver::new();
+        wired_pair(&mut d);
+        d.click(segment_mid(&d));
+        assert_eq!(d.app.selection.segments.len(), 1);
+        // Move the cursor off the wire so hover-delete doesn't shortcut.
+        d.move_to([0.0, 12.0]);
+        d.app.handle_key(KeyInput::Delete);
+        assert!(d.app.editor.project.wire_nets.is_empty());
+    }
+
+    #[test]
+    fn dragging_a_wire_tears_out_a_node_in_one_motion() {
+        let mut d = Driver::new();
+        wired_pair(&mut d);
+        let mid = segment_mid(&d);
+        d.drag(mid, [mid[0], mid[1] + 4.0]);
+        let net = &d.app.editor.project.wire_nets[0];
+        assert_eq!(net.junctions.len(), 1, "a node was born from the drag");
+        let expected_y = ((mid[1] + 4.0) * 2.0).round() / 2.0; // drag end, half-snapped
+        assert_eq!(net.junctions[0].pos[1], expected_y);
+        assert_eq!(net.segments.len(), 2);
+        // Still one connected net with the same logic.
+        assert_eq!(net.sinks.len(), 1);
+    }
+
+    #[test]
+    fn box_select_includes_wires() {
+        let mut d = Driver::new();
+        wired_pair(&mut d);
+        d.drag([-2.0, -1.0], [14.0, 9.0]);
+        assert_eq!(d.app.selection.components.len(), 2);
+        assert_eq!(d.app.selection.segments.len(), 1, "the wire came along");
+        d.app.handle_key(KeyInput::Delete);
+        assert!(d.app.editor.project.components.is_empty());
+        assert!(d.app.editor.project.wire_nets.is_empty());
+    }
+
+    #[test]
+    fn output_pin_wire_selects_and_unwires() {
+        let mut d = Driver::new();
+        d.app.action_new_abstraction();
+        d.type_text("box");
+        d.app.handle_key(KeyInput::Enter);
+        d.app.action_add_pin(PortKind::Output);
+        d.type_text("q");
+        d.app.handle_key(KeyInput::Enter);
+        d.place("nand", [2.0, 1.0]);
+        d.app.camera.offset = [300.0, 250.0];
+        let abstractions = &d.app.editor.project.abstractions;
+        let pin_pos = diycpu::layout::interface_pins(abstractions, &abstractions[0])
+            .into_iter()
+            .find(|p| p.name == "q")
+            .unwrap()
+            .pos;
+        d.drag(port_at(&d.app, "nand_1", "out"), pin_pos);
+        assert_eq!(
+            d.app.editor.project.abstractions[0].outputs.get("q"),
+            Some(&"nand_1".to_string())
+        );
+
+        // Click the derived wire midway and delete it.
+        let from = port_at(&d.app, "nand_1", "out");
+        let mid = [(from[0] + pin_pos[0]) / 2.0, (from[1] + pin_pos[1]) / 2.0];
+        d.app.handle_key(KeyInput::Escape);
+        d.click(mid);
+        assert_eq!(d.app.selection.pin_wires, vec!["q".to_string()]);
+        d.move_to([0.0, -6.0]);
+        d.app.handle_key(KeyInput::Delete);
+        assert_eq!(
+            d.app.editor.project.abstractions[0].outputs.get("q"),
+            Some(&String::new())
+        );
     }
 }

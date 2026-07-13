@@ -100,7 +100,6 @@ impl Renderer {
         self.draw_palette(canvas, app, ui);
         self.draw_topbar(canvas, app, ui);
         self.draw_statusbar(canvas, app);
-        self.draw_tooltip(canvas, app);
         self.draw_layout_dialog(canvas, app);
         self.draw_prompt(canvas, app);
     }
@@ -145,7 +144,9 @@ impl Renderer {
 
         // While running, sheets are keyed into the flattened simulation by
         // their instance path from the top.
-        let root_sim_path = if app.is_running() {
+        // A view rooted at an abstraction (sidebar ↗) has no unique instance
+        // path, so its values render neutral.
+        let root_sim_path = if app.is_running() && app.view_root == SheetRef::Top {
             Some(
                 app.path[..start]
                     .iter()
@@ -339,14 +340,8 @@ impl Renderer {
                 None => theme::wire(),
             };
         }
-        if !ctx.focus {
-            return theme::wire();
-        }
-        if app.selection.net.as_deref() == Some(net.id.as_str()) {
-            theme::wire_selected()
-        } else {
-            theme::wire()
-        }
+        let _ = app;
+        theme::wire()
     }
 
     fn draw_wires(&self, canvas: &mut Canvas<OpenGl>, app: &App, ctx: &SheetCtx) {
@@ -357,12 +352,6 @@ impl Renderer {
 
         for net in wire_nets {
             let color = self.net_color(app, ctx, net);
-            let selected =
-                ctx.focus && app.selection.net.as_deref() == Some(net.id.as_str());
-            let mut paint = Paint::color(color);
-            paint.set_line_width(if selected { width + 1.0 } else { width });
-            paint.set_line_join(femtovg::LineJoin::Round);
-            paint.set_line_cap(femtovg::LineCap::Round);
 
             for i in 0..net.segments.len() {
                 let Some(pts) =
@@ -370,6 +359,18 @@ impl Renderer {
                 else {
                     continue;
                 };
+                // Segments select individually.
+                let selected = ctx.focus
+                    && app
+                        .selection
+                        .segments
+                        .iter()
+                        .any(|(id, k)| *id == net.id && *k == i);
+                let mut paint =
+                    Paint::color(if selected { theme::wire_selected() } else { color });
+                paint.set_line_width(if selected { width + 1.0 } else { width });
+                paint.set_line_join(femtovg::LineJoin::Round);
+                paint.set_line_cap(femtovg::LineCap::Round);
                 let mut p = Path::new();
                 for (k, pt) in pts.iter().enumerate() {
                     let s = ctx.view.to_screen(*pt);
@@ -405,14 +406,14 @@ impl Renderer {
     }
 
     /// Resolve where a wire anchor sits on the sheet.
-    fn anchor_geom(&self, app: &App, anchor: &diycpu::editor::WirePoint) -> Option<([f32; 2], layout::ExitDir)> {
+    fn anchor_geom(&self, app: &App, anchor: &diycpu::editor::WirePoint) -> Option<[f32; 2]> {
         use diycpu::editor::WirePoint;
         let abstractions = &app.editor.project.abstractions;
         let (components, wire_nets) = app.editor.sheet_data();
         match anchor {
             WirePoint::Port(p) => {
                 layout::port_geom_any(abstractions, components, app.interface(), p)
-                    .map(|(pos, side)| (pos, Some(side)))
+                    .map(|(pos, _side)| pos)
             }
             WirePoint::Junction {
                 net_id,
@@ -423,8 +424,8 @@ impl Renderer {
                 .junctions
                 .iter()
                 .find(|j| &j.id == junction_id)
-                .map(|j| (j.pos, None)),
-            WirePoint::New(pos) => Some((*pos, None)),
+                .map(|j| j.pos),
+            WirePoint::New(pos) => Some(*pos),
         }
     }
 
@@ -434,15 +435,15 @@ impl Renderer {
         };
         let abstractions = &app.editor.project.abstractions;
         let (components, wire_nets) = app.editor.sheet_data();
-        let Some((from_pos, from_dir)) = self.anchor_geom(app, anchor) else {
+        let Some(from_pos) = self.anchor_geom(app, anchor) else {
             return;
         };
 
         let target = app.wire_target();
-        let (end, end_dir, color) = match &target {
+        let (end, color) = match &target {
             WireTarget::Port(port) => {
                 match layout::port_geom_any(abstractions, components, app.interface(), port) {
-                    Some((pos, side)) => (pos, Some(side), theme::wire_preview()),
+                    Some((pos, _side)) => (pos, theme::wire_preview()),
                     None => return,
                 }
             }
@@ -456,16 +457,16 @@ impl Renderer {
                     .and_then(|n| n.junctions.iter().find(|j| &j.id == junction_id))
                     .map(|j| j.pos);
                 match pos {
-                    Some(p) => (p, None, theme::wire_preview()),
+                    Some(p) => (p, theme::wire_preview()),
                     None => return,
                 }
             }
-            WireTarget::Incompatible => (app.cursor_grid(), None, theme::wire_invalid()),
-            WireTarget::Free(p) => (*p, None, theme::wire_preview()),
+            WireTarget::Incompatible => (app.cursor_grid(), theme::wire_invalid()),
+            WireTarget::Free(p) => (*p, theme::wire_preview()),
         };
 
-        // The exact same routing as the committed wire will get.
-        let pts = layout::route(from_pos, from_dir, end, end_dir);
+        // The exact same straight line the committed wire will get.
+        let pts = layout::route(from_pos, end);
         let zoom = app.camera.zoom;
         let mut paint = Paint::color(color);
         paint.set_line_width((2.5 * zoom).clamp(1.5, 4.5));
@@ -1042,12 +1043,12 @@ impl Renderer {
                 continue;
             };
             let port = layout::output_target_port(target);
-            let Some((from, from_side)) =
+            let Some((from, _side)) =
                 layout::port_geom_any(abstractions, ctx.components, Some(def), &port)
             else {
                 continue;
             };
-            let pts = layout::route(from, Some(from_side), pin.pos, Some(layout::Side::Left));
+            let pts = layout::route(from, pin.pos);
             let mut p = Path::new();
             for (k, pt) in pts.iter().enumerate() {
                 let s = ctx.view.to_screen(*pt);
@@ -1057,7 +1058,8 @@ impl Renderer {
                     p.line_to(s[0], s[1]);
                 }
             }
-            // Live value of the driving port while simulating.
+            // Live value of the driving port while simulating; selection
+            // highlight while editing.
             let color = match (&app.mode, &ctx.sim_path) {
                 (Mode::Run(session), Some(path)) => {
                     let is_prim = ctx
@@ -1071,6 +1073,9 @@ impl Renderer {
                         Some(false) => theme::wire_off(),
                         None => theme::wire(),
                     }
+                }
+                _ if ctx.focus && app.selection.pin_wires.contains(name) => {
+                    theme::wire_selected()
                 }
                 _ => theme::wire(),
             };
@@ -1133,7 +1138,7 @@ impl Renderer {
             canvas,
             p.x + 16.0,
             p.y + 46.0,
-            "Drag a port to any edge · drag the corner to resize · Esc closes",
+            "Drag a port to any edge · size below (click a value to type it) · Esc closes",
             11.5,
             theme::text_dim(),
             Align::Left,
@@ -1214,28 +1219,66 @@ impl Renderer {
             }
         }
 
-        // Resize handle + size readout.
-        let hr = &geom.resize_handle;
-        let mut handle = Path::new();
-        handle.rounded_rect(hr.x, hr.y, hr.w, hr.h, 4.0);
-        canvas.fill_path(
-            &handle,
-            &Paint::color(if hr.contains(app.cursor) {
-                theme::accent()
-            } else {
-                theme::button_border()
-            }),
-        );
-        self.text(
-            canvas,
-            p.x + p.w / 2.0,
-            p.y + p.h - 26.0,
-            &format!("{} × {} cells", geom.size.0, geom.size.1),
-            12.5,
-            theme::text_dim(),
-            Align::Center,
-            Baseline::Middle,
-        );
+        // Size sliders: label, track with a filled knob, and a clickable
+        // value that opens a type-in prompt.
+        for slider in &geom.sliders {
+            self.text(
+                canvas,
+                slider.track.x - 12.0,
+                slider.track.y + slider.track.h / 2.0,
+                slider.label,
+                12.5,
+                theme::text(),
+                Align::Right,
+                Baseline::Middle,
+            );
+
+            let t = &slider.track;
+            let mid_y = t.y + t.h / 2.0;
+            let mut rail = Path::new();
+            rail.rounded_rect(t.x, mid_y - 2.0, t.w, 4.0, 2.0);
+            canvas.fill_path(&rail, &Paint::color(theme::panel_border()));
+
+            let f = ((slider.value - crate::app::DIALOG_SIZE_MIN)
+                / (crate::app::DIALOG_SIZE_MAX - crate::app::DIALOG_SIZE_MIN))
+                .clamp(0.0, 1.0);
+            let mut fill = Path::new();
+            fill.rounded_rect(t.x, mid_y - 2.0, t.w * f, 4.0, 2.0);
+            canvas.fill_path(&fill, &Paint::color(theme::accent()));
+            let mut knob = Path::new();
+            knob.circle(t.x + t.w * f, mid_y, 7.0);
+            canvas.fill_path(&knob, &Paint::color(theme::chip_fill()));
+            let mut ring = Paint::color(theme::accent());
+            ring.set_line_width(2.0);
+            canvas.stroke_path(&knob, &ring);
+
+            // The value doubles as a "type it" button.
+            let v = &slider.value_rect;
+            let hovered = v.contains(app.cursor);
+            let mut vbox = Path::new();
+            vbox.rounded_rect(v.x, v.y, v.w, v.h, 5.0);
+            canvas.fill_path(
+                &vbox,
+                &Paint::color(if hovered {
+                    theme::button_hover_bg()
+                } else {
+                    theme::button_bg()
+                }),
+            );
+            let mut vb = Paint::color(theme::button_border());
+            vb.set_line_width(1.2);
+            canvas.stroke_path(&vbox, &vb);
+            self.text(
+                canvas,
+                v.x + v.w / 2.0,
+                v.y + v.h / 2.0,
+                &format!("{} cells", slider.value),
+                12.0,
+                theme::text(),
+                Align::Center,
+                Baseline::Middle,
+            );
+        }
     }
 
     fn draw_prompt(&self, canvas: &mut Canvas<OpenGl>, app: &App) {
@@ -1718,148 +1761,6 @@ impl Renderer {
             Align::Right,
             Baseline::Middle,
         );
-    }
-
-    fn draw_tooltip(&self, canvas: &mut Canvas<OpenGl>, app: &App) {
-        if !matches!(app.gesture, Gesture::Idle)
-            || app.layout_dialog.is_some()
-            || app.prompt.is_some()
-        {
-            return;
-        }
-        let lines: Vec<String> = match &app.hover {
-            layout::Hit::Port {
-                component_id,
-                port_name,
-                kind,
-            } => {
-                if let Some(pin) = component_id
-                    .strip_prefix("INPUT:")
-                    .or_else(|| component_id.strip_prefix("OUTPUT:"))
-                {
-                    vec![format!(
-                        "pin \"{pin}\" — drag to wire it {}",
-                        match kind {
-                            PortKind::Output => "into the circuit",
-                            PortKind::Input => "from a component",
-                        }
-                    )]
-                } else {
-                    vec![format!(
-                        "{} \"{port_name}\"",
-                        match kind {
-                            PortKind::Input => "input",
-                            PortKind::Output => "output",
-                        }
-                    )]
-                }
-            }
-            layout::Hit::Pin { name, kind } => vec![format!(
-                "{} pin \"{name}\" — double-click renames, Delete removes",
-                match kind {
-                    PortKind::Input => "input",
-                    PortKind::Output => "output",
-                }
-            )],
-            layout::Hit::Junction { .. } => {
-                if app.is_running() {
-                    return;
-                }
-                vec!["node — click to wire from it, drag to move, Delete removes".into()]
-            }
-            layout::Hit::Wire { .. } => {
-                if app.is_running() {
-                    return;
-                }
-                vec![
-                    "wire — double-click adds a node, Delete removes this segment".into(),
-                ]
-            }
-            layout::Hit::Note { .. } => {
-                if app.is_running() {
-                    return;
-                }
-                vec!["note — double-click to edit".into()]
-            }
-            layout::Hit::Component { component_id } => {
-                let (components, _) = app.editor.sheet_data();
-                let Some(comp) = components.iter().find(|c| &c.id == component_id) else {
-                    return;
-                };
-                let mut lines = match comp.component_type.as_str() {
-                    "clk" => vec!["clock — toggles every step".to_string()],
-                    "nand" => vec!["NAND gate".to_string()],
-                    "dff" | "const" => vec![],
-                    other => vec![format!("{other} — zoom in or double-click to open")],
-                };
-                if let Mode::Run(session) = &app.mode {
-                    let path: Vec<String> = app
-                        .path
-                        .iter()
-                        .map(|seg| seg.instance_id.clone())
-                        .collect();
-                    if let Some(v) = session.component_value_at(&path, &comp.id) {
-                        lines.push(format!("value: {}", if v { "1" } else { "0" }));
-                    }
-                } else if comp.component_type == "dff" {
-                    lines.push(format!(
-                        "flip-flop — starts at {}, double-click to flip",
-                        if comp.init.unwrap_or(false) { "1" } else { "0" }
-                    ));
-                } else if comp.component_type == "const" {
-                    lines.push(format!(
-                        "constant {} — double-click to flip",
-                        if comp.init.unwrap_or(false) { "1" } else { "0" }
-                    ));
-                }
-                if lines.is_empty() {
-                    return;
-                }
-                lines
-            }
-            _ => return,
-        };
-
-        let size = 12.0;
-        let line_h = size + 5.0;
-        let mut paint = Paint::color(theme::tooltip_text());
-        paint.set_font(&[self.font]);
-        paint.set_font_size(size);
-        let width = lines
-            .iter()
-            .map(|l| {
-                canvas
-                    .measure_text(0.0, 0.0, l, &paint)
-                    .map(|m| m.width())
-                    .unwrap_or(80.0)
-            })
-            .fold(0.0f32, f32::max);
-
-        let x = (app.cursor[0] + 16.0).min(app.window_size[0] - width - 24.0);
-        let y = (app.cursor[1] + 18.0)
-            .min(app.window_size[1] - theme::STATUSBAR_HEIGHT - lines.len() as f32 * line_h - 16.0);
-
-        let mut bg = Path::new();
-        bg.rounded_rect(
-            x,
-            y,
-            width + 16.0,
-            lines.len() as f32 * line_h + 10.0,
-            5.0,
-        );
-        canvas.fill_path(&bg, &Paint::color(theme::tooltip_bg()));
-        for (i, line) in lines.iter().enumerate() {
-            self.text(
-                canvas,
-                x + 8.0,
-                y + 5.0 + i as f32 * line_h + line_h / 2.0,
-                line,
-                size,
-                theme::tooltip_text(),
-                Align::Left,
-                Baseline::Middle,
-            );
-        }
     }
 
     #[allow(clippy::too_many_arguments)]

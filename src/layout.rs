@@ -217,44 +217,81 @@ pub fn component_ports(
         });
     }
 
-    // Custom spots from the abstraction's port layout (any edge); ports
-    // without one auto-distribute on their default side.
+    // Every port sits at a half-grid slot along its edge, so ports align
+    // across all components. Custom spots snap to the nearest slot; autos
+    // stack from a centered start.
     let custom = |name: &str| -> Option<(Side, f32)> {
         let def = abstractions.iter().find(|a| a.name == comp.component_type)?;
         let spot = def.port_layout.get(name)?;
         Some((Side::from_project(spot.side), spot.t.clamp(0.0, 1.0)))
     };
-    let place = |side: Side, t: f32| -> [f32; 2] {
+    let edge_len = |side: Side| match side {
+        Side::Left | Side::Right => rect.h,
+        Side::Top | Side::Bottom => rect.w,
+    };
+    // Snap a distance along an edge to the nearest x.5 slot inside it.
+    let snap_slot = |offset: f32, len: f32| -> f32 {
+        ((offset - 0.5).round() + 0.5).clamp(0.5, (len - 0.5).max(0.5))
+    };
+    let place = |side: Side, offset: f32| -> [f32; 2] {
         match side {
-            Side::Left => [rect.x, rect.y + rect.h * t],
-            Side::Right => [rect.x + rect.w, rect.y + rect.h * t],
-            Side::Top => [rect.x + rect.w * t, rect.y],
-            Side::Bottom => [rect.x + rect.w * t, rect.y + rect.h],
+            Side::Left => [rect.x, rect.y + offset],
+            Side::Right => [rect.x + rect.w, rect.y + offset],
+            Side::Top => [rect.x + offset, rect.y],
+            Side::Bottom => [rect.x + offset, rect.y + rect.h],
         }
     };
 
     let mut result = Vec::with_capacity(ports.len());
     for (list, default_side) in [(inputs, Side::Left), (outputs, Side::Right)] {
-        let auto_count = list
-            .iter()
-            .filter(|p| custom(&p.name).is_none())
-            .count()
-            .max(1);
+        let auto_count = list.iter().filter(|p| custom(&p.name).is_none()).count();
+        let len = edge_len(default_side);
+        let auto_start = ((len - auto_count as f32) / 2.0).floor().max(0.0);
         let mut auto_index = 0usize;
         for info in list {
-            let (side, t) = custom(&info.name).unwrap_or_else(|| {
-                let t = (auto_index as f32 + 0.5) / auto_count as f32;
-                auto_index += 1;
-                (default_side, t)
-            });
+            let (side, offset) = match custom(&info.name) {
+                Some((side, t)) => {
+                    let len = edge_len(side);
+                    (side, snap_slot(t * len, len))
+                }
+                None => {
+                    let offset = snap_slot(auto_start + 0.5 + auto_index as f32, len);
+                    auto_index += 1;
+                    (default_side, offset)
+                }
+            };
             result.push(PortGeom {
                 info: info.clone(),
-                pos: place(side, t),
+                pos: place(side, offset),
                 side,
             });
         }
     }
     result
+}
+
+/// The (side, t) every port currently occupies — used to freeze the auto
+/// layout in place the first time the user hand-places any port.
+pub fn current_port_spots(
+    abstractions: &[ProjectAbstraction],
+    def: &ProjectAbstraction,
+) -> Vec<(String, crate::project::PortSide, f32)> {
+    let synthetic = ProjectComponent {
+        id: String::new(),
+        component_type: def.name.clone(),
+        init: None,
+        pos: [0.0, 0.0],
+    };
+    component_ports(abstractions, &synthetic)
+        .into_iter()
+        .map(|g| {
+            let (len, offset) = match g.side {
+                Side::Left | Side::Right => (def.height, g.pos[1]),
+                Side::Top | Side::Bottom => (def.width, g.pos[0]),
+            };
+            (g.info.name, g.side.to_project(), (offset / len).clamp(0.0, 1.0))
+        })
+        .collect()
 }
 
 /// Position of one named port on a placed component.
@@ -268,190 +305,16 @@ pub fn port_pos(
         .find(|p| p.info.name == port_name)
 }
 
-// ── Wire routing ─────────────────────────────────────────────────────────────
+// ── Wire geometry ────────────────────────────────────────────────────────────
 //
-// There is exactly one routing algorithm. Committed wires, the live drag
-// preview, and wire hit-testing all call `route`, so what you see while
-// drawing is always what you get.
+// Wires have no auto-routing: a segment is a straight line between its two
+// endpoints, diagonals included. Users route by placing nodes. Committed
+// wires, the live drag preview, and hit-testing all share this one rule,
+// so what you see while drawing is always what you get.
 
-/// Direction a wire must travel when leaving an endpoint. `None` for free
-/// endpoints (junctions, the cursor during a drag).
-pub type ExitDir = Option<Side>;
-
-/// Grid clearance a backward route keeps above the endpoints it detours over.
-pub const DETOUR: f32 = 1.5;
-
-/// Route an orthogonal polyline from `a` to `b`.
-///
-/// `a_dir`/`b_dir` are the sides the endpoints exit toward (outputs exit
-/// Right, inputs are approached from their Left side, i.e. exit Left).
-pub fn route(a: [f32; 2], a_dir: ExitDir, b: [f32; 2], b_dir: ExitDir) -> Vec<[f32; 2]> {
-    // Stub points: step straight out of each port before any turns.
-    let sa = stub(a, a_dir);
-    let sb = stub(b, b_dir);
-
-    let mut pts = vec![a];
-    if sa != a {
-        pts.push(sa);
-    }
-    connect_orthogonal(&mut pts, sa, sb, a_dir, b_dir);
-    if sb != b {
-        pts.push(sb);
-    }
-    pts.push(b);
-    dedup_consecutive(&mut pts);
-    pts
-}
-
-fn stub(p: [f32; 2], dir: ExitDir) -> [f32; 2] {
-    match dir {
-        Some(side) => {
-            let o = side.outward();
-            [p[0] + o[0] * PORT_STUB, p[1] + o[1] * PORT_STUB]
-        }
-        None => p,
-    }
-}
-
-/// Append the elbow points connecting stub point `sa` to stub point `sb`
-/// (exclusive of both, which the caller pushes).
-fn connect_orthogonal(
-    pts: &mut Vec<[f32; 2]>,
-    sa: [f32; 2],
-    sb: [f32; 2],
-    a_dir: ExitDir,
-    b_dir: ExitDir,
-) {
-    let step = |from: [f32; 2], to: [f32; 2]| -> [f32; 2] {
-        [to[0] - from[0], to[1] - from[1]]
-    };
-    // Leaving sa must not retrace a's stub; arriving at sb must not double
-    // back over b's stub.
-    let leaves_cleanly = |d: [f32; 2]| {
-        a_dir.is_none_or(|side| {
-            let o = side.outward();
-            d[0] * o[0] + d[1] * o[1] >= -1e-6
-        })
-    };
-    let arrives_cleanly = |d: [f32; 2]| {
-        b_dir.is_none_or(|side| {
-            let o = side.outward();
-            d[0] * o[0] + d[1] * o[1] <= 1e-6
-        })
-    };
-    let nonzero = |d: [f32; 2]| d[0].abs() > 1e-6 || d[1].abs() > 1e-6;
-
-    // Direct candidates only make sense when each port faces the other:
-    // the displacement must have a non-negative component along each exit.
-    // A port that has to be approached from behind gets the wrap-around
-    // detour below (so wires arc around components, not through them).
-    let disp = [sb[0] - sa[0], sb[1] - sa[1]];
-    let a_faces = a_dir.is_none_or(|side| {
-        let o = side.outward();
-        disp[0] * o[0] + disp[1] * o[1] >= -1e-6
-    });
-    let b_faces = b_dir.is_none_or(|side| {
-        let o = side.outward();
-        -(disp[0] * o[0] + disp[1] * o[1]) >= -1e-6
-    });
-
-    // Candidate polylines between the stubs, in preference order.
-    let mid_x = (sa[0] + sb[0]) / 2.0;
-    let mid_y = (sa[1] + sb[1]) / 2.0;
-    let candidates: [&[[f32; 2]]; 5] = [
-        &[],                                              // straight
-        &[[mid_x, sa[1]], [mid_x, sb[1]]],                // H-V-H
-        &[[sa[0], mid_y], [sb[0], mid_y]],                // V-H-V
-        &[[sb[0], sa[1]]],                                // L: H then V
-        &[[sa[0], sb[1]]],                                // L: V then H
-    ];
-
-    'candidate: for mids in candidates {
-        if !a_faces || !b_faces {
-            break 'candidate;
-        }
-        // The straight candidate only applies on an axis-aligned run.
-        if mids.is_empty() && (sa[0] - sb[0]).abs() > 1e-6 && (sa[1] - sb[1]).abs() > 1e-6 {
-            continue;
-        }
-        let mut points: Vec<[f32; 2]> = Vec::with_capacity(mids.len() + 2);
-        points.push(sa);
-        points.extend(mids.iter().copied());
-        points.push(sb);
-        // Validate first and last non-degenerate legs.
-        let mut first_leg = None;
-        let mut last_leg = None;
-        for pair in points.windows(2) {
-            let d = step(pair[0], pair[1]);
-            if nonzero(d) {
-                if first_leg.is_none() {
-                    first_leg = Some(d);
-                }
-                last_leg = Some(d);
-            }
-        }
-        let (Some(first), Some(last)) = (first_leg, last_leg) else {
-            // Zero-length: stubs coincide, nothing to add.
-            return;
-        };
-        if !leaves_cleanly(first) || !arrives_cleanly(last) {
-            continue 'candidate;
-        }
-        pts.extend(mids.iter().copied());
-        return;
-    }
-
-    // Nothing clean fits: extend both stubs outward and detour around,
-    // offset perpendicular so the run never doubles back through the ports.
-    let ext = |p: [f32; 2], dir: ExitDir| -> [f32; 2] {
-        match dir {
-            Some(side) => {
-                let o = side.outward();
-                [p[0] + o[0] * DETOUR, p[1] + o[1] * DETOUR]
-            }
-            None => p,
-        }
-    };
-    let ea = ext(sa, a_dir);
-    let eb = ext(sb, b_dir);
-    // Which axis each port exits along (None = free endpoint).
-    let axis = |d: ExitDir| -> Option<bool> {
-        d.map(|s| matches!(s, Side::Left | Side::Right)) // true = horizontal
-    };
-    match (axis(a_dir), axis(b_dir)) {
-        // Mixed axes: the extended points already clear both ports, so a
-        // single elbow between them is clean (the corner keeps each leg
-        // moving away from its own port).
-        (Some(true), Some(false)) => {
-            pts.push(ea);
-            pts.push([ea[0], eb[1]]);
-            pts.push(eb);
-        }
-        (Some(false), Some(true)) => {
-            pts.push(ea);
-            pts.push([eb[0], ea[1]]);
-            pts.push(eb);
-        }
-        // Same (or free) axes: wrap around perpendicular to the exits.
-        (Some(false), _) | (None, Some(false)) => {
-            let detour_x = sa[0].min(sb[0]) - DETOUR;
-            pts.push(ea);
-            pts.push([detour_x, ea[1]]);
-            pts.push([detour_x, eb[1]]);
-            pts.push(eb);
-        }
-        _ => {
-            let detour_y = sa[1].min(sb[1]) - DETOUR;
-            pts.push(ea);
-            pts.push([ea[0], detour_y]);
-            pts.push([eb[0], detour_y]);
-            pts.push(eb);
-        }
-    }
-}
-
-fn dedup_consecutive(pts: &mut Vec<[f32; 2]>) {
-    pts.dedup_by(|a, b| (a[0] - b[0]).abs() < 1e-6 && (a[1] - b[1]).abs() < 1e-6);
+/// The polyline of a wire between two points: a straight line.
+pub fn route(a: [f32; 2], b: [f32; 2]) -> Vec<[f32; 2]> {
+    vec![a, b]
 }
 
 // ── Abstraction interface pins ───────────────────────────────────────────────
@@ -796,7 +659,7 @@ pub fn resolve_endpoint(
     interface: Option<&ProjectAbstraction>,
     junctions: &[Junction],
     endpoint: &Endpoint,
-) -> Option<([f32; 2], ExitDir)> {
+) -> Option<[f32; 2]> {
     match endpoint {
         Endpoint::Port {
             component_id,
@@ -806,12 +669,12 @@ pub fn resolve_endpoint(
                 component_id: component_id.clone(),
                 port_name: port_name.clone(),
             };
-            let (pos, side) = port_geom_any(abstractions, components, interface, &port)?;
-            Some((pos, Some(side)))
+            let (pos, _side) = port_geom_any(abstractions, components, interface, &port)?;
+            Some(pos)
         }
         Endpoint::Junction { junction_id } => {
             let j = junctions.iter().find(|j| &j.id == junction_id)?;
-            Some((j.pos, None))
+            Some(j.pos)
         }
     }
 }
@@ -825,11 +688,9 @@ pub fn route_segment(
     segment_index: usize,
 ) -> Option<Vec<[f32; 2]>> {
     let seg = net.segments.get(segment_index)?;
-    let (a, a_dir) =
-        resolve_endpoint(abstractions, components, interface, &net.junctions, &seg.from)?;
-    let (b, b_dir) =
-        resolve_endpoint(abstractions, components, interface, &net.junctions, &seg.to)?;
-    Some(route(a, a_dir, b, b_dir))
+    let a = resolve_endpoint(abstractions, components, interface, &net.junctions, &seg.from)?;
+    let b = resolve_endpoint(abstractions, components, interface, &net.junctions, &seg.to)?;
+    Some(route(a, b))
 }
 
 /// What lies under a point on the sheet, in priority order: ports (including
@@ -850,6 +711,11 @@ pub enum Hit {
     Junction {
         net_id: String,
         junction_id: String,
+    },
+    /// The derived wire feeding an output pin (click selects, Delete
+    /// unwires the pin).
+    OutputWire {
+        pin: String,
     },
     Component {
         component_id: String,
@@ -935,6 +801,30 @@ pub fn hit_test(
                         segment_index: i,
                     };
                 }
+            }
+        }
+    }
+
+    // Derived output-pin wires.
+    if let Some(def) = interface {
+        let pins = interface_pins(abstractions, def);
+        for (name, target) in &def.outputs {
+            if target.is_empty() {
+                continue;
+            }
+            let Some(pin) = pins
+                .iter()
+                .find(|pg| pg.io == PortKind::Output && &pg.name == name)
+            else {
+                continue;
+            };
+            let port = output_target_port(target);
+            let Some((from, _)) = port_geom_any(abstractions, components, interface, &port)
+            else {
+                continue;
+            };
+            if polyline_dist(&route(from, pin.pos), p) <= WIRE_HIT_RADIUS {
+                return Hit::OutputWire { pin: name.clone() };
             }
         }
     }
@@ -1031,7 +921,7 @@ mod tests {
         let out = ports.iter().find(|p| p.info.name == "out").unwrap();
         assert_eq!(a.pos, [10.0, 20.5]);
         assert_eq!(b.pos, [10.0, 21.5]);
-        assert_eq!(out.pos, [13.0, 21.0]);
+        assert_eq!(out.pos, [13.0, 20.5], "outputs sit on half-grid slots too");
         assert_eq!(out.side, Side::Right);
     }
 
@@ -1045,154 +935,51 @@ mod tests {
     }
 
     #[test]
-    fn route_straight_line() {
-        let pts = route([3.0, 1.0], Some(Side::Right), [8.0, 1.0], Some(Side::Left));
-        assert_eq!(pts.first(), Some(&[3.0, 1.0]));
-        assert_eq!(pts.last(), Some(&[8.0, 1.0]));
-        // Same y all the way: straight run.
-        assert!(pts.iter().all(|p| p[1] == 1.0));
-    }
-
-    #[test]
-    fn route_elbow_forward() {
-        let pts = route([3.0, 1.0], Some(Side::Right), [10.0, 5.0], Some(Side::Left));
-        // Orthogonal: every consecutive pair shares x or y.
-        for pair in pts.windows(2) {
-            assert!(
-                pair[0][0] == pair[1][0] || pair[0][1] == pair[1][1],
-                "non-orthogonal step {:?}",
-                pair
-            );
-        }
-        assert_eq!(pts.first(), Some(&[3.0, 1.0]));
-        assert_eq!(pts.last(), Some(&[10.0, 5.0]));
-    }
-
-    #[test]
-    fn route_backward_arcs_over() {
-        // Target is to the LEFT of an output that exits right.
-        let pts = route([10.0, 1.0], Some(Side::Right), [2.0, 5.0], Some(Side::Left));
-        for pair in pts.windows(2) {
-            assert!(pair[0][0] == pair[1][0] || pair[0][1] == pair[1][1]);
-        }
-        // First step must still exit rightward.
-        assert!(pts[1][0] > pts[0][0]);
-        // Last step must approach the input from its left.
-        let n = pts.len();
-        assert!(pts[n - 2][0] < pts[n - 1][0]);
-        // The detour goes ABOVE both endpoints, not between them.
-        assert!(pts.iter().any(|p| p[1] < 1.0));
-    }
-
-    #[test]
-    fn route_backward_same_height_never_doubles_back() {
-        // Output at x=10 feeding an input at x=2 on the SAME row: a naive
-        // straight line would run backward through both components.
-        let pts = route([10.0, 1.0], Some(Side::Right), [2.0, 1.0], Some(Side::Left));
-        for pair in pts.windows(2) {
-            assert!(pair[0][0] == pair[1][0] || pair[0][1] == pair[1][1]);
-        }
-        assert!(pts[1][0] > pts[0][0], "must exit rightward first");
-        assert!(pts.iter().any(|p| p[1] < 1.0), "must arc around");
-        let n = pts.len();
-        assert!(pts[n - 2][0] < pts[n - 1][0], "must arrive from the left");
-    }
-
-    #[test]
-    fn route_vertical_exits() {
-        // Output on a TOP edge feeding an input on a LEFT edge below-right:
-        // out exits upward, must come around cleanly.
-        let pts = route([5.0, 3.0], Some(Side::Top), [9.0, 6.0], Some(Side::Left));
-        for pair in pts.windows(2) {
-            assert!(pair[0][0] == pair[1][0] || pair[0][1] == pair[1][1]);
-        }
-        // First leg leaves upward.
-        assert!(pts[1][1] < pts[0][1]);
-        // Arrival comes from the input's left.
-        let n = pts.len();
-        assert!(pts[n - 2][0] < pts[n - 1][0]);
-
-        // Input on a TOP edge approached from below: the wire wraps above.
-        let pts = route([0.0, 0.0], Some(Side::Right), [5.0, -3.0], Some(Side::Top));
-        let n = pts.len();
-        assert!(pts[n - 2][1] < pts[n - 1][1], "must enter a top port from above");
-        assert!(pts.iter().any(|p| p[1] < -3.4), "must rise above the stub");
-    }
-
-    #[test]
-    fn custom_port_layout_places_ports_on_any_edge() {
+    fn custom_port_layout_places_ports_on_any_edge_snapped() {
         use crate::project::{PortSide, PortSpot};
         let mut abs = abs_not();
-        abs.port_layout.insert(
-            "x".into(),
-            PortSpot { side: PortSide::Top, t: 0.5 },
-        );
-        abs.port_layout.insert(
-            "out".into(),
-            PortSpot { side: PortSide::Bottom, t: 0.25 },
-        );
+        abs.port_layout
+            .insert("x".into(), PortSpot { side: PortSide::Top, t: 0.5 });
+        abs.port_layout
+            .insert("out".into(), PortSpot { side: PortSide::Bottom, t: 0.25 });
         let abstractions = vec![abs];
         let c = comp("n1", "not", 10.0, 20.0); // 4x2 footprint
         let ports = component_ports(&abstractions, &c);
         let x = ports.iter().find(|p| p.info.name == "x").unwrap();
         assert_eq!(x.side, Side::Top);
-        assert_eq!(x.pos, [12.0, 20.0]);
+        assert_eq!(x.pos, [12.5, 20.0], "snapped to a half-grid slot");
         let out = ports.iter().find(|p| p.info.name == "out").unwrap();
         assert_eq!(out.side, Side::Bottom);
-        assert_eq!(out.pos, [11.0, 22.0]);
+        assert_eq!(out.pos, [11.5, 22.0]);
     }
 
-    /// A polyline retraces itself when two consecutive co-linear legs point
-    /// in opposite directions — the signature of stabbing through a port.
-    fn assert_no_retrace(pts: &[[f32; 2]]) {
-        let legs: Vec<[f32; 2]> = pts
-            .windows(2)
-            .map(|p| [p[1][0] - p[0][0], p[1][1] - p[0][1]])
-            .filter(|d| d[0].abs() > 1e-6 || d[1].abs() > 1e-6)
-            .collect();
-        for pair in legs.windows(2) {
-            let (a, b) = (pair[0], pair[1]);
-            let colinear = (a[0].abs() > 1e-6) == (b[0].abs() > 1e-6);
-            if colinear {
-                assert!(
-                    a[0] * b[0] >= 0.0 && a[1] * b[1] >= 0.0,
-                    "retrace: leg {a:?} then {b:?} in {pts:?}"
-                );
-            }
+    #[test]
+    fn current_port_spots_round_trips_the_auto_layout() {
+        // Freezing the auto layout must not move anything: spots derived
+        // from the current geometry place ports exactly where they were.
+        let mut abs = abs_not();
+        abs.width = 4.0;
+        abs.height = 3.0;
+        let abstractions = vec![abs.clone()];
+        let before = component_ports(&abstractions, &comp("n1", "not", 0.0, 0.0));
+        let spots = current_port_spots(&abstractions, &abstractions[0]);
+        let mut frozen = abs.clone();
+        for (name, side, t) in spots {
+            frozen
+                .port_layout
+                .insert(name, crate::project::PortSpot { side, t });
+        }
+        let frozen_list = vec![frozen];
+        let after = component_ports(&frozen_list, &comp("n1", "not", 0.0, 0.0));
+        for (b, a) in before.iter().zip(after.iter()) {
+            assert_eq!(b.info.name, a.info.name);
+            assert_eq!(b.pos, a.pos, "freeze moved port {}", b.info.name);
         }
     }
 
     #[test]
-    fn route_mixed_axis_detours_never_retrace() {
-        // The two degenerate combos found in review: horizontal exit into a
-        // Bottom port behind it, and vertical exit into a Right port.
-        for (a, ad, b, bd) in [
-            ([10.0, 0.0], Side::Right, [2.0, 5.0], Side::Bottom),
-            ([5.0, 10.0], Side::Bottom, [0.0, 2.0], Side::Right),
-            ([0.0, 0.0], Side::Left, [5.0, -3.0], Side::Top),
-            ([3.0, 0.0], Side::Top, [3.0, 6.0], Side::Left),
-        ] {
-            let pts = route(a, Some(ad), b, Some(bd));
-            for pair in pts.windows(2) {
-                assert!(
-                    pair[0][0] == pair[1][0] || pair[0][1] == pair[1][1],
-                    "non-orthogonal in {pts:?}"
-                );
-            }
-            assert_no_retrace(&pts);
-        }
-        // And the plain cases still hold.
-        assert_no_retrace(&route([10.0, 1.0], Some(Side::Right), [2.0, 1.0], Some(Side::Left)));
-        assert_no_retrace(&route([8.0, 1.0], None, [2.0, 1.0], Some(Side::Left)));
-    }
-
-    #[test]
-    fn route_junction_into_port_respects_port_side() {
-        // A junction RIGHT of an input port: the wire must swing around to
-        // approach the port from its left, not stab it from the right.
-        let pts = route([8.0, 1.0], None, [2.0, 1.0], Some(Side::Left));
-        let n = pts.len();
-        assert!(pts[n - 2][0] < pts[n - 1][0], "arrive traveling rightward");
+    fn wires_are_straight_lines() {
+        assert_eq!(route([3.0, 1.0], [8.0, 4.0]), vec![[3.0, 1.0], [8.0, 4.0]]);
     }
 
     #[test]
@@ -1236,7 +1023,11 @@ mod tests {
         // clk out is at (2, 1); nand a is at (6, 0.5). Midpoint of the run
         // sits near x=4 — probe a point on the wire.
         let pts = route_segment(&[], &comps, None, &net, 0).unwrap();
-        let mid = pts[pts.len() / 2];
+        // Probe the middle of the straight run (endpoints are ports).
+        let mid = [
+            (pts[0][0] + pts[1][0]) / 2.0,
+            (pts[0][1] + pts[1][1]) / 2.0,
+        ];
         let hit = hit_test(&[], &comps, std::slice::from_ref(&net), &[], None, mid);
         assert!(matches!(hit, Hit::Wire { ref net_id, .. } if net_id == "w1"));
     }

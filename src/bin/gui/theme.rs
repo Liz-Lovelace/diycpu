@@ -175,12 +175,6 @@ pub fn status_error() -> Color {
 pub fn status_info() -> Color {
     hex(0x5A6270)
 }
-pub fn tooltip_bg() -> Color {
-    Color::rgba(43, 48, 59, 235)
-}
-pub fn tooltip_text() -> Color {
-    hex(0xF5F6F8)
-}
 
 // ── Layout constants (pixels) ──
 pub const PALETTE_WIDTH: f32 = 190.0;

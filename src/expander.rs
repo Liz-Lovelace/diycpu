@@ -16,11 +16,6 @@ pub enum ExpandError {
         context: String,
         reference: String,
     },
-    MissingAbstractionInput {
-        instance: String,
-        abstraction: String,
-        input: String,
-    },
     ExtraAbstractionInput {
         instance: String,
         abstraction: String,
@@ -50,14 +45,6 @@ impl fmt::Display for ExpandError {
             Self::UnknownReference { context, reference } => {
                 write!(f, "Unknown reference \"{reference}\" in \"{context}\"")
             }
-            Self::MissingAbstractionInput {
-                instance,
-                abstraction,
-                input,
-            } => write!(
-                f,
-                "Instance \"{instance}\" of \"{abstraction}\" is missing input \"{input}\""
-            ),
             Self::ExtraAbstractionInput {
                 instance,
                 abstraction,
@@ -115,9 +102,14 @@ pub fn expand(circuit_def: &CircuitDef) -> Result<ExpandedCircuit, ExpandError> 
         } else if let Some(abstraction) =
             abstraction_map.get(component.component_type.as_str())
         {
-            let input_bindings = component.inputs.clone();
+            let mut input_bindings = component.inputs.clone();
 
-            validate_instance_inputs(&component.name, abstraction, &input_bindings)?;
+            complete_instance_inputs(
+                &component.name,
+                abstraction,
+                &mut input_bindings,
+                &mut flat_components,
+            )?;
 
             let output_mapping = expand_instance(
                 &component.name,
@@ -125,6 +117,7 @@ pub fn expand(circuit_def: &CircuitDef) -> Result<ExpandedCircuit, ExpandError> 
                 &input_bindings,
                 &abstraction_map,
                 &mut flat_components,
+                &mut aliases,
             )?;
 
             for (output_name, flat_target_name) in output_mapping {
@@ -244,20 +237,25 @@ fn check_abstraction_cycles(
     Ok(())
 }
 
-/// Validate that an instance provides exactly the inputs declared by its abstraction.
-fn validate_instance_inputs(
+/// Complete an instance's input bindings: an unconnected abstraction input
+/// reads as constant 0, so each missing binding gets a synthesized zero
+/// source. Extra (undeclared) inputs are still rejected.
+fn complete_instance_inputs(
     instance_name: &str,
     abstraction: &AbstractionDef,
-    input_bindings: &HashMap<String, String>,
+    input_bindings: &mut HashMap<String, String>,
+    flat_components: &mut Vec<ComponentDef>,
 ) -> Result<(), ExpandError> {
-    // Check all declared inputs are provided.
     for declared_input in &abstraction.inputs {
         if !input_bindings.contains_key(declared_input) {
-            return Err(ExpandError::MissingAbstractionInput {
-                instance: instance_name.to_string(),
-                abstraction: abstraction.name.clone(),
-                input: declared_input.clone(),
+            let zero_name = format!("{instance_name}/{declared_input}__unconnected");
+            flat_components.push(ComponentDef {
+                component_type: "dff".into(),
+                name: zero_name.clone(),
+                init: Some(false),
+                inputs: HashMap::new(),
             });
+            input_bindings.insert(declared_input.clone(), zero_name);
         }
     }
 
@@ -285,6 +283,7 @@ fn expand_instance(
     input_bindings: &HashMap<String, String>,
     abstraction_map: &HashMap<&str, &AbstractionDef>,
     flat_components: &mut Vec<ComponentDef>,
+    aliases: &mut HashMap<String, String>,
 ) -> Result<HashMap<String, String>, ExpandError> {
     // Phase 1: Register all internal component flat names.
     let mut internal_name_map: HashMap<String, String> = HashMap::new();
@@ -307,17 +306,18 @@ fn expand_instance(
                         type_name: component.component_type.clone(),
                     })?;
 
-            let sub_input_bindings = resolve_input_map(
+            let mut sub_input_bindings = resolve_input_map(
                 &format!("{name_prefix}/{}", component.name),
                 &component.inputs,
                 input_bindings,
                 &internal_name_map,
             )?;
 
-            validate_instance_inputs(
+            complete_instance_inputs(
                 &format!("{name_prefix}/{}", component.name),
                 sub_abstraction,
-                &sub_input_bindings,
+                &mut sub_input_bindings,
+                flat_components,
             )?;
 
             let sub_output_mapping = expand_instance(
@@ -326,10 +326,18 @@ fn expand_instance(
                 &sub_input_bindings,
                 abstraction_map,
                 flat_components,
+                aliases,
             )?;
 
-            // Register sub-output aliases: "comp_name.out_name" -> flat name.
+            // Register sub-output aliases: "comp_name.out_name" -> flat name
+            // locally, and "prefix/comp_name.out_name" globally so nested
+            // instance outputs stay addressable (the GUI reads them when
+            // showing live values inside zoomed abstractions).
             for (output_name, flat_target_name) in sub_output_mapping {
+                aliases.insert(
+                    format!("{name_prefix}/{}.{}", component.name, output_name),
+                    flat_target_name.clone(),
+                );
                 internal_name_map.insert(
                     format!("{}.{}", component.name, output_name),
                     flat_target_name,
@@ -516,14 +524,20 @@ mod tests {
     }
 
     #[test]
-    fn reject_missing_abstraction_input() {
+    fn missing_abstraction_input_reads_zero() {
+        use crate::compiler::compile;
+        use crate::simulator::simulate;
         let def = CircuitBuilder::new("test", 1)
             .abstraction(not_abstraction())
             .dff("a").done()
             .component("not", "my_not", &[])
             .build();
-        let err = expand(&def).unwrap_err();
-        assert!(matches!(err, ExpandError::MissingAbstractionInput { .. }));
+        // The unconnected input is a constant 0, so NOT(0) = 1.
+        let expanded = expand(&def).unwrap();
+        let compiled = compile(&expanded.def).unwrap();
+        let results = simulate(&compiled);
+        let flat = expanded.aliases.get("my_not.out").unwrap();
+        assert!(results[0][flat]);
     }
 
     #[test]

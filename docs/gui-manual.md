@@ -16,15 +16,16 @@ exit), `--run N` (enter run mode and step N times first), `--sheet name`
 | Move | Drag a component. Multi-selections move together. |
 | Select | Click a component; Ctrl-click to add/remove; drag on empty canvas for a box select; click a wire to select its net. |
 | Wire | Click or drag from any port. Click a compatible port to connect; click empty canvas to drop a **node** and keep drawing from it; right-click or Esc to stop (everything placed stays). Wiring an already-connected input replaces its old connection. |
-| Wire nodes | Click a node to draw a new branch from it (fan-out). Drag a node to move it. Hover a node and press Delete to remove it — the wire splits where it was cut. Stubs are fine: wires don't need to connect anything to exist. |
+| Wire nodes | Click a node to draw a new branch from it (fan-out). Drag a node to move it. Double-click anywhere on a wire to insert a node right there. Hover a node or a wire segment and press Delete to remove just that piece — the wire splits where it was cut. Stubs are fine: wires don't need to connect anything to exist. |
 | Delete | Select, then Delete/Backspace. Deleting a component cleans up its connections but leaves your routed wires as stubs. |
 | Flip a DFF's start value | Double-click it — the big digit on its face is the stored bit. |
+| Constant signal | The “const” primitive is a toggleable 0/1 source (double-click flips it) — handy for feeding test inputs. Unconnected inputs always read as 0. |
 | Notes | Pick “note” in the palette, click the canvas, type. Double-click a note to edit it (empty text removes it); drag to move; notes can sit anywhere. |
 | Duplicate | Ctrl+D. |
 | Undo / redo | Ctrl+Z / Ctrl+Shift+Z (or Ctrl+Y). One action = one undo step; a cancelled gesture never becomes one. |
 | Cancel anything | Esc or right-click. |
 | Pan / zoom | Middle- or right-drag; scroll wheel zooms at the cursor. `F` fits the circuit, Ctrl+0 resets zoom. |
-| Files | Ctrl+S save, Ctrl+Shift+S save as, Ctrl+O open, Ctrl+N new — native file dialogs; unsaved changes ask you to repeat the action to confirm. |
+| Files | Saving is automatic: once the project has a file (opened, or Save As once), every change writes straight through. Ctrl+S/Ctrl+Shift+S choose the file, Ctrl+O opens, Ctrl+N starts fresh. |
 | Rename the project | Click its name in the title bar. |
 
 ## Infinite zoom
@@ -49,6 +50,9 @@ level. The title bar shows where you are (`project ▸ alu ▸ adder`).
   pins inside is the port order on the closed rectangle outside.
   Double-click a pin's name plate to rename it (every wire and instance
   follows); click it and press Delete to remove it.
+- **Closed-rectangle layout**: the “Layout” button opens a dialog where
+  you drag each port to any edge (top and bottom included) and resize the
+  component by its corner — make a tiny XOR or a big processor core.
 - **Rename / delete the abstraction**: the toolbar buttons inside its
   sheet (or click the title). Deleting is refused while instances of it
   are still placed somewhere.
@@ -64,7 +68,9 @@ clock back and forward (Home rewinds), or press **P** (or “Play”) to let
 it run on its own — stepping by hand pauses it. `P` from edit mode starts
 running and playing in one go. Wires glow amber when high, flip-flops fill
 amber while storing a 1, every primitive shows its value badge, and
-editing is locked until you stop (Esc, Space, or “■ Stop”).
+editing is locked until you stop (Esc, Space, or “■ Stop”). You can zoom
+into abstractions while the simulation runs — their internals light up
+with live values too.
 
 Hotkeys are printed right on the toolbar buttons.
 

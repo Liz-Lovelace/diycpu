@@ -117,10 +117,17 @@ fn build_engine_components(
             }
         }
 
+        // A `const` is exactly a DFF that never latches: same init-driven
+        // output, no inputs. Lower it here so the engine stays simple.
+        let (engine_type, init) = if pc.component_type == "const" {
+            ("dff".to_string(), pc.init.or(Some(false)))
+        } else {
+            (pc.component_type.clone(), pc.init)
+        };
         engine_components.push(ComponentDef {
-            component_type: pc.component_type.clone(),
+            component_type: engine_type,
             name: pc.id.clone(),
-            init: pc.init,
+            init,
             inputs,
         });
     }
@@ -267,6 +274,7 @@ mod tests {
             steps: 0,
             abstractions: vec![ProjectAbstraction {
                 pin_positions: HashMap::new(),
+                port_layout: HashMap::new(),
                 notes: vec![],
                 name: "not".into(),
                 inputs: vec!["x".into()],
@@ -321,6 +329,7 @@ mod tests {
             steps: 0,
             abstractions: vec![ProjectAbstraction {
                 pin_positions: HashMap::new(),
+                port_layout: HashMap::new(),
                 notes: vec![],
                 name: "not".into(),
                 inputs: vec!["x".into()],

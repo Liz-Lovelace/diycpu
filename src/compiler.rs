@@ -18,10 +18,6 @@ pub enum CompileError {
         component: String,
         type_name: String,
     },
-    MissingInput {
-        component: String,
-        input: String,
-    },
 }
 
 impl fmt::Display for CompileError {
@@ -43,9 +39,6 @@ impl fmt::Display for CompileError {
                 f,
                 "Unknown primitive type \"{type_name}\" for component \"{component}\""
             ),
-            Self::MissingInput { component, input } => {
-                write!(f, "Missing input \"{input}\" in component \"{component}\"")
-            }
         }
     }
 }
@@ -56,8 +49,9 @@ impl std::error::Error for CompileError {}
 pub enum CompiledComponent {
     Clk,
     Nand {
-        input_a: usize,
-        input_b: usize,
+        /// An unconnected input reads as constant 0.
+        input_a: Option<usize>,
+        input_b: Option<usize>,
     },
     Dff {
         init: bool,
@@ -129,28 +123,20 @@ fn build_compiled_component(
     match component.component_type.as_str() {
         "clk" => Ok(CompiledComponent::Clk),
         "nand" => {
-            let input_a_name =
-                component.inputs
-                    .get("a")
-                    .ok_or_else(|| CompileError::MissingInput {
-                        component: component.name.clone(),
-                        input: "a".to_string(),
-                    })?;
-            let input_b_name =
-                component.inputs
-                    .get("b")
-                    .ok_or_else(|| CompileError::MissingInput {
-                        component: component.name.clone(),
-                        input: "b".to_string(),
-                    })?;
-
-            let input_a_index =
-                resolve_input_reference(&component.name, input_a_name, name_to_index)?;
-            let input_b_index =
-                resolve_input_reference(&component.name, input_b_name, name_to_index)?;
+            // Unconnected inputs read as constant 0.
+            let input_a_index = component
+                .inputs
+                .get("a")
+                .map(|name| resolve_input_reference(&component.name, name, name_to_index))
+                .transpose()?;
+            let input_b_index = component
+                .inputs
+                .get("b")
+                .map(|name| resolve_input_reference(&component.name, name, name_to_index))
+                .transpose()?;
 
             let own_index = name_to_index[component.name.as_str()];
-            if input_a_index == own_index || input_b_index == own_index {
+            if input_a_index == Some(own_index) || input_b_index == Some(own_index) {
                 return Err(CompileError::SelfReference {
                     component: component.name.clone(),
                 });
@@ -214,17 +200,19 @@ fn topological_sort(
     // Build the dependency graph among NAND gates only.
     for (component_index, component) in components.iter().enumerate() {
         if let CompiledComponent::Nand { input_a, input_b } = component {
-            let source_a = *input_a;
-            let source_b = *input_b;
-
-            if matches!(components[source_a], CompiledComponent::Nand { .. }) {
-                incoming_edge_count[component_index] += 1;
-                downstream_dependents[source_a].push(component_index);
+            if let Some(source_a) = *input_a {
+                if matches!(components[source_a], CompiledComponent::Nand { .. }) {
+                    incoming_edge_count[component_index] += 1;
+                    downstream_dependents[source_a].push(component_index);
+                }
             }
-            if matches!(components[source_b], CompiledComponent::Nand { .. }) && source_a != source_b
-            {
-                incoming_edge_count[component_index] += 1;
-                downstream_dependents[source_b].push(component_index);
+            if let Some(source_b) = *input_b {
+                if matches!(components[source_b], CompiledComponent::Nand { .. })
+                    && *input_a != Some(source_b)
+                {
+                    incoming_edge_count[component_index] += 1;
+                    downstream_dependents[source_b].push(component_index);
+                }
             }
         }
     }
@@ -408,11 +396,13 @@ mod tests {
     }
 
     #[test]
-    fn reject_nand_missing_inputs() {
+    fn nand_with_unconnected_inputs_reads_zeros() {
+        use crate::simulator::simulate;
         let def = CircuitBuilder::new("test", 1)
             .component("nand", "x", &[])
             .build();
-        let err = compile(&def).unwrap_err();
-        assert!(matches!(err, CompileError::MissingInput { .. }));
+        let circuit = compile(&def).unwrap();
+        // NAND(0, 0) = 1.
+        assert!(simulate(&circuit)[0]["x"]);
     }
 }

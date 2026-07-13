@@ -37,6 +37,7 @@ struct CliArgs {
     screenshot: Option<PathBuf>,
     run_steps: Option<usize>,
     sheet: Option<String>,
+    dialog: bool,
     camera: Option<(f32, f32, f32)>,
     size: (u32, u32),
 }
@@ -47,6 +48,7 @@ fn parse_args() -> CliArgs {
         screenshot: None,
         run_steps: None,
         sheet: None,
+        dialog: false,
         camera: None,
         size: (1280, 800),
     };
@@ -56,6 +58,7 @@ fn parse_args() -> CliArgs {
             "--screenshot" => args.screenshot = it.next().map(PathBuf::from),
             "--run" => args.run_steps = it.next().and_then(|s| s.parse().ok()),
             "--sheet" => args.sheet = it.next(),
+            "--dialog" => args.dialog = true,
             "--camera" => {
                 if let Some(s) = it.next() {
                     let parts: Vec<f32> =
@@ -160,6 +163,9 @@ impl Shell {
                 app.open_as_root(i);
             }
         }
+        if args.dialog {
+            app.action_open_layout_dialog();
+        }
         if let Some((zoom, x, y)) = args.camera {
             app.camera.zoom = zoom;
             app.camera.offset = [x, y];
@@ -254,8 +260,13 @@ impl Shell {
         self.window.set_cursor(icon);
     }
 
-    /// Left press: chrome first, then canvas (with double-click detection).
+    /// Left press: dialog first, then chrome, then canvas (with
+    /// double-click detection).
     fn left_pressed(&mut self) {
+        if self.app.layout_dialog.is_some() {
+            self.app.dialog_mouse_pressed();
+            return;
+        }
         let cursor = self.app.cursor;
         let ui = ui_layout(&self.app);
 
@@ -281,6 +292,7 @@ impl Shell {
                         self.app.action_add_pin(diycpu::layout::PortKind::Output)
                     }
                     ButtonId::RenameAbstraction => self.app.action_rename_title(),
+                    ButtonId::LayoutDialog => self.app.action_open_layout_dialog(),
                     ButtonId::DeleteAbstraction => self.app.action_delete_abstraction(),
                     ButtonId::BackToTop => self.app.action_back_to_top(),
                 }
@@ -395,16 +407,27 @@ impl ApplicationHandler for AppState {
             }
             WindowEvent::RedrawRequested => shell.render(event_loop),
             WindowEvent::CursorMoved { position, .. } => {
-                shell
-                    .app
-                    .mouse_moved([position.x as f32, position.y as f32]);
+                if shell.app.layout_dialog.is_some() {
+                    shell.app.cursor = [position.x as f32, position.y as f32];
+                    shell.app.dialog_mouse_moved();
+                } else {
+                    shell
+                        .app
+                        .mouse_moved([position.x as f32, position.y as f32]);
+                }
                 shell.update_cursor_icon();
                 shell.window.request_redraw();
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 match (button, state) {
                     (MouseButton::Left, ElementState::Pressed) => shell.left_pressed(),
-                    (MouseButton::Left, ElementState::Released) => shell.app.left_released(),
+                    (MouseButton::Left, ElementState::Released) => {
+                        if shell.app.layout_dialog.is_some() {
+                            shell.app.dialog_mouse_released();
+                        } else {
+                            shell.app.left_released();
+                        }
+                    }
                     (MouseButton::Middle | MouseButton::Right, ElementState::Pressed) => {
                         match shell.app.middle_or_right_pressed() {
                             PanOrCancel::Panning | PanOrCancel::Cancelled => {}
@@ -461,6 +484,7 @@ impl ApplicationHandler for AppState {
             }
             _ => {}
         }
+        shell.app.autosave();
     }
 }
 

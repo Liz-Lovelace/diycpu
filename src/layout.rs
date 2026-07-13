@@ -65,7 +65,7 @@ pub fn type_ports(
         kind,
     };
     match component_type {
-        "clk" => Some(vec![port("out", PortKind::Output)]),
+        "clk" | "const" => Some(vec![port("out", PortKind::Output)]),
         "nand" => Some(vec![
             port("a", PortKind::Input),
             port("b", PortKind::Input),
@@ -95,7 +95,7 @@ pub fn type_ports(
 /// Footprint size in grid units for a component type. None for unknown types.
 pub fn type_size(abstractions: &[ProjectAbstraction], component_type: &str) -> Option<[f32; 2]> {
     match component_type {
-        "clk" => Some([2.0, 2.0]),
+        "clk" | "const" => Some([2.0, 2.0]),
         "nand" | "dff" => Some([3.0, 2.0]),
         name => {
             let def = abstractions.iter().find(|a| a.name == name)?;
@@ -127,14 +127,36 @@ pub fn footprint(abstractions: &[ProjectAbstraction], comp: &ProjectComponent) -
 pub enum Side {
     Left,
     Right,
+    Top,
+    Bottom,
 }
 
 impl Side {
-    /// Unit x-direction a wire leaves/enters this side (outward normal).
-    pub fn outward_x(self) -> f32 {
+    /// Outward unit normal of this side (the direction wires leave in).
+    pub fn outward(self) -> [f32; 2] {
         match self {
-            Side::Left => -1.0,
-            Side::Right => 1.0,
+            Side::Left => [-1.0, 0.0],
+            Side::Right => [1.0, 0.0],
+            Side::Top => [0.0, -1.0],
+            Side::Bottom => [0.0, 1.0],
+        }
+    }
+
+    pub fn from_project(side: crate::project::PortSide) -> Side {
+        match side {
+            crate::project::PortSide::Left => Side::Left,
+            crate::project::PortSide::Right => Side::Right,
+            crate::project::PortSide::Top => Side::Top,
+            crate::project::PortSide::Bottom => Side::Bottom,
+        }
+    }
+
+    pub fn to_project(self) -> crate::project::PortSide {
+        match self {
+            Side::Left => crate::project::PortSide::Left,
+            Side::Right => crate::project::PortSide::Right,
+            Side::Top => crate::project::PortSide::Top,
+            Side::Bottom => crate::project::PortSide::Bottom,
         }
     }
 }
@@ -186,18 +208,39 @@ pub fn component_ports(
         });
     }
 
+    // Custom spots from the abstraction's port layout (any edge); ports
+    // without one auto-distribute on their default side.
+    let custom = |name: &str| -> Option<(Side, f32)> {
+        let def = abstractions.iter().find(|a| a.name == comp.component_type)?;
+        let spot = def.port_layout.get(name)?;
+        Some((Side::from_project(spot.side), spot.t.clamp(0.0, 1.0)))
+    };
+    let place = |side: Side, t: f32| -> [f32; 2] {
+        match side {
+            Side::Left => [rect.x, rect.y + rect.h * t],
+            Side::Right => [rect.x + rect.w, rect.y + rect.h * t],
+            Side::Top => [rect.x + rect.w * t, rect.y],
+            Side::Bottom => [rect.x + rect.w * t, rect.y + rect.h],
+        }
+    };
+
     let mut result = Vec::with_capacity(ports.len());
-    for (list, side) in [(inputs, Side::Left), (outputs, Side::Right)] {
-        let n = list.len();
-        for (i, info) in list.into_iter().enumerate() {
-            let x = match side {
-                Side::Left => rect.x,
-                Side::Right => rect.x + rect.w,
-            };
-            let y = rect.y + rect.h * (i as f32 + 0.5) / n as f32;
+    for (list, default_side) in [(inputs, Side::Left), (outputs, Side::Right)] {
+        let auto_count = list
+            .iter()
+            .filter(|p| custom(&p.name).is_none())
+            .count()
+            .max(1);
+        let mut auto_index = 0usize;
+        for info in list {
+            let (side, t) = custom(&info.name).unwrap_or_else(|| {
+                let t = (auto_index as f32 + 0.5) / auto_count as f32;
+                auto_index += 1;
+                (default_side, t)
+            });
             result.push(PortGeom {
                 info: info.clone(),
-                pos: [x, y],
+                pos: place(side, t),
                 side,
             });
         }
@@ -253,7 +296,10 @@ pub fn route(a: [f32; 2], a_dir: ExitDir, b: [f32; 2], b_dir: ExitDir) -> Vec<[f
 
 fn stub(p: [f32; 2], dir: ExitDir) -> [f32; 2] {
     match dir {
-        Some(side) => [p[0] + side.outward_x() * PORT_STUB, p[1]],
+        Some(side) => {
+            let o = side.outward();
+            [p[0] + o[0] * PORT_STUB, p[1] + o[1] * PORT_STUB]
+        }
         None => p,
     }
 }
@@ -267,39 +313,115 @@ fn connect_orthogonal(
     a_dir: ExitDir,
     b_dir: ExitDir,
 ) {
-    let dx = sb[0] - sa[0];
+    let step = |from: [f32; 2], to: [f32; 2]| -> [f32; 2] {
+        [to[0] - from[0], to[1] - from[1]]
+    };
+    // Leaving sa must not retrace a's stub; arriving at sb must not double
+    // back over b's stub.
+    let leaves_cleanly = |d: [f32; 2]| {
+        a_dir.map_or(true, |side| {
+            let o = side.outward();
+            d[0] * o[0] + d[1] * o[1] >= -1e-6
+        })
+    };
+    let arrives_cleanly = |d: [f32; 2]| {
+        b_dir.map_or(true, |side| {
+            let o = side.outward();
+            d[0] * o[0] + d[1] * o[1] <= 1e-6
+        })
+    };
+    let nonzero = |d: [f32; 2]| d[0].abs() > 1e-6 || d[1].abs() > 1e-6;
 
-    // Would horizontal travel in `x_dir` leave sa without doubling back
-    // over a's stub, and arrive at sb without doubling back over b's stub?
-    let leaves_a_cleanly =
-        |x_dir: f32| a_dir.map_or(true, |side| x_dir * side.outward_x() >= 0.0);
-    let arrives_b_cleanly =
-        |x_dir: f32| b_dir.map_or(true, |side| x_dir * side.outward_x() <= 0.0);
-    let horizontal_ok = dx != 0.0
-        && leaves_a_cleanly(dx.signum())
-        && arrives_b_cleanly(dx.signum());
+    // Direct candidates only make sense when each port faces the other:
+    // the displacement must have a non-negative component along each exit.
+    // A port that has to be approached from behind gets the wrap-around
+    // detour below (so wires arc around components, not through them).
+    let disp = [sb[0] - sa[0], sb[1] - sa[1]];
+    let a_faces = a_dir.map_or(true, |side| {
+        let o = side.outward();
+        disp[0] * o[0] + disp[1] * o[1] >= -1e-6
+    });
+    let b_faces = b_dir.map_or(true, |side| {
+        let o = side.outward();
+        -(disp[0] * o[0] + disp[1] * o[1]) >= -1e-6
+    });
 
-    if sa[0] == sb[0] {
-        // Vertical straight run between the stubs — always clean, the stubs
-        // themselves provide the horizontal entry/exit.
+    // Candidate polylines between the stubs, in preference order.
+    let mid_x = (sa[0] + sb[0]) / 2.0;
+    let mid_y = (sa[1] + sb[1]) / 2.0;
+    let candidates: [&[[f32; 2]]; 5] = [
+        &[],                                              // straight
+        &[[mid_x, sa[1]], [mid_x, sb[1]]],                // H-V-H
+        &[[sa[0], mid_y], [sb[0], mid_y]],                // V-H-V
+        &[[sb[0], sa[1]]],                                // L: H then V
+        &[[sa[0], sb[1]]],                                // L: V then H
+    ];
+
+    'candidate: for mids in candidates {
+        if !a_faces || !b_faces {
+            break 'candidate;
+        }
+        // The straight candidate only applies on an axis-aligned run.
+        if mids.is_empty() && (sa[0] - sb[0]).abs() > 1e-6 && (sa[1] - sb[1]).abs() > 1e-6 {
+            continue;
+        }
+        let mut points: Vec<[f32; 2]> = Vec::with_capacity(mids.len() + 2);
+        points.push(sa);
+        points.extend(mids.iter().copied());
+        points.push(sb);
+        // Validate first and last non-degenerate legs.
+        let mut first_leg = None;
+        let mut last_leg = None;
+        for pair in points.windows(2) {
+            let d = step(pair[0], pair[1]);
+            if nonzero(d) {
+                if first_leg.is_none() {
+                    first_leg = Some(d);
+                }
+                last_leg = Some(d);
+            }
+        }
+        let (Some(first), Some(last)) = (first_leg, last_leg) else {
+            // Zero-length: stubs coincide, nothing to add.
+            return;
+        };
+        if !leaves_cleanly(first) || !arrives_cleanly(last) {
+            continue 'candidate;
+        }
+        pts.extend(mids.iter().copied());
         return;
     }
-    if sa[1] == sb[1] && horizontal_ok {
-        return; // straight horizontal run
-    }
 
-    if horizontal_ok {
-        // H-V-H through the midpoint: ┌─┐ shape.
-        let mid_x = (sa[0] + sb[0]) / 2.0;
-        pts.push([mid_x, sa[1]]);
-        pts.push([mid_x, sb[1]]);
-    } else {
-        // The target is behind one of the exits: detour around, above the
-        // higher of the two endpoints, so the wire arcs over components
-        // instead of cutting through the space between them.
+    // Nothing clean fits: extend both stubs outward and detour around,
+    // offset perpendicular so the run never doubles back through the ports.
+    let ext = |p: [f32; 2], dir: ExitDir| -> [f32; 2] {
+        match dir {
+            Some(side) => {
+                let o = side.outward();
+                [p[0] + o[0] * DETOUR, p[1] + o[1] * DETOUR]
+            }
+            None => p,
+        }
+    };
+    let ea = ext(sa, a_dir);
+    let eb = ext(sb, b_dir);
+    // Detour axis: perpendicular to a's exit (or b's when a is free).
+    let horizontal_exit = match a_dir.or(b_dir) {
+        Some(Side::Left) | Some(Side::Right) | None => true,
+        Some(Side::Top) | Some(Side::Bottom) => false,
+    };
+    if horizontal_exit {
         let detour_y = sa[1].min(sb[1]) - DETOUR;
-        pts.push([sa[0], detour_y]);
-        pts.push([sb[0], detour_y]);
+        pts.push(ea);
+        pts.push([ea[0], detour_y]);
+        pts.push([eb[0], detour_y]);
+        pts.push(eb);
+    } else {
+        let detour_x = sa[0].min(sb[0]) - DETOUR;
+        pts.push(ea);
+        pts.push([detour_x, ea[1]]);
+        pts.push([detour_x, eb[1]]);
+        pts.push(eb);
     }
 }
 
@@ -863,6 +985,7 @@ mod tests {
     fn abs_not() -> ProjectAbstraction {
         ProjectAbstraction {
             pin_positions: HashMap::new(),
+            port_layout: HashMap::new(),
             name: "not".into(),
             inputs: vec!["x".into()],
             outputs: HashMap::from([("out".into(), "gate".into())]),
@@ -966,6 +1089,50 @@ mod tests {
         assert!(pts.iter().any(|p| p[1] < 1.0), "must arc around");
         let n = pts.len();
         assert!(pts[n - 2][0] < pts[n - 1][0], "must arrive from the left");
+    }
+
+    #[test]
+    fn route_vertical_exits() {
+        // Output on a TOP edge feeding an input on a LEFT edge below-right:
+        // out exits upward, must come around cleanly.
+        let pts = route([5.0, 3.0], Some(Side::Top), [9.0, 6.0], Some(Side::Left));
+        for pair in pts.windows(2) {
+            assert!(pair[0][0] == pair[1][0] || pair[0][1] == pair[1][1]);
+        }
+        // First leg leaves upward.
+        assert!(pts[1][1] < pts[0][1]);
+        // Arrival comes from the input's left.
+        let n = pts.len();
+        assert!(pts[n - 2][0] < pts[n - 1][0]);
+
+        // Input on a TOP edge approached from below: the wire wraps above.
+        let pts = route([0.0, 0.0], Some(Side::Right), [5.0, -3.0], Some(Side::Top));
+        let n = pts.len();
+        assert!(pts[n - 2][1] < pts[n - 1][1], "must enter a top port from above");
+        assert!(pts.iter().any(|p| p[1] < -3.4), "must rise above the stub");
+    }
+
+    #[test]
+    fn custom_port_layout_places_ports_on_any_edge() {
+        use crate::project::{PortSide, PortSpot};
+        let mut abs = abs_not();
+        abs.port_layout.insert(
+            "x".into(),
+            PortSpot { side: PortSide::Top, t: 0.5 },
+        );
+        abs.port_layout.insert(
+            "out".into(),
+            PortSpot { side: PortSide::Bottom, t: 0.25 },
+        );
+        let abstractions = vec![abs];
+        let c = comp("n1", "not", 10.0, 20.0); // 4x2 footprint
+        let ports = component_ports(&abstractions, &c);
+        let x = ports.iter().find(|p| p.info.name == "x").unwrap();
+        assert_eq!(x.side, Side::Top);
+        assert_eq!(x.pos, [12.0, 20.0]);
+        let out = ports.iter().find(|p| p.info.name == "out").unwrap();
+        assert_eq!(out.side, Side::Bottom);
+        assert_eq!(out.pos, [11.0, 22.0]);
     }
 
     #[test]

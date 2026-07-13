@@ -65,6 +65,27 @@ pub struct ProjectAbstraction {
     /// grid units. Pins without an entry get an automatic rail position.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub pin_positions: HashMap<String, [f32; 2]>,
+    /// Where each port sits on the CLOSED rectangle (any edge). Ports
+    /// without an entry lay out automatically (inputs left, outputs right).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub port_layout: HashMap<String, PortSpot>,
+}
+
+/// A port's spot on the closed rectangle: an edge plus a 0..1 fraction
+/// along it.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq)]
+pub struct PortSpot {
+    pub side: PortSide,
+    pub t: f32,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum PortSide {
+    Left,
+    Right,
+    Top,
+    Bottom,
 }
 
 fn default_width() -> f32 {
@@ -234,6 +255,7 @@ mod tests {
             steps: 0,
             abstractions: vec![ProjectAbstraction {
                 pin_positions: HashMap::new(),
+                port_layout: HashMap::new(),
                 notes: vec![],
                 name: "not".into(),
                 inputs: vec!["x".into()],

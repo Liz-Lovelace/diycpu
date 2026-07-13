@@ -21,6 +21,7 @@ pub enum ButtonId {
     AddInputPin,
     AddOutputPin,
     RenameAbstraction,
+    LayoutDialog,
     DeleteAbstraction,
     BackToTop,
 }
@@ -77,7 +78,7 @@ pub fn ui_layout(app: &App) -> UiLayout {
         _ => None,
     };
 
-    let is_builtin = |name: &str| matches!(name, "clk" | "nand" | "dff" | "note");
+    let is_builtin = |name: &str| matches!(name, "clk" | "nand" | "dff" | "const" | "note");
     for item in app.palette_items() {
         let is_abstraction_start = !is_builtin(&item)
             && !palette_items
@@ -179,6 +180,7 @@ pub fn ui_layout(app: &App) -> UiLayout {
                         (ButtonId::AddInputPin, "+ input", None, 76.0),
                         (ButtonId::AddOutputPin, "+ output", None, 86.0),
                         (ButtonId::RenameAbstraction, "Rename", None, 76.0),
+                        (ButtonId::LayoutDialog, "Layout", None, 72.0),
                         (ButtonId::DeleteAbstraction, "Delete", None, 72.0),
                     ]
                 } else {
@@ -201,7 +203,7 @@ pub fn ui_layout(app: &App) -> UiLayout {
     // Right-aligned buttons.
     let mut rx = app.window_size[0] - 12.0;
     for (id, label, hotkey, w) in [
-        (ButtonId::Save, "Save", Some("Ctrl+S"), 106.0),
+        (ButtonId::Save, "Save as", Some("Ctrl+S"), 116.0),
         (ButtonId::Open, "Open", Some("Ctrl+O"), 100.0),
         (ButtonId::Fit, "Fit view", Some("F"), 98.0),
     ] {

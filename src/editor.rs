@@ -261,7 +261,7 @@ impl Editor {
             components.push(ProjectComponent {
                 id: id.clone(),
                 component_type: type_name.clone(),
-                init: (type_name == "dff").then_some(false),
+                init: (type_name == "dff" || type_name == "const").then_some(false),
                 pos: [pos[0] as f32, pos[1] as f32],
             });
             Ok(id)
@@ -547,6 +547,70 @@ impl Editor {
         })
     }
 
+    /// Delete one wire segment. If that cuts the net into disconnected
+    /// pieces, each piece becomes its own net.
+    pub fn delete_segment(
+        &mut self,
+        net_id: &str,
+        segment_index: usize,
+    ) -> Result<(), EditError> {
+        let net_id = net_id.to_string();
+        self.mutate(move |project, sheet| {
+            let ctx = KindCtx::new(project, sheet)?;
+            let (components, wire_nets) =
+                sheet_mut(project, sheet).ok_or(EditError::BadSheet)?;
+            let net = wire_nets
+                .iter_mut()
+                .find(|n| n.id == net_id)
+                .ok_or_else(|| EditError::UnknownJunction(net_id.clone()))?;
+            if segment_index >= net.segments.len() {
+                return Err(EditError::NoopWire);
+            }
+            net.segments.remove(segment_index);
+            repair_nets(wire_nets, components, &ctx)?;
+            Ok(())
+        })
+    }
+
+    /// Split a segment by inserting a node at `pos` — the wire then runs
+    /// through it and new branches can grow from it. Returns the node's id.
+    pub fn insert_junction(
+        &mut self,
+        net_id: &str,
+        segment_index: usize,
+        pos: [f32; 2],
+    ) -> Result<String, EditError> {
+        let net_id = net_id.to_string();
+        self.mutate(move |project, sheet| {
+            let (_, wire_nets) = sheet_mut(project, sheet).ok_or(EditError::BadSheet)?;
+            let net = wire_nets
+                .iter_mut()
+                .find(|n| n.id == net_id)
+                .ok_or_else(|| EditError::UnknownJunction(net_id.clone()))?;
+            if segment_index >= net.segments.len() {
+                return Err(EditError::NoopWire);
+            }
+            let seg = net.segments.remove(segment_index);
+            let junction_id = generate_junction_id(net);
+            net.junctions.push(Junction {
+                id: junction_id.clone(),
+                pos,
+            });
+            let mid = Endpoint::Junction {
+                junction_id: junction_id.clone(),
+            };
+            net.segments.push(crate::project::Segment {
+                from: seg.from,
+                to: mid.clone(),
+            });
+            net.segments.push(crate::project::Segment {
+                from: mid,
+                to: seg.to,
+            });
+            Ok(junction_id)
+        })
+    }
+
     /// Remove one input's connection (the rest of the net stays, including
     /// any nodes that now dangle as reusable stubs).
     pub fn disconnect_sink(&mut self, sink: PortRef) -> Result<(), EditError> {
@@ -579,7 +643,7 @@ impl Editor {
                 .iter_mut()
                 .find(|c| c.id == id)
                 .ok_or_else(|| EditError::UnknownComponent(id.clone()))?;
-            if comp.component_type != "dff" {
+            if comp.component_type != "dff" && comp.component_type != "const" {
                 return Err(EditError::NotADff(id.clone()));
             }
             let new = !comp.init.unwrap_or(false);
@@ -667,6 +731,7 @@ impl Editor {
             let [width, height] = layout::default_abstraction_size(&name, 0, 0);
             project.abstractions.push(crate::project::ProjectAbstraction {
                 pin_positions: HashMap::new(),
+                port_layout: HashMap::new(),
                 name: name.clone(),
                 inputs: vec![],
                 outputs: HashMap::new(),
@@ -778,7 +843,48 @@ impl Editor {
             }
             let def = project.abstractions.get_mut(i).ok_or(EditError::BadSheet)?;
             def.pin_positions.remove(&name);
+            def.port_layout.remove(&name);
             update_interface_height(def);
+            Ok(())
+        })
+    }
+
+    /// Place a port on a chosen edge of the closed rectangle.
+    pub fn set_port_layout(
+        &mut self,
+        name: &str,
+        side: crate::project::PortSide,
+        t: f32,
+    ) -> Result<(), EditError> {
+        let name = name.to_string();
+        self.mutate(move |project, sheet| {
+            let SheetRef::Abstraction(i) = sheet else {
+                return Err(EditError::NotAnAbstractionSheet);
+            };
+            let def = project.abstractions.get_mut(i).ok_or(EditError::BadSheet)?;
+            if !def.inputs.iter().any(|x| x == &name) && !def.outputs.contains_key(&name) {
+                return Err(EditError::UnknownComponent(name.clone()));
+            }
+            def.port_layout.insert(
+                name.clone(),
+                crate::project::PortSpot {
+                    side,
+                    t: t.clamp(0.02, 0.98),
+                },
+            );
+            Ok(())
+        })
+    }
+
+    /// Resize the closed rectangle of the abstraction being edited.
+    pub fn set_abstraction_size(&mut self, w: f32, h: f32) -> Result<(), EditError> {
+        self.mutate(move |project, sheet| {
+            let SheetRef::Abstraction(i) = sheet else {
+                return Err(EditError::NotAnAbstractionSheet);
+            };
+            let def = project.abstractions.get_mut(i).ok_or(EditError::BadSheet)?;
+            def.width = w.clamp(2.0, 40.0);
+            def.height = h.clamp(1.5, 40.0);
             Ok(())
         })
     }
@@ -812,6 +918,9 @@ impl Editor {
 
             if let Some(pos) = def.pin_positions.remove(&old) {
                 def.pin_positions.insert(new.clone(), pos);
+            }
+            if let Some(spot) = def.port_layout.remove(&old) {
+                def.port_layout.insert(new.clone(), spot);
             }
             match kind {
                 PortKind::Input => {
@@ -2353,6 +2462,7 @@ mod tests {
         let mut e = Editor::empty();
         e.project.abstractions.push(ProjectAbstraction {
             pin_positions: HashMap::new(),
+            port_layout: HashMap::new(),
             name: "not".into(),
             inputs: vec!["x".into()],
             outputs: HashMap::from([("out".into(), "gate".into())]),
@@ -2817,6 +2927,26 @@ mod tests {
         let notes = normalize(&mut project);
         assert_eq!(project.abstractions[i].outputs["q"], "");
         assert!(!notes.is_empty());
+    }
+
+    #[test]
+    fn const_component_drives_signals() {
+        let mut e = Editor::empty();
+        e.place_component("const", [0, 0]).unwrap();
+        assert_eq!(e.toggle_dff_init("const_1").unwrap(), true);
+        e.place_component("nand", [6, 0]).unwrap();
+        e.connect(port("const_1", "out"), port("nand_1", "a"), &[])
+            .unwrap();
+        // nand.b stays unconnected: reads as 0 → NAND(1, 0) = 1.
+        use crate::compiler::compile;
+        use crate::convert::project_to_circuit;
+        use crate::expander::expand;
+        use crate::simulator::simulate;
+        let expanded = expand(&project_to_circuit(&e.project).unwrap()).unwrap();
+        let compiled = compile(&expanded.def).unwrap();
+        let results = simulate(&compiled);
+        assert!(results[0]["const_1"]);
+        assert!(results[0]["nand_1"]);
     }
 
     // ── Notes ────────────────────────────────────────────────────────────

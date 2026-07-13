@@ -24,6 +24,10 @@ const MIN_CHILD_SCALE: f32 = 2.0; // px per grid unit
 
 /// Everything needed to draw one sheet at one place on screen.
 struct SheetCtx<'a> {
+    abstractions: &'a [ProjectAbstraction],
+    /// While running: this sheet's instance path from the top, for keying
+    /// flattened simulation values. None when not simulating.
+    sim_path: Option<Vec<String>>,
     components: &'a [diycpu::project::ProjectComponent],
     wire_nets: &'a [WireNet],
     notes: &'a [Note],
@@ -41,14 +45,23 @@ impl SheetCtx<'_> {
     }
 }
 
-fn make_ctx(app: &App, sheet: SheetRef, view: View, alpha: f32, focus: bool) -> Option<SheetCtx<'_>> {
-    let (components, wire_nets) = diycpu::editor::sheet_of(&app.editor.project, sheet)?;
-    let notes = diycpu::editor::sheet_notes(&app.editor.project, sheet)?;
+fn make_ctx(
+    project: &diycpu::project::Project,
+    sheet: SheetRef,
+    view: View,
+    alpha: f32,
+    focus: bool,
+    sim_path: Option<Vec<String>>,
+) -> Option<SheetCtx<'_>> {
+    let (components, wire_nets) = diycpu::editor::sheet_of(project, sheet)?;
+    let notes = diycpu::editor::sheet_notes(project, sheet)?;
     let interface = match sheet {
-        SheetRef::Abstraction(i) => app.editor.project.abstractions.get(i),
+        SheetRef::Abstraction(i) => project.abstractions.get(i),
         SheetRef::Top => None,
     };
     Some(SheetCtx {
+        abstractions: &project.abstractions,
+        sim_path,
         components,
         wire_nets,
         notes,
@@ -80,8 +93,6 @@ impl Renderer {
         self.draw_world(canvas, app);
         self.draw_wire_preview(canvas, app);
         self.draw_drag_ghosts(canvas, app);
-        self.draw_junction_drag_ghost(canvas, app);
-        self.draw_pin_drag_ghost(canvas, app);
         self.draw_placement_ghost(canvas, app);
         self.draw_band(canvas, app);
         canvas.reset_scissor();
@@ -90,6 +101,7 @@ impl Renderer {
         self.draw_topbar(canvas, app, ui);
         self.draw_statusbar(canvas, app);
         self.draw_tooltip(canvas, app);
+        self.draw_layout_dialog(canvas, app);
         self.draw_prompt(canvas, app);
     }
 
@@ -99,6 +111,11 @@ impl Renderer {
     /// of ancestor context behind it, plus every big-enough instance's
     /// contents cross-faded in — recursively. One canvas, any depth.
     fn draw_world(&self, canvas: &mut Canvas<OpenGl>, app: &App) {
+        // Mid-drag gestures render from a temporary copy of the document
+        // with the drag applied, so everything moves live.
+        let project = app.display_project();
+        let project: &diycpu::project::Project = &project;
+
         // Climb from the focus to an ancestor to start drawing from, by
         // inverting each level's map. Levels further up are entirely
         // off-screen anyway.
@@ -108,7 +125,7 @@ impl Renderer {
         let mut climbed = 0;
         while climbed < 3 && start > 0 {
             let seg = &app.path[start - 1];
-            let Some(map) = app.seg_map(seg) else { break };
+            let Some(map) = app.seg_map_in(project, seg) else { break };
             view = view.through(&map.inverse());
             sheet = seg.parent;
             start -= 1;
@@ -117,21 +134,36 @@ impl Renderer {
 
         // The focus sheet's grid clips to its enclosing instance body.
         let grid_clip = app.path.last().and_then(|seg| {
-            let map = app.seg_map(seg)?;
+            let map = app.seg_map_in(project, seg)?;
             let pview = app.camera.view().through(&map.inverse());
-            let (comps, _) = diycpu::editor::sheet_of(&app.editor.project, seg.parent)?;
+            let (comps, _) = diycpu::editor::sheet_of(project, seg.parent)?;
             let comp = comps.iter().find(|c| c.id == seg.instance_id)?;
-            let r = layout::footprint(&app.editor.project.abstractions, comp);
+            let r = layout::footprint(&project.abstractions, comp);
             let tl = pview.to_screen([r.x, r.y]);
             Some([tl[0], tl[1], r.w * pview.scale, r.h * pview.scale])
         });
 
+        // While running, sheets are keyed into the flattened simulation by
+        // their instance path from the top.
+        let root_sim_path = if app.is_running() {
+            Some(
+                app.path[..start]
+                    .iter()
+                    .map(|seg| seg.instance_id.clone())
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            None
+        };
+
         self.draw_sheet_tree(
             canvas,
             app,
+            project,
             sheet,
             view,
             1.0,
+            root_sim_path,
             &app.path[start..],
             true,
             0,
@@ -141,20 +173,23 @@ impl Renderer {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn draw_sheet_tree(
         &self,
         canvas: &mut Canvas<OpenGl>,
         app: &App,
+        project: &diycpu::project::Project,
         sheet: SheetRef,
         view: View,
         alpha: f32,
+        sim_path: Option<Vec<String>>,
         slice: &[PathSeg],
         on_path: bool,
         depth: usize,
         grid_clip: Option<[f32; 4]>,
     ) {
         let focus = on_path && slice.is_empty();
-        let Some(ctx) = make_ctx(app, sheet, view, alpha, focus) else {
+        let Some(ctx) = make_ctx(project, sheet, view, alpha, focus, sim_path) else {
             return;
         };
         canvas.set_global_alpha(alpha);
@@ -165,7 +200,9 @@ impl Renderer {
         self.draw_wires(canvas, app, &ctx);
         self.draw_derived_output_wires(canvas, app, &ctx);
         for comp in ctx.components {
-            self.draw_component_tree(canvas, app, &ctx, comp, slice, on_path, depth, grid_clip);
+            self.draw_component_tree(
+                canvas, app, project, &ctx, comp, slice, on_path, depth, grid_clip,
+            );
             canvas.set_global_alpha(alpha);
         }
         if ctx.interface.is_some() {
@@ -288,19 +325,22 @@ impl Renderer {
 
     /// The display color of a whole net.
     fn net_color(&self, app: &App, ctx: &SheetCtx, net: &WireNet) -> Color {
-        if !ctx.focus {
-            return theme::wire();
-        }
-        if let Mode::Run(session) = &app.mode {
+        if let (Some(path), Mode::Run(session)) = (&ctx.sim_path, &app.mode) {
             let energized = net.source.as_ref().and_then(|src| {
+                if src.component_id.starts_with(diycpu::convert::INPUT_PREFIX) {
+                    return None; // pin values arrive via the instance inputs
+                }
                 let comp = ctx.components.iter().find(|c| c.id == src.component_id)?;
-                session.port_value(is_primitive(&comp.component_type), src)
+                session.port_value_at(path, is_primitive(&comp.component_type), src)
             });
             return match energized {
                 Some(true) => theme::wire_on(),
                 Some(false) => theme::wire_off(),
                 None => theme::wire(),
             };
+        }
+        if !ctx.focus {
+            return theme::wire();
         }
         if app.selection.net.as_deref() == Some(net.id.as_str()) {
             theme::wire_selected()
@@ -310,7 +350,7 @@ impl Renderer {
     }
 
     fn draw_wires(&self, canvas: &mut Canvas<OpenGl>, app: &App, ctx: &SheetCtx) {
-        let abstractions = &app.editor.project.abstractions;
+        let abstractions = ctx.abstractions;
         let (components, wire_nets) = (ctx.components, ctx.wire_nets);
         let zoom = ctx.zoom();
         let width = (2.5 * zoom).clamp(0.5, 4.5);
@@ -463,84 +503,6 @@ impl Renderer {
     }
 
     /// While a node drags, ghost its segments at the target position (the
-    /// document only changes when the drag commits).
-    fn draw_junction_drag_ghost(&self, canvas: &mut Canvas<OpenGl>, app: &App) {
-        let Gesture::DraggingJunction {
-            net_id,
-            junction_id,
-            pos,
-        } = &app.gesture
-        else {
-            return;
-        };
-        let abstractions = &app.editor.project.abstractions;
-        let (components, wire_nets) = app.editor.sheet_data();
-        let Some(net) = wire_nets.iter().find(|n| &n.id == net_id) else {
-            return;
-        };
-
-        let zoom = app.camera.zoom;
-        let mut paint = Paint::color(theme::wire_preview());
-        paint.set_line_width((2.0 * zoom).clamp(1.2, 3.5));
-        paint.set_line_join(femtovg::LineJoin::Round);
-
-        for seg in &net.segments {
-            let touches = [&seg.from, &seg.to].iter().any(|e| {
-                matches!(e, diycpu::project::Endpoint::Junction { junction_id: id } if id == junction_id)
-            });
-            if !touches {
-                continue;
-            }
-            let resolve = |e: &diycpu::project::Endpoint| -> Option<([f32; 2], layout::ExitDir)> {
-                if matches!(e, diycpu::project::Endpoint::Junction { junction_id: id } if id == junction_id)
-                {
-                    return Some((*pos, None));
-                }
-                layout::resolve_endpoint(
-                    abstractions,
-                    components,
-                    app.interface(),
-                    &net.junctions,
-                    e,
-                )
-            };
-            let (Some((a, a_dir)), Some((b, b_dir))) = (resolve(&seg.from), resolve(&seg.to))
-            else {
-                continue;
-            };
-            let pts = layout::route(a, a_dir, b, b_dir);
-            let mut p = Path::new();
-            for (k, pt) in pts.iter().enumerate() {
-                let s = app.camera.grid_to_screen(*pt);
-                if k == 0 {
-                    p.move_to(s[0], s[1]);
-                } else {
-                    p.line_to(s[0], s[1]);
-                }
-            }
-            canvas.stroke_path(&p, &paint);
-        }
-
-        let s = app.camera.grid_to_screen(*pos);
-        let mut dot = Path::new();
-        dot.circle(s[0], s[1], (4.5 * zoom).clamp(2.5, 6.5));
-        canvas.fill_path(&dot, &Paint::color(theme::accent()));
-    }
-
-    /// Ghost for a pin being dragged to a new home.
-    fn draw_pin_drag_ghost(&self, canvas: &mut Canvas<OpenGl>, app: &App) {
-        let Gesture::DraggingPin { pos, .. } = &app.gesture else {
-            return;
-        };
-        let zoom = app.camera.zoom;
-        let s = app.camera.grid_to_screen(*pos);
-        let mut dot = Path::new();
-        dot.circle(s[0], s[1], (5.0 * zoom).clamp(2.5, 8.0));
-        let mut ring = Paint::color(theme::accent());
-        ring.set_line_width(2.0);
-        canvas.stroke_path(&dot, &ring);
-    }
-
     /// One component, plus — when it's an abstraction instance big enough
     /// on screen — its contents cross-faded in, recursively.
     #[allow(clippy::too_many_arguments)]
@@ -548,6 +510,7 @@ impl Renderer {
         &self,
         canvas: &mut Canvas<OpenGl>,
         app: &App,
+        project: &diycpu::project::Project,
         ctx: &SheetCtx,
         comp: &diycpu::project::ProjectComponent,
         slice: &[PathSeg],
@@ -555,7 +518,7 @@ impl Renderer {
         depth: usize,
         grid_clip: Option<[f32; 4]>,
     ) {
-        let abstractions = &app.editor.project.abstractions;
+        let abstractions = ctx.abstractions;
         let rect = layout::footprint(abstractions, comp);
         let tl = ctx.view.to_screen([rect.x, rect.y]);
         let cell = ctx.view.scale;
@@ -595,14 +558,16 @@ impl Renderer {
 
         let mut body = Path::new();
         body.rounded_rect(tl[0], tl[1], w, h, corner);
-        let fill = if comp.component_type == "dff" && ctx.focus {
-            match &app.mode {
-                Mode::Run(session) => match session.component_value(&comp.id) {
-                    Some(true) => theme::badge_on_bg(),
-                    Some(false) => theme::badge_off_bg(),
-                    None => theme::chip_fill(),
-                },
-                Mode::Edit => theme::chip_fill(),
+        let fill = if comp.component_type == "dff" || comp.component_type == "const" {
+            match (&app.mode, &ctx.sim_path) {
+                (Mode::Run(session), Some(path)) => {
+                    match session.component_value_at(path, &comp.id) {
+                        Some(true) => theme::badge_on_bg(),
+                        Some(false) => theme::badge_off_bg(),
+                        None => theme::chip_fill(),
+                    }
+                }
+                _ => theme::chip_fill(),
             }
         } else {
             theme::chip_fill()
@@ -632,12 +597,19 @@ impl Renderer {
                             }
                             _ => (&[], false),
                         };
+                    let child_sim_path = ctx.sim_path.as_ref().map(|p| {
+                        let mut p = p.clone();
+                        p.push(comp.id.clone());
+                        p
+                    });
                     self.draw_sheet_tree(
                         canvas,
                         app,
+                        project,
                         SheetRef::Abstraction(i),
                         ctx.view.through(&map),
                         ctx.alpha * open_frac,
+                        child_sim_path,
                         child_slice,
                         child_on_path,
                         depth + 1,
@@ -679,12 +651,49 @@ impl Renderer {
             match comp.component_type.as_str() {
                 "clk" => self.draw_clock_glyph(canvas, zoom, tl, w, h),
                 "nand" => self.draw_nand_glyph(canvas, zoom, tl, w, h),
+                "const" => {
+                    // A constant signal: its face is the value it feeds out.
+                    let value = match (&app.mode, &ctx.sim_path) {
+                        (Mode::Run(session), Some(path)) => {
+                            session.component_value_at(path, &comp.id)
+                        }
+                        _ => comp.init,
+                    }
+                    .unwrap_or(false);
+                    let digit_size = (18.0 * zoom).clamp(6.0, 30.0);
+                    // A ring around the digit says "this is a source".
+                    let cx = tl[0] + w * 0.45;
+                    let cy = tl[1] + h / 2.0;
+                    let mut ring = Path::new();
+                    ring.circle(cx, cy, digit_size * 0.75);
+                    let mut rp = Paint::color(if value {
+                        theme::value_digit_on()
+                    } else {
+                        theme::value_digit_off()
+                    });
+                    rp.set_line_width((1.6 * zoom).clamp(0.6, 2.5));
+                    canvas.stroke_path(&ring, &rp);
+                    self.text(
+                        canvas,
+                        cx,
+                        cy,
+                        if value { "1" } else { "0" },
+                        digit_size,
+                        if value {
+                            theme::value_digit_on()
+                        } else {
+                            theme::value_digit_off()
+                        },
+                        Align::Center,
+                        Baseline::Middle,
+                    );
+                }
                 "dff" => {
                     // The flip-flop's face IS its bit: init while editing,
                     // live state while running. Double-click flips the init.
-                    let value = match &app.mode {
-                        Mode::Run(session) if ctx.focus => {
-                            session.component_value(&comp.id)
+                    let value = match (&app.mode, &ctx.sim_path) {
+                        (Mode::Run(session), Some(path)) => {
+                            session.component_value_at(path, &comp.id)
                         }
                         _ => comp.init,
                     }
@@ -710,12 +719,13 @@ impl Renderer {
 
             // Run-mode value badge for the primitives whose face doesn't
             // already show it.
-            if ctx.focus {
-                if let Mode::Run(session) = &app.mode {
-                    if is_primitive(&comp.component_type) && comp.component_type != "dff" {
-                        if let Some(v) = session.component_value(&comp.id) {
-                            self.draw_badge(canvas, zoom, tl, w, v);
-                        }
+            if let (Mode::Run(session), Some(path)) = (&app.mode, &ctx.sim_path) {
+                if is_primitive(&comp.component_type)
+                    && comp.component_type != "dff"
+                    && comp.component_type != "const"
+                {
+                    if let Some(v) = session.component_value_at(path, &comp.id) {
+                        self.draw_badge(canvas, zoom, tl, w, v);
                     }
                 }
             }
@@ -739,20 +749,24 @@ impl Renderer {
             let r = (5.0 * zoom).clamp(1.0, 8.0);
             let hovered = hover_port.as_deref() == Some(port.info.name.as_str());
 
-            let fill = match (&app.mode, port.info.kind) {
-                (Mode::Run(session), PortKind::Output) if ctx.focus => {
+            let fill = match (&app.mode, &ctx.sim_path, port.info.kind) {
+                (Mode::Run(session), Some(path), PortKind::Output) => {
                     let port_ref = diycpu::project::PortRef {
                         component_id: comp.id.clone(),
                         port_name: port.info.name.clone(),
                     };
-                    match session.port_value(is_primitive(&comp.component_type), &port_ref) {
+                    match session.port_value_at(
+                        path,
+                        is_primitive(&comp.component_type),
+                        &port_ref,
+                    ) {
                         Some(true) => theme::value_on(),
                         Some(false) => theme::wire_off(),
                         None => theme::port_fill_output(),
                     }
                 }
-                (_, PortKind::Output) => theme::port_fill_output(),
-                (_, PortKind::Input) => theme::port_fill_input(),
+                (_, _, PortKind::Output) => theme::port_fill_output(),
+                (_, _, PortKind::Input) => theme::port_fill_input(),
             };
 
             let mut p = Path::new();
@@ -772,28 +786,31 @@ impl Renderer {
                     canvas.set_global_alpha(chrome_alpha);
                     let size = (9.0 * zoom).clamp(7.0, 13.0);
                     let pad = r + 4.0;
-                    match port.side {
-                        layout::Side::Left => self.text(
-                            canvas,
-                            s[0] + pad,
-                            s[1],
-                            &port.info.name,
-                            size,
-                            theme::port_label(),
-                            Align::Left,
-                            Baseline::Middle,
-                        ),
-                        layout::Side::Right => self.text(
-                            canvas,
-                            s[0] - pad,
-                            s[1],
-                            &port.info.name,
-                            size,
-                            theme::port_label(),
-                            Align::Right,
-                            Baseline::Middle,
-                        ),
-                    }
+                    // Label sits just inside the body, opposite the exit.
+                    let (lx, ly, align, baseline) = match port.side {
+                        layout::Side::Left => {
+                            (s[0] + pad, s[1], Align::Left, Baseline::Middle)
+                        }
+                        layout::Side::Right => {
+                            (s[0] - pad, s[1], Align::Right, Baseline::Middle)
+                        }
+                        layout::Side::Top => {
+                            (s[0], s[1] + pad, Align::Center, Baseline::Top)
+                        }
+                        layout::Side::Bottom => {
+                            (s[0], s[1] - pad, Align::Center, Baseline::Bottom)
+                        }
+                    };
+                    self.text(
+                        canvas,
+                        lx,
+                        ly,
+                        &port.info.name,
+                        size,
+                        theme::port_label(),
+                        align,
+                        baseline,
+                    );
                     canvas.set_global_alpha(ctx.alpha);
                 }
             }
@@ -904,7 +921,7 @@ impl Renderer {
         let Some(def) = ctx.interface else {
             return;
         };
-        let abstractions = &app.editor.project.abstractions;
+        let abstractions = ctx.abstractions;
         let zoom = ctx.zoom();
         let cell = ctx.view.scale;
 
@@ -1005,13 +1022,13 @@ impl Renderer {
     fn draw_derived_output_wires(
         &self,
         canvas: &mut Canvas<OpenGl>,
-        app: &App,
+        _app: &App,
         ctx: &SheetCtx,
     ) {
         let Some(def) = ctx.interface else {
             return;
         };
-        let abstractions = &app.editor.project.abstractions;
+        let abstractions = ctx.abstractions;
         let zoom = ctx.zoom();
 
         let pins = layout::interface_pins(abstractions, def);
@@ -1047,6 +1064,162 @@ impl Renderer {
             paint.set_line_cap(femtovg::LineCap::Round);
             canvas.stroke_path(&p, &paint);
         }
+    }
+
+    /// The component-layout dialog: drag ports around the closed
+    /// rectangle's edges, drag the corner to resize.
+    fn draw_layout_dialog(&self, canvas: &mut Canvas<OpenGl>, app: &App) {
+        let Some(geom) = app.dialog_geometry() else {
+            return;
+        };
+        let Some(def) = app.dialog_def() else {
+            return;
+        };
+        let [w, h] = app.window_size;
+
+        let mut dim = Path::new();
+        dim.rect(0.0, 0.0, w, h);
+        canvas.fill_path(&dim, &Paint::color(femtovg::Color::rgba(30, 33, 40, 70)));
+
+        let p = &geom.panel;
+        let mut panel = Path::new();
+        panel.rounded_rect(p.x, p.y, p.w, p.h, 10.0);
+        canvas.fill_path(&panel, &Paint::color(theme::canvas_bg()));
+        let mut border = Paint::color(theme::button_border());
+        border.set_line_width(1.5);
+        canvas.stroke_path(&panel, &border);
+
+        self.text(
+            canvas,
+            p.x + 16.0,
+            p.y + 24.0,
+            &format!("Component layout — {}", def.name),
+            15.0,
+            theme::text(),
+            Align::Left,
+            Baseline::Middle,
+        );
+        self.text(
+            canvas,
+            geom.close_rect.x + geom.close_rect.w / 2.0,
+            geom.close_rect.y + geom.close_rect.h / 2.0,
+            "✕",
+            14.0,
+            if geom.close_rect.contains(app.cursor) {
+                theme::danger()
+            } else {
+                theme::text_dim()
+            },
+            Align::Center,
+            Baseline::Middle,
+        );
+        self.text(
+            canvas,
+            p.x + 16.0,
+            p.y + 46.0,
+            "Drag a port to any edge · drag the corner to resize · Esc closes",
+            11.5,
+            theme::text_dim(),
+            Align::Left,
+            Baseline::Middle,
+        );
+
+        // The component preview.
+        let r = &geom.preview;
+        let mut body = Path::new();
+        body.rounded_rect(r.x, r.y, r.w, r.h, 8.0);
+        canvas.fill_path(&body, &Paint::color(theme::chip_fill()));
+        let mut bp = Paint::color(theme::chip_border());
+        bp.set_line_width(2.0);
+        canvas.stroke_path(&body, &bp);
+        self.text(
+            canvas,
+            r.x + r.w / 2.0,
+            r.y + r.h / 2.0,
+            &def.name,
+            15.0,
+            theme::chip_label(),
+            Align::Center,
+            Baseline::Middle,
+        );
+
+        for (name, pos, is_input) in &geom.ports {
+            let hovered = {
+                let dx = app.cursor[0] - pos[0];
+                let dy = app.cursor[1] - pos[1];
+                (dx * dx + dy * dy).sqrt() <= 12.0
+            };
+            let mut c = Path::new();
+            c.circle(pos[0], pos[1], 7.0);
+            canvas.fill_path(
+                &c,
+                &Paint::color(if *is_input {
+                    theme::port_fill_input()
+                } else {
+                    theme::port_fill_output()
+                }),
+            );
+            let mut ring = Paint::color(if hovered {
+                theme::accent()
+            } else {
+                theme::port_ring()
+            });
+            ring.set_line_width(if hovered { 2.5 } else { 1.5 });
+            canvas.stroke_path(&c, &ring);
+
+            // Label outside the body, next to the port.
+            let inward = [
+                (r.x + r.w / 2.0 - pos[0]).signum(),
+                (r.y + r.h / 2.0 - pos[1]).signum(),
+            ];
+            let on_vertical_edge = (pos[0] - r.x).abs() < 1.0 || (pos[0] - (r.x + r.w)).abs() < 1.0;
+            if on_vertical_edge {
+                self.text(
+                    canvas,
+                    pos[0] - inward[0] * 12.0,
+                    pos[1],
+                    name,
+                    12.0,
+                    theme::text(),
+                    if inward[0] > 0.0 { Align::Right } else { Align::Left },
+                    Baseline::Middle,
+                );
+            } else {
+                self.text(
+                    canvas,
+                    pos[0],
+                    pos[1] - inward[1] * 16.0,
+                    name,
+                    12.0,
+                    theme::text(),
+                    Align::Center,
+                    Baseline::Middle,
+                );
+            }
+        }
+
+        // Resize handle + size readout.
+        let hr = &geom.resize_handle;
+        let mut handle = Path::new();
+        handle.rounded_rect(hr.x, hr.y, hr.w, hr.h, 4.0);
+        canvas.fill_path(
+            &handle,
+            &Paint::color(if hr.contains(app.cursor) {
+                theme::accent()
+            } else {
+                theme::button_border()
+            }),
+        );
+        self.text(
+            canvas,
+            p.x + p.w / 2.0,
+            p.y + p.h - 26.0,
+            &format!("{} × {} cells", geom.size.0, geom.size.1),
+            12.5,
+            theme::text_dim(),
+            Align::Center,
+            Baseline::Middle,
+        );
     }
 
     fn draw_prompt(&self, canvas: &mut Canvas<OpenGl>, app: &App) {
@@ -1113,6 +1286,8 @@ impl Renderer {
         );
     }
 
+    /// Dragged items render live in the world; this overlay only flags an
+    /// invalid drop position.
     fn draw_drag_ghosts(&self, canvas: &mut Canvas<OpenGl>, app: &App) {
         let Gesture::DraggingComponents {
             ids,
@@ -1127,6 +1302,9 @@ impl Renderer {
             return;
         }
         let valid = app.drag_is_valid(ids, *delta);
+        if valid {
+            return;
+        }
         let abstractions = &app.editor.project.abstractions;
         let (components, _) = app.editor.sheet_data();
         let cell = app.camera.cell_px();
@@ -1207,10 +1385,15 @@ impl Renderer {
             init: None,
             pos: [pos[0] as f32, pos[1] as f32],
         };
-        if let Some(ctx) = make_ctx(app, app.editor.sheet, app.camera.view(), 0.55, false) {
+        let project = &app.editor.project;
+        if let Some(ctx) =
+            make_ctx(project, app.editor.sheet, app.camera.view(), 0.55, false, None)
+        {
             canvas.set_global_alpha(0.55);
             // MAX_DEPTH suppresses the open-contents recursion for ghosts.
-            self.draw_component_tree(canvas, app, &ctx, &ghost, &[], false, MAX_DEPTH, None);
+            self.draw_component_tree(
+                canvas, app, project, &ctx, &ghost, &[], false, MAX_DEPTH, None,
+            );
             canvas.set_global_alpha(1.0);
         }
         if !valid {
@@ -1529,7 +1712,10 @@ impl Renderer {
     }
 
     fn draw_tooltip(&self, canvas: &mut Canvas<OpenGl>, app: &App) {
-        if !matches!(app.gesture, Gesture::Idle) {
+        if !matches!(app.gesture, Gesture::Idle)
+            || app.layout_dialog.is_some()
+            || app.prompt.is_some()
+        {
             return;
         }
         let lines: Vec<String> = match &app.hover {
@@ -1572,6 +1758,14 @@ impl Renderer {
                 }
                 vec!["node — click to wire from it, drag to move, Delete removes".into()]
             }
+            layout::Hit::Wire { .. } => {
+                if app.is_running() {
+                    return;
+                }
+                vec![
+                    "wire — double-click adds a node, Delete removes this segment".into(),
+                ]
+            }
             layout::Hit::Note { .. } => {
                 if app.is_running() {
                     return;
@@ -1586,7 +1780,7 @@ impl Renderer {
                 let mut lines = match comp.component_type.as_str() {
                     "clk" => vec!["clock — toggles every step".to_string()],
                     "nand" => vec!["NAND gate".to_string()],
-                    "dff" => vec![],
+                    "dff" | "const" => vec![],
                     other => vec![format!("{other} — zoom in or double-click to open")],
                 };
                 if let Mode::Run(session) = &app.mode {
@@ -1596,6 +1790,11 @@ impl Renderer {
                 } else if comp.component_type == "dff" {
                     lines.push(format!(
                         "flip-flop — starts at {}, double-click to flip",
+                        if comp.init.unwrap_or(false) { "1" } else { "0" }
+                    ));
+                } else if comp.component_type == "const" {
+                    lines.push(format!(
+                        "constant {} — double-click to flip",
                         if comp.init.unwrap_or(false) { "1" } else { "0" }
                     ));
                 }

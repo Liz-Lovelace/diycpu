@@ -45,7 +45,9 @@ impl fmt::Display for ComponentDef {
     }
 }
 
-pub const PRIMITIVE_TYPES: &[&str] = &["clk", "nand", "dff"];
+/// `const` is a GUI-level primitive: a toggleable constant signal. The
+/// converter lowers it to an input-less DFF, so the engine never sees it.
+pub const PRIMITIVE_TYPES: &[&str] = &["clk", "nand", "dff", "const"];
 
 pub fn is_primitive(type_name: &str) -> bool {
     PRIMITIVE_TYPES.contains(&type_name)

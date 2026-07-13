@@ -83,20 +83,41 @@ impl SimSession {
         &self.states[self.cursor]
     }
 
-    /// Current value of one component output port at the cursor step.
-    /// Primitives are keyed by component id, abstraction instance outputs
-    /// by `id.port` via the expander's aliases.
-    pub fn port_value(&self, is_primitive: bool, port: &PortRef) -> Option<bool> {
-        let key = if is_primitive {
-            port.component_id.clone()
-        } else {
-            format!("{}.{}", port.component_id, port.port_name)
-        };
+    /// Current value of one component output port at the cursor step,
+    /// inside the instance identified by `path` (empty = the top sheet).
+    /// Primitives are keyed by their flattened name, abstraction instance
+    /// outputs by `name.port` via the expander's aliases.
+    pub fn port_value_at(
+        &self,
+        path: &[String],
+        is_primitive: bool,
+        port: &PortRef,
+    ) -> Option<bool> {
+        let mut key = String::new();
+        for seg in path {
+            key.push_str(seg);
+            key.push('/');
+        }
+        key.push_str(&port.component_id);
+        if !is_primitive {
+            key.push('.');
+            key.push_str(&port.port_name);
+        }
         self.state().get(&key).copied()
     }
 
     /// Value of a component's (single) output, for primitives.
+    pub fn component_value_at(&self, path: &[String], component_id: &str) -> Option<bool> {
+        let mut key = String::new();
+        for seg in path {
+            key.push_str(seg);
+            key.push('/');
+        }
+        key.push_str(component_id);
+        self.state().get(&key).copied()
+    }
+
     pub fn component_value(&self, component_id: &str) -> Option<bool> {
-        self.state().get(component_id).copied()
+        self.component_value_at(&[], component_id)
     }
 }

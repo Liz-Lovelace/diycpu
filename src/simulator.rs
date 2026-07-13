@@ -146,8 +146,10 @@ fn evaluate_combinational_logic(circuit: &CompiledCircuit, component_values: &mu
         if let CompiledComponent::Nand { input_a, input_b } =
             &circuit.components[component_index]
         {
-            component_values[component_index] =
-                !(component_values[*input_a] && component_values[*input_b]);
+            // Unconnected inputs read as constant 0.
+            let a = input_a.map(|i| component_values[i]).unwrap_or(false);
+            let b = input_b.map(|i| component_values[i]).unwrap_or(false);
+            component_values[component_index] = !(a && b);
         }
     }
 }

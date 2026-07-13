@@ -22,11 +22,15 @@ pub struct PathSeg {
     pub child: SheetRef,
 }
 
-/// An instance bigger than this fraction of the viewport (and containing
-/// its center) pulls focus in; smaller than the ascend fraction pushes it
-/// back out. The gap is hysteresis.
-const DESCEND_AT: f32 = 1.30;
-const ASCEND_AT: f32 = 1.15;
+/// Focus descends into an instance when it covers the whole central region
+/// of the viewport (canvas inset by this fraction of its smaller dimension
+/// per side) AND is comfortably larger than the screen; it ascends when the
+/// enclosing instance stops covering a slightly smaller region. The gap is
+/// hysteresis.
+const DESCEND_COVER_INSET: f32 = 0.20;
+const ASCEND_COVER_INSET: f32 = 0.24;
+const DESCEND_AT: f32 = 1.25;
+const ASCEND_AT: f32 = 1.10;
 
 /// Pixels the cursor must travel before a press becomes a drag.
 const DRAG_THRESHOLD_PX: f32 = 5.0;
@@ -162,6 +166,21 @@ pub struct Status {
     pub is_error: bool,
 }
 
+/// The "component layout" dialog: arrange ports on the closed rectangle's
+/// edges and resize it. Pure preview state; edits commit on drag release.
+pub struct LayoutDialog {
+    pub index: usize,
+    pub drag: Option<DialogDrag>,
+    pub pending_port: Option<(String, diycpu::project::PortSide, f32)>,
+    pub pending_size: Option<(f32, f32)>,
+}
+
+#[derive(Clone, PartialEq)]
+pub enum DialogDrag {
+    Port(String),
+    Resize,
+}
+
 pub struct App {
     pub editor: Editor,
     pub camera: Camera,
@@ -182,6 +201,7 @@ pub struct App {
     pub shift: bool,
     pub hover: Hit,
     pub prompt: Option<Prompt>,
+    pub layout_dialog: Option<LayoutDialog>,
     /// Run mode advances the clock on a timer.
     pub playing: bool,
     /// Set when an action would discard unsaved changes; repeating the
@@ -235,6 +255,7 @@ impl App {
             shift: false,
             hover: Hit::Empty,
             prompt: None,
+            layout_dialog: None,
             playing: false,
             pending_discard: None,
             pending_fit: true,
@@ -265,11 +286,28 @@ impl App {
         [r.x + r.w / 2.0, r.y + r.h / 2.0]
     }
 
+    /// The canvas rect inset by `frac` of its smaller dimension per side —
+    /// "what the user is looking at".
+    fn central_box(&self, frac: f32) -> Rect {
+        let r = self.canvas_rect();
+        let inset = r.w.min(r.h) * frac;
+        Rect {
+            x: r.x + inset,
+            y: r.y + inset,
+            w: (r.w - inset * 2.0).max(1.0),
+            h: (r.h - inset * 2.0).max(1.0),
+        }
+    }
+
     /// The child→parent transform of one zoom-path segment, recomputed from
-    /// the live document.
-    pub fn seg_map(&self, seg: &PathSeg) -> Option<diycpu::layout::SheetMap> {
-        let abstractions = &self.editor.project.abstractions;
-        let (components, _) = diycpu::editor::sheet_of(&self.editor.project, seg.parent)?;
+    /// the given document state.
+    pub fn seg_map_in(
+        &self,
+        project: &Project,
+        seg: &PathSeg,
+    ) -> Option<diycpu::layout::SheetMap> {
+        let abstractions = &project.abstractions;
+        let (components, _) = diycpu::editor::sheet_of(project, seg.parent)?;
         let comp = components.iter().find(|c| c.id == seg.instance_id)?;
         let def = abstractions.iter().find(|a| a.name == comp.component_type)?;
         Some(diycpu::layout::instance_inner_map(
@@ -279,15 +317,16 @@ impl App {
         ))
     }
 
+    pub fn seg_map(&self, seg: &PathSeg) -> Option<diycpu::layout::SheetMap> {
+        self.seg_map_in(&self.editor.project, seg)
+    }
+
     /// Keep the focused sheet in step with the camera: zooming into an
     /// instance until it fills the screen hands focus (and the camera's
     /// coordinate system) to its sheet; zooming back out hands it back.
     /// The rebased camera describes the identical visual transform, so the
     /// hand-off is invisible.
     pub fn update_focus(&mut self) {
-        if self.is_running() {
-            return;
-        }
         if !matches!(self.gesture, Gesture::Idle | Gesture::Panning { .. }) {
             return;
         }
@@ -305,6 +344,7 @@ impl App {
         let abstractions = &self.editor.project.abstractions;
         let (components, _) = self.editor.sheet_data();
 
+        let central = self.central_box(DESCEND_COVER_INSET);
         let mut target: Option<(String, usize, layout::Rect)> = None;
         for comp in components {
             let Some(def_index) = abstractions
@@ -316,15 +356,19 @@ impl App {
             let rect = layout::footprint(abstractions, comp);
             let tl = view.to_screen([rect.x, rect.y]);
             let (w, h) = (rect.w * view.scale, rect.h * view.scale);
-            let contains = center[0] >= tl[0]
-                && center[0] <= tl[0] + w
-                && center[1] >= tl[1]
-                && center[1] <= tl[1] + h;
-            if w.max(h) > DESCEND_AT * v && contains {
+            // "We're looking at it": the instance covers the whole central
+            // region of the screen (components can't overlap, so at most
+            // one instance can).
+            let covers = tl[0] <= central.x
+                && tl[1] <= central.y
+                && tl[0] + w >= central.x + central.w
+                && tl[1] + h >= central.y + central.h;
+            if w.max(h) > DESCEND_AT * v && covers {
                 target = Some((comp.id.clone(), def_index, rect));
                 break;
             }
         }
+        let _ = center;
         let Some((instance_id, def_index, rect)) = target else {
             return false;
         };
@@ -368,12 +412,12 @@ impl App {
         let tl = parent_view.to_screen([rect.x, rect.y]);
         let (w, h) = (rect.w * parent_view.scale, rect.h * parent_view.scale);
         let v = self.viewport_min();
-        let center = self.canvas_center();
-        let contains = center[0] >= tl[0]
-            && center[0] <= tl[0] + w
-            && center[1] >= tl[1]
-            && center[1] <= tl[1] + h;
-        if w.max(h) >= ASCEND_AT * v && contains {
+        let central = self.central_box(ASCEND_COVER_INSET);
+        let covers = tl[0] <= central.x
+            && tl[1] <= central.y
+            && tl[0] + w >= central.x + central.w
+            && tl[1] + h >= central.y + central.h;
+        if w.max(h) >= ASCEND_AT * v && covers {
             return false;
         }
         self.camera.set_view(parent_view);
@@ -423,6 +467,68 @@ impl App {
                 self.info("Editing the abstraction — every instance updates; Esc goes back");
             }
             Err(e) => self.error(e.to_string()),
+        }
+    }
+
+    /// The project as it should be DRAWN right now: mid-drag gestures are
+    /// applied to a temporary copy so components render fully and wires
+    /// re-route live, while the real document stays untouched until the
+    /// gesture commits.
+    pub fn display_project(&self) -> std::borrow::Cow<'_, Project> {
+        use std::borrow::Cow;
+        let sheet = self.editor.sheet;
+        match &self.gesture {
+            Gesture::DraggingComponents {
+                ids,
+                note_ids,
+                delta,
+                ..
+            } if *delta != [0, 0] => {
+                let mut p = self.editor.project.clone();
+                let (components, notes) = match sheet {
+                    SheetRef::Top => (&mut p.components, &mut p.notes),
+                    SheetRef::Abstraction(i) => {
+                        let a = &mut p.abstractions[i];
+                        (&mut a.components, &mut a.notes)
+                    }
+                };
+                for c in components.iter_mut().filter(|c| ids.contains(&c.id)) {
+                    c.pos[0] += delta[0] as f32;
+                    c.pos[1] += delta[1] as f32;
+                }
+                for n in notes.iter_mut().filter(|n| note_ids.contains(&n.id)) {
+                    n.pos[0] += delta[0] as f32;
+                    n.pos[1] += delta[1] as f32;
+                }
+                Cow::Owned(p)
+            }
+            Gesture::DraggingJunction {
+                net_id,
+                junction_id,
+                pos,
+            } => {
+                let mut p = self.editor.project.clone();
+                let wire_nets = match sheet {
+                    SheetRef::Top => &mut p.wire_nets,
+                    SheetRef::Abstraction(i) => &mut p.abstractions[i].wire_nets,
+                };
+                if let Some(j) = wire_nets
+                    .iter_mut()
+                    .find(|n| &n.id == net_id)
+                    .and_then(|n| n.junctions.iter_mut().find(|j| &j.id == junction_id))
+                {
+                    j.pos = *pos;
+                }
+                Cow::Owned(p)
+            }
+            Gesture::DraggingPin { name, pos } => {
+                let mut p = self.editor.project.clone();
+                if let SheetRef::Abstraction(i) = sheet {
+                    p.abstractions[i].pin_positions.insert(name.clone(), *pos);
+                }
+                Cow::Owned(p)
+            }
+            _ => Cow::Borrowed(&self.editor.project),
         }
     }
 
@@ -498,6 +604,7 @@ impl App {
             "clk".to_string(),
             "nand".to_string(),
             "dff".to_string(),
+            "const".to_string(),
             "note".to_string(),
         ];
         items.extend(self.editor.project.abstractions.iter().map(|a| a.name.clone()));
@@ -691,6 +798,24 @@ impl App {
         match picked {
             Some(path) => self.write_to(path),
             None => self.info("Save cancelled"),
+        }
+    }
+
+    /// Write-through persistence: every committed change lands on disk as
+    /// soon as the project has a file. Called by the shell after events.
+    pub fn autosave(&mut self) {
+        if !self.editor.dirty {
+            return;
+        }
+        let Some(path) = self.file_path.clone() else {
+            return; // nowhere to save yet — Save As picks the home
+        };
+        match serde_json::to_string_pretty(&self.editor.project)
+            .map_err(|e| e.to_string())
+            .and_then(|json| std::fs::write(&path, json + "\n").map_err(|e| e.to_string()))
+        {
+            Ok(()) => self.editor.dirty = false,
+            Err(e) => self.error(format!("Autosave failed: {e}")),
         }
     }
 
@@ -1348,12 +1473,28 @@ impl App {
             });
             return;
         }
+        if let Hit::Wire {
+            net_id,
+            segment_index,
+        } = self.hover.clone()
+        {
+            // Double-click a wire: drop a node right there.
+            let pos = snap_half(self.cursor_grid());
+            match self.editor.insert_junction(&net_id, segment_index, pos) {
+                Ok(_) => {
+                    self.info("Node added — click it to branch a wire");
+                    self.recompute_hover();
+                }
+                Err(e) => self.error(e.to_string()),
+            }
+            return;
+        }
         if let Hit::Component { component_id } = self.hover.clone() {
             let (components, _) = self.editor.sheet_data();
             let Some(comp) = components.iter().find(|c| c.id == component_id) else {
                 return;
             };
-            if comp.component_type == "dff" {
+            if comp.component_type == "dff" || comp.component_type == "const" {
                 match self.editor.toggle_dff_init(&component_id) {
                     Ok(v) => self.info(format!(
                         "{component_id} now starts at {}",
@@ -1506,7 +1647,8 @@ impl App {
             return;
         }
         self.gesture = Gesture::Idle;
-        // A hovered wire node takes priority: point at it and press Delete.
+        // A hovered wire node or segment takes priority: point at it and
+        // press Delete.
         if let Hit::Junction {
             net_id,
             junction_id,
@@ -1516,6 +1658,19 @@ impl App {
                 Ok(()) => self.info("Removed node"),
                 Err(e) => self.error(e.to_string()),
             }
+            self.recompute_hover();
+            return;
+        }
+        if let Hit::Wire {
+            net_id,
+            segment_index,
+        } = self.hover.clone()
+        {
+            match self.editor.delete_segment(&net_id, segment_index) {
+                Ok(()) => self.info("Removed wire segment"),
+                Err(e) => self.error(e.to_string()),
+            }
+            self.selection.net = None;
             self.recompute_hover();
             return;
         }
@@ -1607,6 +1762,12 @@ impl App {
     pub fn handle_key(&mut self, key: KeyInput) {
         if self.prompt.is_some() {
             self.prompt_key(key);
+            return;
+        }
+        if self.layout_dialog.is_some() {
+            if matches!(key, KeyInput::Escape | KeyInput::Enter) {
+                self.layout_dialog = None;
+            }
             return;
         }
         match key {
@@ -2267,7 +2428,8 @@ mod tests {
         let Mode::Run(session) = &d.app.mode else { unreachable!() };
         // NOT(1) = 0 on the instance output.
         assert_eq!(
-            session.port_value(
+            session.port_value_at(
+                &[],
                 false,
                 &PortRef {
                     component_id: "inverter_1".into(),
@@ -2506,5 +2668,226 @@ mod zoom_tests {
         // Undo jumps back to a top-sheet edit: view must follow.
         d.app.undo();
         assert_eq!(d.app.editor.sheet, d.app.focus_sheet());
+    }
+}
+
+// ── Layout dialog ────────────────────────────────────────────────────────────
+
+/// Everything the dialog's renderer and hit-testing share.
+pub struct DialogGeom {
+    pub panel: Rect,
+    /// The preview rectangle of the closed component, in pixels.
+    pub preview: Rect,
+    /// Pixels per grid unit inside the preview.
+    pub scale: f32,
+    /// (name, px position, is_input) for every port.
+    pub ports: Vec<(String, [f32; 2], bool)>,
+    pub resize_handle: Rect,
+    /// Current (possibly pending) size in grid units.
+    pub size: (f32, f32),
+    pub close_rect: Rect,
+}
+
+impl App {
+    pub fn action_open_layout_dialog(&mut self) {
+        if !self.require_edit_mode() {
+            return;
+        }
+        let SheetRef::Abstraction(index) = self.editor.sheet else {
+            return;
+        };
+        self.gesture = Gesture::Idle;
+        self.layout_dialog = Some(LayoutDialog {
+            index,
+            drag: None,
+            pending_port: None,
+            pending_size: None,
+        });
+    }
+
+    /// The dialog's abstraction with pending preview edits applied.
+    pub fn dialog_def(&self) -> Option<diycpu::project::ProjectAbstraction> {
+        let dialog = self.layout_dialog.as_ref()?;
+        let mut def = self
+            .editor
+            .project
+            .abstractions
+            .get(dialog.index)?
+            .clone();
+        if let Some((name, side, t)) = &dialog.pending_port {
+            def.port_layout.insert(
+                name.clone(),
+                diycpu::project::PortSpot { side: *side, t: *t },
+            );
+        }
+        if let Some((w, h)) = dialog.pending_size {
+            def.width = w;
+            def.height = h;
+        }
+        Some(def)
+    }
+
+    pub fn dialog_geometry(&self) -> Option<DialogGeom> {
+        let def = self.dialog_def()?;
+        let panel_w = 560.0f32;
+        let panel_h = 460.0f32;
+        let panel = Rect {
+            x: (self.window_size[0] - panel_w) / 2.0,
+            y: (self.window_size[1] - panel_h) / 2.5,
+            w: panel_w,
+            h: panel_h,
+        };
+        let area = Rect {
+            x: panel.x + 70.0,
+            y: panel.y + 80.0,
+            w: panel.w - 140.0,
+            h: panel.h - 170.0,
+        };
+        let scale = (area.w / def.width).min(area.h / def.height);
+        let pw = def.width * scale;
+        let ph = def.height * scale;
+        let preview = Rect {
+            x: area.x + (area.w - pw) / 2.0,
+            y: area.y + (area.h - ph) / 2.0,
+            w: pw,
+            h: ph,
+        };
+
+        // Port positions through the same layout code the canvas uses.
+        let mut abstractions = self.editor.project.abstractions.clone();
+        abstractions[self.layout_dialog.as_ref()?.index] = def.clone();
+        let synthetic = diycpu::project::ProjectComponent {
+            id: String::new(),
+            component_type: def.name.clone(),
+            init: None,
+            pos: [0.0, 0.0],
+        };
+        let ports = layout::component_ports(&abstractions, &synthetic)
+            .into_iter()
+            .map(|p| {
+                (
+                    p.info.name.clone(),
+                    [
+                        preview.x + p.pos[0] * scale,
+                        preview.y + p.pos[1] * scale,
+                    ],
+                    p.info.kind == PortKind::Input,
+                )
+            })
+            .collect();
+
+        Some(DialogGeom {
+            panel,
+            resize_handle: Rect {
+                x: preview.x + preview.w - 9.0,
+                y: preview.y + preview.h - 9.0,
+                w: 18.0,
+                h: 18.0,
+            },
+            close_rect: Rect {
+                x: panel.x + panel.w - 34.0,
+                y: panel.y + 10.0,
+                w: 24.0,
+                h: 24.0,
+            },
+            preview,
+            scale,
+            ports,
+            size: (def.width, def.height),
+        })
+    }
+
+    pub fn dialog_mouse_pressed(&mut self) {
+        let Some(geom) = self.dialog_geometry() else {
+            return;
+        };
+        if geom.close_rect.contains(self.cursor) || !geom.panel.contains(self.cursor) {
+            self.layout_dialog = None;
+            return;
+        }
+        if geom.resize_handle.contains(self.cursor) {
+            if let Some(d) = &mut self.layout_dialog {
+                d.drag = Some(DialogDrag::Resize);
+            }
+            return;
+        }
+        for (name, pos, _) in &geom.ports {
+            let dx = self.cursor[0] - pos[0];
+            let dy = self.cursor[1] - pos[1];
+            if (dx * dx + dy * dy).sqrt() <= 12.0 {
+                if let Some(d) = &mut self.layout_dialog {
+                    d.drag = Some(DialogDrag::Port(name.clone()));
+                }
+                return;
+            }
+        }
+    }
+
+    pub fn dialog_mouse_moved(&mut self) {
+        let Some(geom) = self.dialog_geometry() else {
+            return;
+        };
+        let cursor = self.cursor;
+        let Some(dialog) = &mut self.layout_dialog else {
+            return;
+        };
+        match dialog.drag.clone() {
+            Some(DialogDrag::Port(name)) => {
+                // Project the cursor onto the nearest edge of the preview.
+                let r = geom.preview;
+                let x = cursor[0].clamp(r.x, r.x + r.w);
+                let y = cursor[1].clamp(r.y, r.y + r.h);
+                let d_left = (cursor[0] - r.x).abs();
+                let d_right = (cursor[0] - (r.x + r.w)).abs();
+                let d_top = (cursor[1] - r.y).abs();
+                let d_bottom = (cursor[1] - (r.y + r.h)).abs();
+                let min = d_left.min(d_right).min(d_top).min(d_bottom);
+                use diycpu::project::PortSide;
+                let (side, t) = if min == d_left {
+                    (PortSide::Left, (y - r.y) / r.h)
+                } else if min == d_right {
+                    (PortSide::Right, (y - r.y) / r.h)
+                } else if min == d_top {
+                    (PortSide::Top, (x - r.x) / r.w)
+                } else {
+                    (PortSide::Bottom, (x - r.x) / r.w)
+                };
+                // Snap to twentieths for tidy alignment.
+                let t = ((t * 20.0).round() / 20.0).clamp(0.02, 0.98);
+                dialog.pending_port = Some((name, side, t));
+            }
+            Some(DialogDrag::Resize) => {
+                let w = ((cursor[0] - geom.preview.x) / geom.scale * 2.0).round() / 2.0;
+                let h = ((cursor[1] - geom.preview.y) / geom.scale * 2.0).round() / 2.0;
+                dialog.pending_size = Some((w.clamp(2.0, 40.0), h.clamp(1.5, 40.0)));
+            }
+            None => {}
+        }
+    }
+
+    pub fn dialog_mouse_released(&mut self) {
+        let Some(dialog) = &mut self.layout_dialog else {
+            return;
+        };
+        let pending_port = dialog.pending_port.take();
+        let pending_size = dialog.pending_size.take();
+        let had_drag = dialog.drag.take();
+        match had_drag {
+            Some(DialogDrag::Port(_)) => {
+                if let Some((name, side, t)) = pending_port {
+                    if let Err(e) = self.editor.set_port_layout(&name, side, t) {
+                        self.error(e.to_string());
+                    }
+                }
+            }
+            Some(DialogDrag::Resize) => {
+                if let Some((w, h)) = pending_size {
+                    if let Err(e) = self.editor.set_abstraction_size(w, h) {
+                        self.error(e.to_string());
+                    }
+                }
+            }
+            None => {}
+        }
     }
 }

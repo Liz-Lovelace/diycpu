@@ -38,7 +38,13 @@ struct CliArgs {
     run_steps: Option<usize>,
     sheet: Option<String>,
     dialog: bool,
+    /// Open the image-settings dialog for the sheet's first image.
+    image_dialog: bool,
     camera: Option<(f32, f32, f32)>,
+    /// Park the cursor at a grid point before the screenshot (hover states).
+    cursor: Option<(f32, f32)>,
+    /// Sample animated images at this many seconds.
+    anim_t: Option<f32>,
     size: (u32, u32),
 }
 
@@ -49,7 +55,10 @@ fn parse_args() -> CliArgs {
         run_steps: None,
         sheet: None,
         dialog: false,
+        image_dialog: false,
         camera: None,
+        cursor: None,
+        anim_t: None,
         size: (1280, 800),
     };
     let mut it = std::env::args().skip(1);
@@ -59,6 +68,17 @@ fn parse_args() -> CliArgs {
             "--run" => args.run_steps = it.next().and_then(|s| s.parse().ok()),
             "--sheet" => args.sheet = it.next(),
             "--dialog" => args.dialog = true,
+            "--image-dialog" => args.image_dialog = true,
+            "--anim-t" => args.anim_t = it.next().and_then(|s| s.parse().ok()),
+            "--cursor" => {
+                if let Some(s) = it.next() {
+                    let parts: Vec<f32> =
+                        s.split(',').filter_map(|p| p.parse().ok()).collect();
+                    if let [x, y] = parts[..] {
+                        args.cursor = Some((x, y));
+                    }
+                }
+            }
             "--camera" => {
                 if let Some(s) = it.next() {
                     let parts: Vec<f32> =
@@ -86,6 +106,8 @@ fn parse_args() -> CliArgs {
 
 /// Wall-clock time between clock steps while the simulation plays.
 const PLAY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(300);
+/// Redraw cadence while an animated image is on screen.
+const ANIM_FRAME: std::time::Duration = std::time::Duration::from_millis(33);
 
 struct Shell {
     context: PossiblyCurrentContext,
@@ -97,6 +119,13 @@ struct Shell {
     screenshot: Option<PathBuf>,
     last_press: Option<(Instant, [f32; 2])>,
     next_play_tick: Instant,
+    /// Launch time; drives animated images.
+    start: Instant,
+    /// Screenshot helpers: hover this grid point / sample animations here.
+    cursor_at: Option<(f32, f32)>,
+    anim_t: Option<f32>,
+    /// The last frame showed an animated image — keep redrawing.
+    anim_active: bool,
 }
 
 impl Shell {
@@ -150,7 +179,30 @@ impl Shell {
         let mut canvas = Canvas::new(gl_renderer).unwrap();
         let renderer = Renderer::new(&mut canvas);
 
-        let mut app = App::new(args.project.clone());
+        // A project may be given as its directory or its json file; with
+        // no argument, the most recent project in the projects folder opens
+        // (created on first launch).
+        let project_path = args
+            .project
+            .clone()
+            .map(|p| {
+                if p.is_dir() {
+                    p.join("project.json")
+                } else {
+                    p
+                }
+            })
+            .or_else(|| {
+                let base = app::projects_base_dir()?;
+                match app::default_project_path(&base) {
+                    Ok(p) => Some(p),
+                    Err(e) => {
+                        eprintln!("Could not prepare the projects folder: {e}");
+                        None
+                    }
+                }
+            });
+        let mut app = App::new(project_path);
         app.window_size = [size.width as f32, size.height as f32];
         if let Some(sheet_name) = &args.sheet {
             if let Some(i) = app
@@ -165,6 +217,11 @@ impl Shell {
         }
         if args.dialog {
             app.action_open_layout_dialog();
+        }
+        if args.image_dialog {
+            if let Some(id) = app.editor.sheet_images().first().map(|i| i.id.clone()) {
+                app.action_open_image_dialog(&id);
+            }
         }
         if let Some((zoom, x, y)) = args.camera {
             app.camera.zoom = zoom;
@@ -189,6 +246,10 @@ impl Shell {
             screenshot: args.screenshot.clone(),
             last_press: None,
             next_play_tick: Instant::now(),
+            start: Instant::now(),
+            cursor_at: args.cursor,
+            anim_t: args.anim_t,
+            anim_active: false,
         }
     }
 
@@ -204,10 +265,19 @@ impl Shell {
         // higher value would make femtovg rasterize glyphs oversized and
         // scale them back down — blurry text on HiDPI screens.
         self.canvas.set_size(size.width, size.height, 1.0);
+        self.app.anim_seconds = self
+            .anim_t
+            .unwrap_or_else(|| self.start.elapsed().as_secs_f32());
+        if let Some((gx, gy)) = self.cursor_at.take() {
+            // After the pending fit so the point lands where intended.
+            let s = self.app.camera.grid_to_screen([gx, gy]);
+            self.app.mouse_moved(s);
+        }
         self.app.recompute_hover();
         let ui = ui_layout(&self.app);
         self.renderer.draw(&mut self.canvas, &self.app, &ui);
         self.canvas.flush();
+        self.anim_active = self.renderer.wants_animation();
 
         if let Some(path) = self.screenshot.take() {
             match self.save_screenshot(&path) {
@@ -247,13 +317,17 @@ impl Shell {
     fn update_cursor_icon(&self) {
         let icon = match &self.app.gesture {
             Gesture::Panning { .. } => CursorIcon::Grabbing,
-            Gesture::Placing { .. } | Gesture::DrawingWire { .. } => CursorIcon::Crosshair,
+            Gesture::Placing { .. }
+            | Gesture::PlacingImage { .. }
+            | Gesture::DrawingWire { .. } => CursorIcon::Crosshair,
             Gesture::DraggingComponents { .. } => CursorIcon::Move,
             Gesture::DraggingJunction { .. } => CursorIcon::Grabbing,
             _ => match self.app.hover {
                 Hit::Port { .. } => CursorIcon::Crosshair,
                 Hit::Junction { .. } => CursorIcon::Grab,
-                Hit::Component { .. } | Hit::Note { .. } => CursorIcon::Pointer,
+                Hit::Component { .. } | Hit::Note { .. } | Hit::Image { .. } => {
+                    CursorIcon::Pointer
+                }
                 _ => CursorIcon::Default,
             },
         };
@@ -267,6 +341,10 @@ impl Shell {
         // clicking outside any dialog), the layout dialog handles its own.
         if self.app.prompt.is_some() {
             self.app.dismiss_prompt();
+            return;
+        }
+        if self.app.image_dialog.is_some() {
+            self.app.img_dialog_pressed();
             return;
         }
         if self.app.layout_dialog.is_some() {
@@ -288,7 +366,7 @@ impl Shell {
                     ButtonId::StepBack => self.app.action_step_back(),
                     ButtonId::StepForward => self.app.action_step_forward(),
                     ButtonId::Fit => self.app.fit_view(),
-                    ButtonId::Save => self.app.save(),
+                    ButtonId::Save => self.app.save_as(),
                     ButtonId::Open => self.app.open(),
                     ButtonId::NewAbstraction => self.app.action_new_abstraction(),
                     ButtonId::AddInputPin => {
@@ -371,12 +449,14 @@ impl ApplicationHandler for AppState {
     }
 
     fn new_events(&mut self, _event_loop: &ActiveEventLoop, cause: winit::event::StartCause) {
-        // The autoplay timer fired: advance the clock and schedule the next.
+        // A timer fired: the autoplay clock, an animation frame, or both.
         if matches!(cause, winit::event::StartCause::ResumeTimeReached { .. }) {
             if let AppState::Running(shell) = self {
-                if shell.app.playing {
+                if shell.app.playing && Instant::now() >= shell.next_play_tick {
                     shell.app.play_tick();
                     shell.next_play_tick = Instant::now() + PLAY_INTERVAL;
+                }
+                if shell.app.playing || shell.anim_active {
                     shell.window.request_redraw();
                 }
             }
@@ -385,10 +465,17 @@ impl ApplicationHandler for AppState {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if let AppState::Running(shell) = self {
+            let mut next: Option<Instant> = None;
             if shell.app.playing {
-                event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(
-                    shell.next_play_tick,
-                ));
+                next = Some(shell.next_play_tick);
+            }
+            if shell.anim_active {
+                let frame = Instant::now() + ANIM_FRAME;
+                next = Some(next.map_or(frame, |n| n.min(frame)));
+            }
+            if let Some(at) = next {
+                event_loop
+                    .set_control_flow(winit::event_loop::ControlFlow::WaitUntil(at));
                 return;
             }
         }
@@ -421,7 +508,10 @@ impl ApplicationHandler for AppState {
             }
             WindowEvent::RedrawRequested => shell.render(event_loop),
             WindowEvent::CursorMoved { position, .. } => {
-                if shell.app.layout_dialog.is_some() {
+                if shell.app.image_dialog.is_some() {
+                    shell.app.cursor = [position.x as f32, position.y as f32];
+                    shell.app.img_dialog_moved();
+                } else if shell.app.layout_dialog.is_some() {
                     shell.app.cursor = [position.x as f32, position.y as f32];
                     shell.app.dialog_mouse_moved();
                 } else {
@@ -436,7 +526,9 @@ impl ApplicationHandler for AppState {
                 match (button, state) {
                     (MouseButton::Left, ElementState::Pressed) => shell.left_pressed(),
                     (MouseButton::Left, ElementState::Released) => {
-                        if shell.app.layout_dialog.is_some() {
+                        if shell.app.image_dialog.is_some() {
+                            shell.app.img_dialog_released();
+                        } else if shell.app.layout_dialog.is_some() {
                             shell.app.dialog_mouse_released();
                         } else {
                             shell.app.left_released();

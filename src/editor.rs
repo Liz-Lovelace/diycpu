@@ -51,6 +51,7 @@ pub enum EditError {
     OutputPinNeedsSource,
     AbstractionInUse(usize),
     UnknownNote(String),
+    UnknownImage(String),
     UnknownNet(String),
 }
 
@@ -97,6 +98,7 @@ impl fmt::Display for EditError {
                 "This abstraction is placed {n} time(s) — delete those instances first"
             ),
             Self::UnknownNote(id) => write!(f, "That note ({id}) no longer exists"),
+            Self::UnknownImage(id) => write!(f, "That image ({id}) no longer exists"),
             Self::UnknownNet(id) => write!(f, "That wire ({id}) no longer exists"),
         }
     }
@@ -141,6 +143,7 @@ impl Editor {
             components: vec![],
             wire_nets: vec![],
             notes: vec![],
+            images: vec![],
         })
     }
 
@@ -153,6 +156,10 @@ impl Editor {
     }
 
     /// The annotations on the current sheet.
+    pub fn sheet_images(&self) -> &[crate::project::MediaImage] {
+        sheet_images(&self.project, self.sheet).unwrap_or(&[])
+    }
+
     pub fn sheet_notes(&self) -> &[crate::project::Note] {
         sheet_notes(&self.project, self.sheet)
             .expect("current sheet is always kept valid")
@@ -277,15 +284,16 @@ impl Editor {
         ids: &[String],
         delta: [i32; 2],
     ) -> Result<(), EditError> {
-        self.move_items(ids, &[], delta)
+        self.move_items(ids, &[], &[], delta)
     }
 
-    /// Move components and notes together by a whole number of grid cells,
-    /// as one undo step. Only components have overlap rules.
+    /// Move components, notes and images together by a whole number of grid
+    /// cells, as one undo step. Only components have overlap rules.
     pub fn move_items(
         &mut self,
         component_ids: &[String],
         note_ids: &[String],
+        image_ids: &[String],
         delta: [i32; 2],
     ) -> Result<(), EditError> {
         if delta == [0, 0] {
@@ -293,6 +301,7 @@ impl Editor {
         }
         let ids = component_ids.to_vec();
         let note_ids = note_ids.to_vec();
+        let image_ids = image_ids.to_vec();
         self.mutate(move |project, sheet| {
             let abstractions = project.abstractions.clone();
             let (components, _) = sheet_mut(project, sheet).ok_or(EditError::BadSheet)?;
@@ -329,35 +338,48 @@ impl Editor {
                 note.pos[0] += delta[0] as f32;
                 note.pos[1] += delta[1] as f32;
             }
+
+            let images = sheet_images_mut(project, sheet).ok_or(EditError::BadSheet)?;
+            for id in &image_ids {
+                let img = images
+                    .iter_mut()
+                    .find(|i| &i.id == id)
+                    .ok_or_else(|| EditError::UnknownImage(id.clone()))?;
+                img.pos[0] += delta[0] as f32;
+                img.pos[1] += delta[1] as f32;
+            }
             Ok(())
         })
     }
 
     /// Delete components and scrub every reference to them from wire nets.
     pub fn delete_components(&mut self, ids: &[String]) -> Result<(), EditError> {
-        self.delete_items(ids, &[])
+        self.delete_items(ids, &[], &[])
     }
 
-    /// Delete components and notes as one undo step.
+    /// Delete components, notes and images as one undo step.
     pub fn delete_items(
         &mut self,
         component_ids: &[String],
         note_ids: &[String],
+        image_ids: &[String],
     ) -> Result<(), EditError> {
-        self.delete_mixed(component_ids, note_ids, &[], &[])
+        self.delete_mixed(component_ids, note_ids, image_ids, &[], &[])
     }
 
-    /// Delete any mix of selected things — components, notes, wire
+    /// Delete any mix of selected things — components, notes, images, wire
     /// segments — and unwire output pins, all in one undo step.
     pub fn delete_mixed(
         &mut self,
         component_ids: &[String],
         note_ids: &[String],
+        image_ids: &[String],
         segments: &[(String, usize)],
         pin_wires: &[String],
     ) -> Result<(), EditError> {
         if component_ids.is_empty()
             && note_ids.is_empty()
+            && image_ids.is_empty()
             && segments.is_empty()
             && pin_wires.is_empty()
         {
@@ -365,6 +387,7 @@ impl Editor {
         }
         let ids = component_ids.to_vec();
         let note_ids = note_ids.to_vec();
+        let image_ids = image_ids.to_vec();
         let segments = segments.to_vec();
         let pin_wires = pin_wires.to_vec();
         self.mutate(move |project, sheet| {
@@ -431,6 +454,8 @@ impl Editor {
 
             let notes = sheet_notes_mut(project, sheet).ok_or(EditError::BadSheet)?;
             notes.retain(|n| !note_ids.contains(&n.id));
+            let images = sheet_images_mut(project, sheet).ok_or(EditError::BadSheet)?;
+            images.retain(|i| !image_ids.contains(&i.id));
             Ok(())
         })
     }
@@ -466,6 +491,68 @@ impl Editor {
             } else {
                 notes.iter_mut().find(|n| n.id == id).unwrap().text = text.clone();
             }
+            Ok(())
+        })
+    }
+
+    // ── Images ───────────────────────────────────────────────────────────
+
+    /// Place a picture. `file` is a project-dir-relative path (normally
+    /// under "media/"). Returns the new image's id.
+    pub fn place_image(
+        &mut self,
+        pos: [f32; 2],
+        file: &str,
+        size: [f32; 2],
+    ) -> Result<String, EditError> {
+        let file = file.to_string();
+        self.mutate(move |project, sheet| {
+            let images = sheet_images_mut(project, sheet).ok_or(EditError::BadSheet)?;
+            let id = generate_image_id(images);
+            images.push(crate::project::MediaImage {
+                id: id.clone(),
+                file: file.clone(),
+                pos,
+                size: clamp_image_size(size),
+            });
+            Ok(id)
+        })
+    }
+
+    /// Swap a picture's file, optionally updating its display size in the
+    /// same undo step (a new file usually brings a new aspect ratio).
+    pub fn set_image_file(
+        &mut self,
+        id: &str,
+        file: &str,
+        size: Option<[f32; 2]>,
+    ) -> Result<(), EditError> {
+        let id = id.to_string();
+        let file = file.to_string();
+        self.mutate(move |project, sheet| {
+            let images = sheet_images_mut(project, sheet).ok_or(EditError::BadSheet)?;
+            let img = images
+                .iter_mut()
+                .find(|i| i.id == id)
+                .ok_or_else(|| EditError::UnknownImage(id.clone()))?;
+            img.file = file.clone();
+            if let Some(size) = size {
+                img.size = clamp_image_size(size);
+            }
+            Ok(())
+        })
+    }
+
+    /// Resize a picture (grid units).
+    pub fn set_image_size(&mut self, id: &str, w: f32, h: f32) -> Result<(), EditError> {
+        let id = id.to_string();
+        self.mutate(move |project, sheet| {
+            let images = sheet_images_mut(project, sheet).ok_or(EditError::BadSheet)?;
+            let img = images
+                .iter_mut()
+                .find(|i| i.id == id)
+                .ok_or_else(|| EditError::UnknownImage(id.clone()))?;
+            img.size = clamp_image_size([w, h]);
             Ok(())
         })
     }
@@ -667,12 +754,12 @@ impl Editor {
     /// Delete several wire segments (one undo step). Nets that fall apart
     /// split into their live pieces.
     pub fn delete_segments(&mut self, items: &[(String, usize)]) -> Result<(), EditError> {
-        self.delete_mixed(&[], &[], items, &[])
+        self.delete_mixed(&[], &[], &[], items, &[])
     }
 
     /// Unwire output pins (their derived wires disappear; the pins stay).
     pub fn unwire_output_pins(&mut self, names: &[String]) -> Result<(), EditError> {
-        self.delete_mixed(&[], &[], &[], names)
+        self.delete_mixed(&[], &[], &[], &[], names)
     }
 
     /// Flip a flip-flop's initial value.
@@ -695,9 +782,14 @@ impl Editor {
 
     // ── Clipboard fragments ──────────────────────────────────────────────
 
-    /// A self-contained snippet of a sheet: components, notes, and the
-    /// wiring that runs among them. What Ctrl+C carries around.
-    pub fn fragment(&self, component_ids: &[String], note_ids: &[String]) -> Fragment {
+    /// A self-contained snippet of a sheet: components, notes, images and
+    /// the wiring that runs among them. What Ctrl+C carries around.
+    pub fn fragment(
+        &self,
+        component_ids: &[String],
+        note_ids: &[String],
+        image_ids: &[String],
+    ) -> Fragment {
         let (components, wire_nets) = self.sheet_data();
         let components: Vec<ProjectComponent> = components
             .iter()
@@ -708,6 +800,12 @@ impl Editor {
             .sheet_notes()
             .iter()
             .filter(|n| note_ids.contains(&n.id))
+            .cloned()
+            .collect();
+        let images: Vec<crate::project::MediaImage> = self
+            .sheet_images()
+            .iter()
+            .filter(|i| image_ids.contains(&i.id))
             .cloned()
             .collect();
 
@@ -734,19 +832,20 @@ impl Editor {
         Fragment {
             components,
             notes,
+            images,
             wire_nets: nets,
         }
     }
 
     /// Insert a fragment's copies, offset by `delta` grid cells, with fresh
     /// ids everywhere. With `search`, nearby offsets are tried until the
-    /// copies fit. Returns the new (component ids, note ids).
+    /// copies fit. Returns the new (component ids, note ids, image ids).
     pub fn paste_fragment(
         &mut self,
         fragment: &Fragment,
         delta: [i32; 2],
         search: bool,
-    ) -> Result<(Vec<String>, Vec<String>), EditError> {
+    ) -> Result<PastedIds, EditError> {
         let fragment = fragment.clone();
         self.mutate(move |project, sheet| {
             let ctx = KindCtx::new(project, sheet)?;
@@ -861,7 +960,20 @@ impl Editor {
                 new_note_ids.push(id);
             }
 
-            Ok((new_component_ids, new_note_ids))
+            let images = sheet_images_mut(project, sheet).ok_or(EditError::BadSheet)?;
+            let mut new_image_ids = Vec::new();
+            for original in &fragment.images {
+                let id = generate_image_id(images);
+                images.push(crate::project::MediaImage {
+                    id: id.clone(),
+                    file: original.file.clone(),
+                    pos: [original.pos[0] + offset[0], original.pos[1] + offset[1]],
+                    size: original.size,
+                });
+                new_image_ids.push(id);
+            }
+
+            Ok((new_component_ids, new_note_ids, new_image_ids))
         })
     }
 
@@ -892,6 +1004,7 @@ impl Editor {
                 components: vec![],
                 wire_nets: vec![],
                 notes: vec![],
+            images: vec![],
             });
             Ok(project.abstractions.len() - 1)
         })
@@ -1463,6 +1576,32 @@ fn sheet_notes_mut(
     }
 }
 
+pub fn sheet_images(
+    project: &Project,
+    sheet: SheetRef,
+) -> Option<&[crate::project::MediaImage]> {
+    match sheet {
+        SheetRef::Top => Some(project.images.as_slice()),
+        SheetRef::Abstraction(i) => project.abstractions.get(i).map(|a| a.images.as_slice()),
+    }
+}
+
+fn sheet_images_mut(
+    project: &mut Project,
+    sheet: SheetRef,
+) -> Option<&mut Vec<crate::project::MediaImage>> {
+    match sheet {
+        SheetRef::Top => Some(&mut project.images),
+        SheetRef::Abstraction(i) => project.abstractions.get_mut(i).map(|a| &mut a.images),
+    }
+}
+
+/// Pictures may be any size from half a cell to a whole wall.
+fn clamp_image_size(size: [f32; 2]) -> [f32; 2] {
+    let fix = |v: f32, fallback: f32| if v.is_finite() { v.clamp(0.5, 60.0) } else { fallback };
+    [fix(size[0], 6.0), fix(size[1], 4.0)]
+}
+
 /// Does abstraction `name` (transitively) instantiate `target`?
 /// Also true when `name == target`. Robust against cyclic definitions in
 /// hand-edited files (a visited set bounds the walk).
@@ -1520,6 +1659,16 @@ fn generate_note_id(notes: &[crate::project::Note]) -> String {
     for n in 1.. {
         let candidate = format!("note_{n}");
         if !notes.iter().any(|note| note.id == candidate) {
+            return candidate;
+        }
+    }
+    unreachable!()
+}
+
+fn generate_image_id(images: &[crate::project::MediaImage]) -> String {
+    for n in 1.. {
+        let candidate = format!("img_{n}");
+        if !images.iter().any(|img| img.id == candidate) {
             return candidate;
         }
     }
@@ -2081,17 +2230,21 @@ fn repair_nets(
     Ok(())
 }
 
+/// New ids after a paste: (components, notes, images).
+pub type PastedIds = (Vec<String>, Vec<String>, Vec<String>);
+
 /// A copyable snippet of a sheet.
 #[derive(Debug, Clone)]
 pub struct Fragment {
     pub components: Vec<ProjectComponent>,
     pub notes: Vec<crate::project::Note>,
+    pub images: Vec<crate::project::MediaImage>,
     pub wire_nets: Vec<WireNet>,
 }
 
 impl Fragment {
     pub fn is_empty(&self) -> bool {
-        self.components.is_empty() && self.notes.is_empty()
+        self.components.is_empty() && self.notes.is_empty() && self.images.is_empty()
     }
 
     /// Bounding box of the fragment's contents, in grid units.
@@ -2105,6 +2258,9 @@ impl Fragment {
         }
         for n in &self.notes {
             extend(layout::note_bounds(n));
+        }
+        for i in &self.images {
+            extend(layout::image_bounds(i));
         }
         bounds
     }
@@ -2226,7 +2382,46 @@ pub fn normalize(project: &mut Project) -> Vec<String> {
             }
         }
     }
+
+    // Images: unique non-empty ids, finite positive sizes.
+    sanitize_images(&mut project.images, "main circuit", &mut notes);
+    for i in 0..project.abstractions.len() {
+        let label = format!("abstraction \"{}\"", project.abstractions[i].name);
+        sanitize_images(&mut project.abstractions[i].images, &label, &mut notes);
+    }
     notes
+}
+
+fn sanitize_images(
+    images: &mut [crate::project::MediaImage],
+    label: &str,
+    notes: &mut Vec<String>,
+) {
+    for k in 0..images.len() {
+        let dup = images[..k].iter().any(|o| o.id == images[k].id);
+        if images[k].id.is_empty() || dup {
+            let fresh = generate_image_id(images);
+            notes.push(format!("{label}: image given a fresh id \"{fresh}\""));
+            images[k].id = fresh;
+        }
+        let s = images[k].size;
+        let fixed = [
+            if s[0].is_finite() { s[0].clamp(0.5, 60.0) } else { 6.0 },
+            if s[1].is_finite() { s[1].clamp(0.5, 60.0) } else { 4.0 },
+        ];
+        if fixed != s {
+            notes.push(format!(
+                "{label}: image \"{}\" size repaired",
+                images[k].id
+            ));
+            images[k].size = fixed;
+        }
+        for v in images[k].pos.iter_mut() {
+            if !v.is_finite() {
+                *v = 0.0;
+            }
+        }
+    }
 }
 
 fn normalize_sheet(
@@ -2823,6 +3018,7 @@ mod tests {
             }],
             wire_nets: vec![],
         notes: vec![],
+            images: vec![],
         });
         e
     }
@@ -3303,7 +3499,7 @@ mod tests {
         let mut e = Editor::empty();
         let id = e.place_note([2.0, 3.0], "reset logic lives here").unwrap();
         assert_eq!(id, "note_1");
-        e.move_items(&[], std::slice::from_ref(&id), [4, 1]).unwrap();
+        e.move_items(&[], std::slice::from_ref(&id), &[], [4, 1]).unwrap();
         assert_eq!(e.project.notes[0].pos, [6.0, 4.0]);
         e.set_note_text(&id, "updated").unwrap();
         assert_eq!(e.project.notes[0].text, "updated");
@@ -3319,7 +3515,7 @@ mod tests {
         let mut e = Editor::empty();
         e.place_component("nand", [0, 0]).unwrap();
         let note = e.place_note([5.0, 5.0], "hello").unwrap();
-        e.delete_items(&["nand_1".into()], &[note]).unwrap();
+        e.delete_items(&["nand_1".into()], &[note], &[]).unwrap();
         assert!(e.project.components.is_empty());
         assert!(e.project.notes.is_empty());
         // One undo restores both (single op).
@@ -3509,11 +3705,8 @@ mod tests {
             .unwrap();
         e.place_note([0.0, 5.0], "keep me").unwrap();
 
-        let frag = e.fragment(
-            &["nand_1".into(), "nand_2".into()],
-            &["note_1".into()],
-        );
-        let (new_comps, new_notes) = e.paste_fragment(&frag, [0, 8], true).unwrap();
+        let frag = e.fragment(&["nand_1".into(), "nand_2".into()], &["note_1".into()], &[]);
+        let (new_comps, new_notes, _) = e.paste_fragment(&frag, [0, 8], true).unwrap();
         assert_eq!(new_comps, vec!["nand_3", "nand_4"]);
         assert_eq!(new_notes, vec!["note_2"]);
 
@@ -3543,9 +3736,9 @@ mod tests {
         e.connect(port("nand_1", "out"), port("nand_2", "a"), &[])
             .unwrap();
         // Copy only one endpoint: the wire between them must not come.
-        let frag = e.fragment(&["nand_1".into()], &[]);
+        let frag = e.fragment(&["nand_1".into()], &[], &[]);
         assert!(frag.wire_nets.is_empty());
-        let (ids, _) = e.paste_fragment(&frag, [0, 8], true).unwrap();
+        let (ids, _, _) = e.paste_fragment(&frag, [0, 8], true).unwrap();
         assert_eq!(ids.len(), 1);
         assert_eq!(e.project.wire_nets.len(), 1, "no extra nets appeared");
     }
@@ -3553,9 +3746,9 @@ mod tests {
     #[test]
     fn paste_searches_for_free_space_and_rejects_recursion() {
         let mut e = editor_with_two_nands();
-        let frag = e.fragment(&["nand_1".into()], &[]);
+        let frag = e.fragment(&["nand_1".into()], &[], &[]);
         // Zero offset collides with the original; search finds a spot.
-        let (ids, _) = e.paste_fragment(&frag, [0, 0], true).unwrap();
+        let (ids, _, _) = e.paste_fragment(&frag, [0, 0], true).unwrap();
         assert_eq!(ids.len(), 1);
         // Without search, a collision is refused outright.
         assert_eq!(
@@ -3567,7 +3760,7 @@ mod tests {
         let mut e = Editor::empty();
         let i = e.create_abstraction("thing").unwrap();
         e.place_component("thing", [0, 0]).unwrap();
-        let frag = e.fragment(&["thing_1".into()], &[]);
+        let frag = e.fragment(&["thing_1".into()], &[], &[]);
         e.open_sheet(SheetRef::Abstraction(i)).unwrap();
         assert!(matches!(
             e.paste_fragment(&frag, [0, 0], true).unwrap_err(),
@@ -3736,14 +3929,14 @@ mod tests {
         e.add_interface_pin(PortKind::Input, "x").unwrap();
         e.place_component("nand", [4, 0]).unwrap();
         e.connect(pin("INPUT:", "x"), port("nand_1", "a"), &[]).unwrap();
-        let frag = e.fragment(&["nand_1".into()], &[]);
+        let frag = e.fragment(&["nand_1".into()], &[], &[]);
         assert!(
             frag.wire_nets.is_empty(),
             "the pin is not selected, so its wire must not travel"
         );
 
         // Same-sheet paste: the copy is NOT wired to the pin.
-        let (ids, _) = e.paste_fragment(&frag, [0, 4], true).unwrap();
+        let (ids, _, _) = e.paste_fragment(&frag, [0, 4], true).unwrap();
         assert_eq!(ids.len(), 1);
         assert_eq!(e.project.abstractions[i].wire_nets.len(), 1);
         let net = &e.project.abstractions[i].wire_nets[0];
@@ -3751,7 +3944,7 @@ mod tests {
 
         // Cross-sheet paste works too.
         e.open_sheet(SheetRef::Top).unwrap();
-        let (ids, _) = e.paste_fragment(&frag, [0, 0], true).unwrap();
+        let (ids, _, _) = e.paste_fragment(&frag, [0, 0], true).unwrap();
         assert_eq!(ids.len(), 1);
         assert!(e.project.wire_nets.is_empty());
     }
@@ -3844,5 +4037,87 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+
+    #[test]
+    fn image_lifecycle_place_move_resize_delete_undo() {
+        let mut e = Editor::empty();
+        let id = e.place_image([2.0, 3.0], "media/cat.png", [6.0, 4.0]).unwrap();
+        assert_eq!(e.project.images.len(), 1);
+        assert_eq!(e.project.images[0].file, "media/cat.png");
+
+        e.move_items(&[], &[], std::slice::from_ref(&id), [3, -1]).unwrap();
+        assert_eq!(e.project.images[0].pos, [5.0, 2.0]);
+
+        e.set_image_size(&id, 10.0, 2.5).unwrap();
+        assert_eq!(e.project.images[0].size, [10.0, 2.5]);
+
+        e.set_image_file(&id, "media/dog.gif", Some([4.0, 4.0])).unwrap();
+        assert_eq!(e.project.images[0].file, "media/dog.gif");
+        assert_eq!(e.project.images[0].size, [4.0, 4.0]);
+
+        e.delete_items(&[], &[], std::slice::from_ref(&id)).unwrap();
+        assert!(e.project.images.is_empty());
+
+        // Each op was one undo step.
+        e.undo().unwrap(); // un-delete
+        assert_eq!(e.project.images.len(), 1);
+        e.undo().unwrap(); // un-set-file
+        assert_eq!(e.project.images[0].file, "media/cat.png");
+    }
+
+    #[test]
+    fn image_size_is_clamped_sane() {
+        let mut e = Editor::empty();
+        let id = e.place_image([0.0, 0.0], "media/x.png", [0.0, 900.0]).unwrap();
+        assert_eq!(e.project.images[0].size, [0.5, 60.0]);
+        e.set_image_size(&id, f32::NAN, -3.0).unwrap();
+        assert_eq!(e.project.images[0].size, [6.0, 0.5]);
+    }
+
+    #[test]
+    fn fragment_and_paste_carry_images() {
+        let mut e = Editor::empty();
+        e.place_component("nand", [0, 0]).unwrap();
+        let img = e.place_image([0.0, 3.0], "media/cat.png", [4.0, 2.0]).unwrap();
+        let frag = e.fragment(&["nand_1".into()], &[], std::slice::from_ref(&img));
+        assert_eq!(frag.images.len(), 1);
+        let (comps, _, imgs) = e.paste_fragment(&frag, [8, 0], true).unwrap();
+        assert_eq!(comps.len(), 1);
+        assert_eq!(imgs.len(), 1);
+        assert_eq!(e.project.images.len(), 2);
+        // The copy has a fresh id and shares the media file.
+        assert_ne!(e.project.images[1].id, img);
+        assert_eq!(e.project.images[1].file, "media/cat.png");
+        assert_eq!(e.project.images[1].pos, [8.0, 3.0]);
+    }
+
+    #[test]
+    fn normalize_repairs_broken_images() {
+        let mut project = Editor::empty().project;
+        project.images = vec![
+            crate::project::MediaImage {
+                id: "img_1".into(),
+                file: "media/a.png".into(),
+                pos: [0.0, 0.0],
+                size: [4.0, 3.0],
+            },
+            crate::project::MediaImage {
+                id: "img_1".into(), // duplicate id
+                file: "media/b.png".into(),
+                pos: [f32::NAN, 2.0],
+                size: [-5.0, 3.0], // broken size
+            },
+        ];
+        let notes = normalize(&mut project);
+        assert!(!notes.is_empty());
+        assert_ne!(project.images[0].id, project.images[1].id);
+        assert_eq!(project.images[1].size[0], 0.5);
+        assert_eq!(project.images[1].pos[0], 0.0);
     }
 }

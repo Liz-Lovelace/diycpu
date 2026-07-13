@@ -1,7 +1,11 @@
 //! The renderer: a pure function of (document, gesture, simulation, camera).
-//! Nothing here is stateful except the loaded font.
+//! Nothing here is stateful except the loaded fonts and the media cache.
 
-use femtovg::{renderer::OpenGl, Align, Baseline, Canvas, Color, Paint, Path};
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use femtovg::{renderer::OpenGl, Align, Baseline, Canvas, Color, ImageFlags, Paint, Path};
 
 use diycpu::layout::{self, PortKind};
 use diycpu::project::{ProjectComponent, WireNet};
@@ -31,6 +35,7 @@ struct SheetCtx<'a> {
     components: &'a [diycpu::project::ProjectComponent],
     wire_nets: &'a [WireNet],
     notes: &'a [Note],
+    images: &'a [diycpu::project::MediaImage],
     interface: Option<&'a ProjectAbstraction>,
     view: View,
     alpha: f32,
@@ -55,6 +60,7 @@ fn make_ctx(
 ) -> Option<SheetCtx<'_>> {
     let (components, wire_nets) = diycpu::editor::sheet_of(project, sheet)?;
     let notes = diycpu::editor::sheet_notes(project, sheet)?;
+    let images = diycpu::editor::sheet_images(project, sheet)?;
     let interface = match sheet {
         SheetRef::Abstraction(i) => project.abstractions.get(i),
         SheetRef::Top => None,
@@ -65,6 +71,7 @@ fn make_ctx(
         components,
         wire_nets,
         notes,
+        images,
         interface,
         view,
         alpha,
@@ -72,19 +79,156 @@ fn make_ctx(
     })
 }
 
+/// A decoded media file living on the GPU. Animated GIFs carry all their
+/// frames; everything else is a single frame.
+struct LoadedImage {
+    frames: Vec<femtovg::ImageId>,
+    /// Per-frame display time in seconds (same length as `frames`).
+    delays: Vec<f32>,
+    total: f32,
+}
+
+enum MediaEntry {
+    Ok(LoadedImage),
+    Failed,
+}
+
 pub struct Renderer {
-    font: femtovg::FontId,
+    /// Inter first for all UI text; DejaVu as the fallback for symbols
+    /// Inter doesn't cover (⟲ ◂ ▸ ✕ …).
+    fonts: [femtovg::FontId; 2],
+    /// Media decoded at most once per absolute path; failures cached too so
+    /// a broken file doesn't re-decode every frame.
+    media: RefCell<HashMap<PathBuf, MediaEntry>>,
+    /// Set while drawing when any animated image is visible — the shell
+    /// keeps redrawing while this holds.
+    animating: Cell<bool>,
 }
 
 impl Renderer {
     pub fn new(canvas: &mut Canvas<OpenGl>) -> Self {
-        let font = canvas
+        let inter = canvas
+            .add_font_mem(include_bytes!("../../../assets/Inter-Regular.otf"))
+            .expect("embedded font loads");
+        let fallback = canvas
             .add_font_mem(include_bytes!("../../../assets/DejaVuSans.ttf"))
             .expect("embedded font loads");
-        Renderer { font }
+        Renderer {
+            fonts: [inter, fallback],
+            media: RefCell::new(HashMap::new()),
+            animating: Cell::new(false),
+        }
+    }
+
+    /// True when the last draw showed an animated image (keep redrawing).
+    pub fn wants_animation(&self) -> bool {
+        self.animating.get()
+    }
+
+    /// Decode a media file into GPU textures, caching the result (and the
+    /// failure). Animated GIFs decode every frame up to a pixel budget.
+    fn media_entry<R>(
+        &self,
+        canvas: &mut Canvas<OpenGl>,
+        path: &std::path::Path,
+        f: impl FnOnce(&LoadedImage) -> R,
+    ) -> Option<R> {
+        let mut cache = self.media.borrow_mut();
+        let entry = cache
+            .entry(path.to_path_buf())
+            .or_insert_with(|| Self::load_media(canvas, path));
+        match entry {
+            MediaEntry::Ok(img) => Some(f(img)),
+            MediaEntry::Failed => None,
+        }
+    }
+
+    fn load_media(canvas: &mut Canvas<OpenGl>, path: &std::path::Path) -> MediaEntry {
+        let Ok(bytes) = std::fs::read(path) else {
+            return MediaEntry::Failed;
+        };
+        if bytes.len() as u64 > crate::app::MAX_MEDIA_BYTES {
+            return MediaEntry::Failed;
+        }
+        let format = image::guess_format(&bytes).ok();
+        if format == Some(image::ImageFormat::Gif) {
+            use image::AnimationDecoder;
+            let decoded = image::codecs::gif::GifDecoder::new(std::io::Cursor::new(&bytes[..]))
+                .ok()
+                .map(|dec| {
+                    let mut frames = Vec::new();
+                    let mut delays = Vec::new();
+                    // Cap decoded animation data so a huge GIF can't eat
+                    // the GPU: ~256 MB of RGBA.
+                    let mut budget: i64 = 64_000_000;
+                    for frame in dec.into_frames() {
+                        let Ok(frame) = frame else { break };
+                        let (num, den) = frame.delay().numer_denom_ms();
+                        let delay = (num as f32 / den.max(1) as f32 / 1000.0).max(0.02);
+                        let buf = frame.into_buffer();
+                        budget -= (buf.width() * buf.height()) as i64;
+                        let dynimg = image::DynamicImage::ImageRgba8(buf);
+                        let Ok(src) = femtovg::ImageSource::try_from(&dynimg) else {
+                            break;
+                        };
+                        let Ok(id) = canvas.create_image(src, ImageFlags::empty()) else {
+                            break;
+                        };
+                        frames.push(id);
+                        delays.push(delay);
+                        if budget <= 0 {
+                            break; // show what fits; the loop still plays
+                        }
+                    }
+                    (frames, delays)
+                });
+            if let Some((frames, delays)) = decoded {
+                if !frames.is_empty() {
+                    let total = delays.iter().sum::<f32>().max(0.02);
+                    return MediaEntry::Ok(LoadedImage {
+                        frames,
+                        delays,
+                        total,
+                    });
+                }
+            }
+            // fall through to a static decode of the first frame
+        }
+        let Ok(dynimg) = image::load_from_memory(&bytes) else {
+            return MediaEntry::Failed;
+        };
+        let dynimg = image::DynamicImage::ImageRgba8(dynimg.to_rgba8());
+        let Ok(src) = femtovg::ImageSource::try_from(&dynimg) else {
+            return MediaEntry::Failed;
+        };
+        let Ok(id) = canvas.create_image(src, ImageFlags::empty()) else {
+            return MediaEntry::Failed;
+        };
+        MediaEntry::Ok(LoadedImage {
+            frames: vec![id],
+            delays: vec![f32::INFINITY],
+            total: f32::INFINITY,
+        })
+    }
+
+    /// The frame to show right now.
+    fn current_frame(&self, img: &LoadedImage, seconds: f32) -> femtovg::ImageId {
+        if img.frames.len() <= 1 {
+            return img.frames[0];
+        }
+        self.animating.set(true);
+        let mut t = seconds % img.total;
+        for (k, d) in img.delays.iter().enumerate() {
+            if t < *d {
+                return img.frames[k];
+            }
+            t -= d;
+        }
+        img.frames[0]
     }
 
     pub fn draw(&self, canvas: &mut Canvas<OpenGl>, app: &App, ui: &UiLayout) {
+        self.animating.set(false);
         let [w, h] = app.window_size;
         canvas.clear_rect(0, 0, w as u32, h as u32, theme::canvas_bg());
 
@@ -94,13 +238,16 @@ impl Renderer {
         self.draw_wire_preview(canvas, app);
         self.draw_drag_ghosts(canvas, app);
         self.draw_placement_ghost(canvas, app);
+        self.draw_image_placement_ghost(canvas, app);
         self.draw_band(canvas, app);
+        self.draw_cog(canvas, app);
         canvas.reset_scissor();
 
         self.draw_palette(canvas, app, ui);
         self.draw_topbar(canvas, app, ui);
         self.draw_statusbar(canvas, app);
         self.draw_layout_dialog(canvas, app);
+        self.draw_image_dialog(canvas, app);
         self.draw_prompt(canvas, app);
     }
 
@@ -197,6 +344,7 @@ impl Renderer {
         if ctx.focus {
             self.draw_focus_grid(canvas, app, view, grid_clip);
         }
+        self.draw_images(canvas, app, &ctx);
         self.draw_notes(canvas, app, &ctx);
         self.draw_wires(canvas, app, &ctx);
         self.draw_derived_output_wires(canvas, app, &ctx);
@@ -274,6 +422,271 @@ impl Renderer {
             });
             paint.set_line_width(1.0);
             canvas.stroke_path(&p, &paint);
+        }
+    }
+
+
+    /// Placed pictures: the backdrop layer of a sheet.
+    fn draw_images(&self, canvas: &mut Canvas<OpenGl>, app: &App, ctx: &SheetCtx) {
+        for img in ctx.images {
+            let bounds = diycpu::layout::image_bounds(img);
+            let tl = ctx.view.to_screen([bounds.x, bounds.y]);
+            let (w, h) = (bounds.w * ctx.view.scale, bounds.h * ctx.view.scale);
+            let selected = ctx.focus && app.selection.images.contains(&img.id);
+            self.draw_media_rect(
+                canvas,
+                app,
+                app.resolve_media(&img.file),
+                diycpu::layout::Rect {
+                    x: tl[0],
+                    y: tl[1],
+                    w,
+                    h,
+                },
+                ctx.zoom(),
+                selected,
+                1.0,
+            );
+        }
+    }
+
+    /// One picture at a screen rectangle: the media file if it loads, a
+    /// tidy placeholder if it doesn't. Shared by sheets, ghosts and the
+    /// image dialog.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_media_rect(
+        &self,
+        canvas: &mut Canvas<OpenGl>,
+        app: &App,
+        path: Option<PathBuf>,
+        r: diycpu::layout::Rect,
+        zoom: f32,
+        selected: bool,
+        alpha: f32,
+    ) {
+        let corner = (4.0 * zoom).clamp(1.0, 6.0);
+        let mut body = Path::new();
+        body.rounded_rect(r.x, r.y, r.w, r.h, corner);
+
+        let drawn = path.and_then(|p| {
+            self.media_entry(canvas, &p, |img| {
+                self.current_frame(img, app.anim_seconds)
+            })
+        });
+        match drawn {
+            Some(frame) => {
+                let paint = Paint::image(frame, r.x, r.y, r.w, r.h, 0.0, alpha);
+                canvas.fill_path(&body, &paint);
+            }
+            None => {
+                // Missing or undecodable: keep the object usable.
+                canvas.fill_path(&body, &Paint::color(theme::chip_fill()));
+                let mut cross = Path::new();
+                cross.move_to(r.x, r.y);
+                cross.line_to(r.x + r.w, r.y + r.h);
+                cross.move_to(r.x + r.w, r.y);
+                cross.line_to(r.x, r.y + r.h);
+                let mut cp = Paint::color(theme::panel_border());
+                cp.set_line_width(1.0);
+                canvas.stroke_path(&cross, &cp);
+                let size = (11.0 * zoom).clamp(6.0, 14.0);
+                self.text(
+                    canvas,
+                    r.x + r.w / 2.0,
+                    r.y + r.h / 2.0,
+                    "no image",
+                    size,
+                    theme::text_dim(),
+                    Align::Center,
+                    Baseline::Middle,
+                );
+            }
+        }
+        let mut border = Paint::color(if selected {
+            theme::accent()
+        } else {
+            theme::note_border()
+        });
+        border.set_line_width(if selected { 2.5 } else { 1.2 });
+        canvas.stroke_path(&body, &border);
+    }
+
+    /// The picked file follows the cursor before placement commits.
+    fn draw_image_placement_ghost(&self, canvas: &mut Canvas<OpenGl>, app: &App) {
+        let Gesture::PlacingImage { source, size } = &app.gesture else {
+            return;
+        };
+        if !app.canvas_rect().contains(app.cursor) {
+            return;
+        }
+        let g = app.cursor_grid();
+        let pos = [
+            ((g[0] - size[0] / 2.0) * 2.0).round() / 2.0,
+            ((g[1] - size[1] / 2.0) * 2.0).round() / 2.0,
+        ];
+        let tl = app.camera.grid_to_screen(pos);
+        let cell = app.camera.cell_px();
+        canvas.set_global_alpha(0.55);
+        self.draw_media_rect(
+            canvas,
+            app,
+            Some(source.clone()),
+            diycpu::layout::Rect {
+                x: tl[0],
+                y: tl[1],
+                w: size[0] * cell,
+                h: size[1] * cell,
+            },
+            app.camera.zoom,
+            false,
+            1.0,
+        );
+        canvas.set_global_alpha(1.0);
+    }
+
+    /// The hover gear: settings live here.
+    fn draw_cog(&self, canvas: &mut Canvas<OpenGl>, app: &App) {
+        let Some((r, _)) = app.cog() else {
+            return;
+        };
+        let hovered = r.contains(app.cursor);
+        let cx = r.x + r.w / 2.0;
+        let cy = r.y + r.h / 2.0;
+
+        let mut disc = Path::new();
+        disc.circle(cx, cy, r.w / 2.0);
+        canvas.fill_path(
+            &disc,
+            &Paint::color(if hovered {
+                theme::button_hover_bg()
+            } else {
+                theme::chip_fill()
+            }),
+        );
+        let mut ring = Paint::color(if hovered {
+            theme::accent()
+        } else {
+            theme::button_border()
+        });
+        ring.set_line_width(1.2);
+        canvas.stroke_path(&disc, &ring);
+
+        // The gear: a ring with teeth and a hub.
+        let color = if hovered { theme::accent() } else { theme::text_dim() };
+        let mut gear = Paint::color(color);
+        gear.set_line_width(1.6);
+        let rr = r.w * 0.22;
+        let mut body = Path::new();
+        body.circle(cx, cy, rr);
+        canvas.stroke_path(&body, &gear);
+        let mut teeth = Path::new();
+        for k in 0..6 {
+            let a = k as f32 * std::f32::consts::FRAC_PI_3 + 0.4;
+            teeth.move_to(cx + a.cos() * (rr + 1.0), cy + a.sin() * (rr + 1.0));
+            teeth.line_to(cx + a.cos() * (rr + 3.5), cy + a.sin() * (rr + 3.5));
+        }
+        let mut tp = Paint::color(color);
+        tp.set_line_width(2.0);
+        tp.set_line_cap(femtovg::LineCap::Round);
+        canvas.stroke_path(&teeth, &tp);
+    }
+
+    /// The image settings dialog: preview, file swap, size sliders.
+    fn draw_image_dialog(&self, canvas: &mut Canvas<OpenGl>, app: &App) {
+        let Some(geom) = app.image_dialog_geometry() else {
+            return;
+        };
+        let [w, h] = app.window_size;
+
+        let mut dim = Path::new();
+        dim.rect(0.0, 0.0, w, h);
+        canvas.fill_path(&dim, &Paint::color(femtovg::Color::rgba(30, 33, 40, 70)));
+
+        let p = &geom.panel;
+        let mut panel = Path::new();
+        panel.rounded_rect(p.x, p.y, p.w, p.h, 10.0);
+        canvas.fill_path(&panel, &Paint::color(theme::canvas_bg()));
+        let mut border = Paint::color(theme::button_border());
+        border.set_line_width(1.5);
+        canvas.stroke_path(&panel, &border);
+
+        self.text(
+            canvas,
+            p.x + 16.0,
+            p.y + 24.0,
+            "Image settings",
+            15.0,
+            theme::text(),
+            Align::Left,
+            Baseline::Middle,
+        );
+        self.text(
+            canvas,
+            geom.close_rect.x + geom.close_rect.w / 2.0,
+            geom.close_rect.y + geom.close_rect.h / 2.0,
+            "✕",
+            14.0,
+            if geom.close_rect.contains(app.cursor) {
+                theme::danger()
+            } else {
+                theme::text_dim()
+            },
+            Align::Center,
+            Baseline::Middle,
+        );
+
+        // The picture itself, aspect-fit.
+        let r = &geom.preview;
+        self.draw_media_rect(
+            canvas,
+            app,
+            app.resolve_media(&geom.file_label),
+            diycpu::layout::Rect {
+                x: r.x,
+                y: r.y,
+                w: r.w,
+                h: r.h,
+            },
+            1.0,
+            false,
+            1.0,
+        );
+
+        // Choose-file button with the current file name on it.
+        let c = &geom.choose_rect;
+        let hovered = c.contains(app.cursor);
+        let mut btn = Path::new();
+        btn.rounded_rect(c.x, c.y, c.w, c.h, 6.0);
+        canvas.fill_path(
+            &btn,
+            &Paint::color(if hovered {
+                theme::button_hover_bg()
+            } else {
+                theme::button_bg()
+            }),
+        );
+        let mut bb = Paint::color(theme::button_border());
+        bb.set_line_width(1.2);
+        canvas.stroke_path(&btn, &bb);
+        self.text(
+            canvas,
+            c.x + c.w / 2.0,
+            c.y + c.h / 2.0,
+            &format!("Choose image…   ({})", geom.file_label),
+            12.0,
+            theme::text(),
+            Align::Center,
+            Baseline::Middle,
+        );
+
+        for slider in &geom.sliders {
+            self.draw_slider(
+                canvas,
+                app,
+                slider,
+                crate::app::IMG_SIZE_MIN,
+                crate::app::IMG_SIZE_MAX,
+            );
         }
     }
 
@@ -1222,63 +1635,80 @@ impl Renderer {
         // Size sliders: label, track with a filled knob, and a clickable
         // value that opens a type-in prompt.
         for slider in &geom.sliders {
-            self.text(
+            self.draw_slider(
                 canvas,
-                slider.track.x - 12.0,
-                slider.track.y + slider.track.h / 2.0,
-                slider.label,
-                12.5,
-                theme::text(),
-                Align::Right,
-                Baseline::Middle,
-            );
-
-            let t = &slider.track;
-            let mid_y = t.y + t.h / 2.0;
-            let mut rail = Path::new();
-            rail.rounded_rect(t.x, mid_y - 2.0, t.w, 4.0, 2.0);
-            canvas.fill_path(&rail, &Paint::color(theme::panel_border()));
-
-            let f = ((slider.value - crate::app::DIALOG_SIZE_MIN)
-                / (crate::app::DIALOG_SIZE_MAX - crate::app::DIALOG_SIZE_MIN))
-                .clamp(0.0, 1.0);
-            let mut fill = Path::new();
-            fill.rounded_rect(t.x, mid_y - 2.0, t.w * f, 4.0, 2.0);
-            canvas.fill_path(&fill, &Paint::color(theme::accent()));
-            let mut knob = Path::new();
-            knob.circle(t.x + t.w * f, mid_y, 7.0);
-            canvas.fill_path(&knob, &Paint::color(theme::chip_fill()));
-            let mut ring = Paint::color(theme::accent());
-            ring.set_line_width(2.0);
-            canvas.stroke_path(&knob, &ring);
-
-            // The value doubles as a "type it" button.
-            let v = &slider.value_rect;
-            let hovered = v.contains(app.cursor);
-            let mut vbox = Path::new();
-            vbox.rounded_rect(v.x, v.y, v.w, v.h, 5.0);
-            canvas.fill_path(
-                &vbox,
-                &Paint::color(if hovered {
-                    theme::button_hover_bg()
-                } else {
-                    theme::button_bg()
-                }),
-            );
-            let mut vb = Paint::color(theme::button_border());
-            vb.set_line_width(1.2);
-            canvas.stroke_path(&vbox, &vb);
-            self.text(
-                canvas,
-                v.x + v.w / 2.0,
-                v.y + v.h / 2.0,
-                &format!("{} cells", slider.value),
-                12.0,
-                theme::text(),
-                Align::Center,
-                Baseline::Middle,
+                app,
+                slider,
+                crate::app::DIALOG_SIZE_MIN,
+                crate::app::DIALOG_SIZE_MAX,
             );
         }
+    }
+
+    /// One dialog slider row: label, rail with a knob, and the clickable
+    /// value that opens a type-in prompt.
+    fn draw_slider(
+        &self,
+        canvas: &mut Canvas<OpenGl>,
+        app: &App,
+        slider: &crate::app::DialogSlider,
+        min: f32,
+        max: f32,
+    ) {
+        self.text(
+            canvas,
+            slider.track.x - 12.0,
+            slider.track.y + slider.track.h / 2.0,
+            slider.label,
+            12.5,
+            theme::text(),
+            Align::Right,
+            Baseline::Middle,
+        );
+
+        let t = &slider.track;
+        let mid_y = t.y + t.h / 2.0;
+        let mut rail = Path::new();
+        rail.rounded_rect(t.x, mid_y - 2.0, t.w, 4.0, 2.0);
+        canvas.fill_path(&rail, &Paint::color(theme::panel_border()));
+
+        let f = ((slider.value - min) / (max - min)).clamp(0.0, 1.0);
+        let mut fill = Path::new();
+        fill.rounded_rect(t.x, mid_y - 2.0, t.w * f, 4.0, 2.0);
+        canvas.fill_path(&fill, &Paint::color(theme::accent()));
+        let mut knob = Path::new();
+        knob.circle(t.x + t.w * f, mid_y, 7.0);
+        canvas.fill_path(&knob, &Paint::color(theme::chip_fill()));
+        let mut ring = Paint::color(theme::accent());
+        ring.set_line_width(2.0);
+        canvas.stroke_path(&knob, &ring);
+
+        // The value doubles as a "type it" button.
+        let v = &slider.value_rect;
+        let hovered = v.contains(app.cursor);
+        let mut vbox = Path::new();
+        vbox.rounded_rect(v.x, v.y, v.w, v.h, 5.0);
+        canvas.fill_path(
+            &vbox,
+            &Paint::color(if hovered {
+                theme::button_hover_bg()
+            } else {
+                theme::button_bg()
+            }),
+        );
+        let mut vb = Paint::color(theme::button_border());
+        vb.set_line_width(1.2);
+        canvas.stroke_path(&vbox, &vb);
+        self.text(
+            canvas,
+            v.x + v.w / 2.0,
+            v.y + v.h / 2.0,
+            &format!("{} cells", slider.value),
+            12.0,
+            theme::text(),
+            Align::Center,
+            Baseline::Middle,
+        );
     }
 
     fn draw_prompt(&self, canvas: &mut Canvas<OpenGl>, app: &App) {
@@ -1549,6 +1979,21 @@ impl Renderer {
                     line.line_to(glyph_x + 14.5, glyph_y + dy);
                     canvas.stroke_path(&line, &cp);
                 }
+            } else if item.type_name == "image" {
+                // A tiny landscape: frame, sun, mountains.
+                let mut frame = Path::new();
+                frame.rounded_rect(glyph_x, glyph_y - 7.0, 18.0, 14.0, 2.0);
+                canvas.stroke_path(&frame, &cp);
+                let mut sun = Path::new();
+                sun.circle(glyph_x + 6.0, glyph_y - 2.5, 1.8);
+                canvas.stroke_path(&sun, &cp);
+                let mut hills = Path::new();
+                hills.move_to(glyph_x + 1.5, glyph_y + 6.0);
+                hills.line_to(glyph_x + 7.0, glyph_y + 0.5);
+                hills.line_to(glyph_x + 10.5, glyph_y + 4.0);
+                hills.line_to(glyph_x + 13.0, glyph_y + 1.5);
+                hills.line_to(glyph_x + 16.5, glyph_y + 6.0);
+                canvas.stroke_path(&hills, &cp);
             } else {
                 let mut chip = Path::new();
                 chip.rounded_rect(glyph_x, glyph_y - 7.0, 18.0, 14.0, 2.5);
@@ -1776,7 +2221,7 @@ impl Renderer {
         baseline: Baseline,
     ) {
         let mut paint = Paint::color(color);
-        paint.set_font(&[self.font]);
+        paint.set_font(&self.fonts);
         // Quantize size and snap the anchor to whole pixels: glyphs land on
         // the pixel grid instead of being smeared across it.
         paint.set_font_size((size * 2.0).round() / 2.0);

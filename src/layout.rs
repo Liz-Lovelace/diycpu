@@ -532,6 +532,9 @@ pub fn abstraction_inner_bounds(
     for note in &def.notes {
         extend(note_bounds(note));
     }
+    for img in &def.images {
+        extend(image_bounds(img));
+    }
     for pin in interface_pins(abstractions, def) {
         extend(pin.plate);
         extend(Rect {
@@ -645,6 +648,18 @@ pub fn note_bounds(note: &crate::project::Note) -> Rect {
     }
 }
 
+// ── Images ───────────────────────────────────────────────────────────────────
+
+/// The rectangle of a placed picture, in grid units.
+pub fn image_bounds(img: &crate::project::MediaImage) -> Rect {
+    Rect {
+        x: img.pos[0],
+        y: img.pos[1],
+        w: img.size[0].max(0.5),
+        h: img.size[1].max(0.5),
+    }
+}
+
 // ── Endpoint resolution and hit-testing ──────────────────────────────────────
 
 use crate::project::Endpoint;
@@ -727,6 +742,9 @@ pub enum Hit {
     Note {
         note_id: String,
     },
+    Image {
+        image_id: String,
+    },
     Empty,
 }
 
@@ -735,6 +753,7 @@ pub fn hit_test(
     components: &[ProjectComponent],
     wire_nets: &[WireNet],
     notes: &[crate::project::Note],
+    images: &[crate::project::MediaImage],
     interface: Option<&ProjectAbstraction>,
     p: [f32; 2],
 ) -> Hit {
@@ -838,6 +857,15 @@ pub fn hit_test(
         }
     }
 
+    // Pictures are the backdrop — behind even the notes.
+    for img in images.iter().rev() {
+        if image_bounds(img).contains(p) {
+            return Hit::Image {
+                image_id: img.id.clone(),
+            };
+        }
+    }
+
     Hit::Empty
 }
 
@@ -891,6 +919,7 @@ mod tests {
             components: vec![comp("gate", "nand", 0.0, 0.0)],
             wire_nets: vec![],
         notes: vec![],
+            images: vec![],
         }
     }
 
@@ -986,13 +1015,13 @@ mod tests {
     fn hit_priority_port_over_body() {
         let comps = vec![comp("n1", "nand", 0.0, 0.0)];
         // Exactly on the "a" port.
-        let hit = hit_test(&[], &comps, &[], &[], None, [0.0, 0.5]);
+        let hit = hit_test(&[], &comps, &[], &[], &[], None, [0.0, 0.5]);
         assert!(matches!(hit, Hit::Port { ref port_name, .. } if port_name == "a"));
         // Center of the body.
-        let hit = hit_test(&[], &comps, &[], &[], None, [1.5, 1.0]);
+        let hit = hit_test(&[], &comps, &[], &[], &[], None, [1.5, 1.0]);
         assert!(matches!(hit, Hit::Component { ref component_id } if component_id == "n1"));
         // Far away.
-        assert_eq!(hit_test(&[], &comps, &[], &[], None, [20.0, 20.0]), Hit::Empty);
+        assert_eq!(hit_test(&[], &comps, &[], &[], &[], None, [20.0, 20.0]), Hit::Empty);
     }
 
     #[test]
@@ -1028,7 +1057,7 @@ mod tests {
             (pts[0][0] + pts[1][0]) / 2.0,
             (pts[0][1] + pts[1][1]) / 2.0,
         ];
-        let hit = hit_test(&[], &comps, std::slice::from_ref(&net), &[], None, mid);
+        let hit = hit_test(&[], &comps, std::slice::from_ref(&net), &[], &[], None, mid);
         assert!(matches!(hit, Hit::Wire { ref net_id, .. } if net_id == "w1"));
     }
 

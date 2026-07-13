@@ -78,7 +78,8 @@ pub fn ui_layout(app: &App) -> UiLayout {
         _ => None,
     };
 
-    let is_builtin = |name: &str| matches!(name, "clk" | "nand" | "dff" | "const" | "note");
+    let is_builtin =
+        |name: &str| matches!(name, "clk" | "nand" | "dff" | "const" | "note" | "image");
     for item in app.palette_items() {
         let is_abstraction_start = !is_builtin(&item)
             && !palette_items
@@ -203,7 +204,7 @@ pub fn ui_layout(app: &App) -> UiLayout {
     // Right-aligned buttons.
     let mut rx = app.window_size[0] - 12.0;
     for (id, label, hotkey, w) in [
-        (ButtonId::Save, "Save as", Some("Ctrl+S"), 116.0),
+        (ButtonId::Save, "Save copy", Some("Ctrl+Shift+S"), 148.0),
         (ButtonId::Open, "Open", Some("Ctrl+O"), 100.0),
         (ButtonId::Fit, "Fit view", Some("F"), 98.0),
     ] {

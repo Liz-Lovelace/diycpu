@@ -18,6 +18,9 @@ pub struct Project {
     /// Free-floating text annotations. Purely visual; the engine ignores them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<Note>,
+    /// Pictures placed on the canvas. Purely visual; the engine ignores them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<MediaImage>,
 }
 
 /// A text annotation placed on the canvas.
@@ -27,6 +30,23 @@ pub struct Note {
     pub text: String,
     #[serde(default)]
     pub pos: [f32; 2],
+}
+
+/// A picture placed on the canvas. `file` is a path relative to the
+/// project's directory (media files live in its `media/` folder).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MediaImage {
+    pub id: String,
+    pub file: String,
+    #[serde(default)]
+    pub pos: [f32; 2],
+    /// Displayed size in grid units.
+    #[serde(default = "default_image_size")]
+    pub size: [f32; 2],
+}
+
+fn default_image_size() -> [f32; 2] {
+    [6.0, 4.0]
 }
 
 /// A component as stored in a project file.
@@ -61,6 +81,9 @@ pub struct ProjectAbstraction {
     /// Annotations on this abstraction's sheet.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<Note>,
+    /// Pictures on this abstraction's sheet.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<MediaImage>,
     /// Where each interface pin sits inside this abstraction's sheet, in
     /// grid units. Pins without an entry get an automatic rail position.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
@@ -160,6 +183,7 @@ mod tests {
     fn round_trip_empty_project() {
         let project = Project {
             notes: vec![],
+            images: vec![],
             name: "test".into(),
             steps: 8,
             abstractions: vec![],
@@ -177,6 +201,7 @@ mod tests {
     fn round_trip_component() {
         let project = Project {
             notes: vec![],
+            images: vec![],
             name: "test".into(),
             steps: 1,
             abstractions: vec![],
@@ -251,12 +276,14 @@ mod tests {
     fn round_trip_abstraction() {
         let project = Project {
             notes: vec![],
+            images: vec![],
             name: "test".into(),
             steps: 0,
             abstractions: vec![ProjectAbstraction {
                 pin_positions: HashMap::new(),
                 port_layout: HashMap::new(),
                 notes: vec![],
+            images: vec![],
                 name: "not".into(),
                 inputs: vec!["x".into()],
                 outputs: {
@@ -318,6 +345,40 @@ mod tests {
         assert!(project.wire_nets.is_empty());
         assert_eq!(project.components[0].pos, [0.0, 0.0]);
         assert_eq!(project.components[0].init, None);
+    }
+
+    #[test]
+    fn round_trip_images() {
+        let json = r#"{
+            "name": "pics",
+            "steps": 4,
+            "components": [],
+            "images": [
+                {"id": "img_1", "file": "media/cat.gif", "pos": [2.0, 3.0], "size": [8.0, 5.0]},
+                {"id": "img_2", "file": "media/logo.png"}
+            ]
+        }"#;
+        let project: Project = serde_json::from_str(json).unwrap();
+        assert_eq!(project.images.len(), 2);
+        assert_eq!(project.images[0].file, "media/cat.gif");
+        assert_eq!(project.images[1].size, [6.0, 4.0]); // default size
+        let back = serde_json::to_string(&project).unwrap();
+        let again: Project = serde_json::from_str(&back).unwrap();
+        assert_eq!(again.images, project.images);
+    }
+
+    #[test]
+    fn empty_images_are_not_serialized() {
+        let project = Project {
+            notes: vec![],
+            images: vec![],
+            name: "t".into(),
+            steps: 1,
+            abstractions: vec![],
+            components: vec![],
+            wire_nets: vec![],
+        };
+        assert!(!serde_json::to_string(&project).unwrap().contains("images"));
     }
 
     #[test]

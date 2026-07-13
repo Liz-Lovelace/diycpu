@@ -4,7 +4,7 @@
 //! once, so cancelling a gesture (Esc, right-click, focus loss) is always
 //! just dropping it.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use diycpu::editor::{EditError, Editor, Fragment, SheetRef, WirePoint};
 use diycpu::layout::{self, Hit, PortKind, Rect};
@@ -65,9 +65,21 @@ pub enum Gesture {
         press_screen: [f32; 2],
         ctrl: bool,
     },
+    PressedImage {
+        id: String,
+        press_screen: [f32; 2],
+        ctrl: bool,
+    },
+    /// A picked image file follows the cursor; a click places it (the file
+    /// is only copied into the project on commit).
+    PlacingImage {
+        source: PathBuf,
+        size: [f32; 2],
+    },
     DraggingComponents {
         ids: Vec<String>,
         note_ids: Vec<String>,
+        image_ids: Vec<String>,
         press_grid: [f32; 2],
         delta: [i32; 2],
         /// Ctrl-drag: the originals stay put and copies land at the delta.
@@ -120,6 +132,7 @@ pub enum Gesture {
 pub struct Selection {
     pub components: Vec<String>,
     pub notes: Vec<String>,
+    pub images: Vec<String>,
     /// Individual wire segments, by (net id, segment index).
     pub segments: Vec<(String, usize)>,
     /// Derived output-pin wires, by pin name.
@@ -132,6 +145,7 @@ impl Selection {
     pub fn clear(&mut self) {
         self.components.clear();
         self.notes.clear();
+        self.images.clear();
         self.segments.clear();
         self.pin_wires.clear();
         self.pin = None;
@@ -139,6 +153,7 @@ impl Selection {
     pub fn is_empty(&self) -> bool {
         self.components.is_empty()
             && self.notes.is_empty()
+            && self.images.is_empty()
             && self.segments.is_empty()
             && self.pin_wires.is_empty()
             && self.pin.is_none()
@@ -158,6 +173,12 @@ pub enum PromptAction {
     RenameProject,
     /// Type a size for the layout dialog (which: 0 = width, 1 = height).
     SetAbstractionDim { index: usize, which: usize },
+    /// Type a size for the image dialog (which: 0 = width, 1 = height).
+    SetImageDim { id: String, which: usize },
+    /// Name for a fresh project directory in the projects folder.
+    NewProject,
+    /// Name for a copy of the current project in the projects folder.
+    SaveCopyAs,
 }
 
 pub struct Prompt {
@@ -225,11 +246,14 @@ pub struct App {
     pub hover: Hit,
     pub prompt: Option<Prompt>,
     pub layout_dialog: Option<LayoutDialog>,
+    pub image_dialog: Option<ImageDialog>,
     pub clipboard: Option<Fragment>,
     /// Run mode advances the clock on a timer.
     pub playing: bool,
     /// Scroll offset of the palette, for projects with many abstractions.
     pub palette_scroll: f32,
+    /// Wall-clock seconds since launch; drives animated images.
+    pub anim_seconds: f32,
     /// Set when an action would discard unsaved changes; repeating the
     /// action confirms it. Any other click clears it.
     pending_discard: Option<DiscardIntent>,
@@ -246,10 +270,14 @@ impl App {
             Some(path) => match load_project(path) {
                 Ok((project, notes)) => {
                     status_text = if notes.is_empty() {
-                        format!("Opened {}", path.display())
+                        format!("Opened \"{}\"", project.name)
                     } else {
                         is_error = true;
-                        format!("Opened {} — repaired: {}", path.display(), notes.join("; "))
+                        format!(
+                            "Opened \"{}\" — repaired: {}",
+                            project.name,
+                            notes.join("; ")
+                        )
                     };
                     Editor::new(project)
                 }
@@ -282,9 +310,11 @@ impl App {
             hover: Hit::Empty,
             prompt: None,
             layout_dialog: None,
+            image_dialog: None,
             clipboard: None,
             playing: false,
             palette_scroll: 0.0,
+            anim_seconds: 0.0,
             pending_discard: None,
             pending_fit: true,
         }
@@ -519,16 +549,17 @@ impl App {
             Gesture::DraggingComponents {
                 ids,
                 note_ids,
+                image_ids,
                 delta,
                 copying,
                 ..
             } if *delta != [0, 0] => {
                 let mut p = self.editor.project.clone();
-                let (components, notes) = match sheet {
-                    SheetRef::Top => (&mut p.components, &mut p.notes),
+                let (components, notes, images) = match sheet {
+                    SheetRef::Top => (&mut p.components, &mut p.notes, &mut p.images),
                     SheetRef::Abstraction(i) => {
                         let a = &mut p.abstractions[i];
-                        (&mut a.components, &mut a.notes)
+                        (&mut a.components, &mut a.notes, &mut a.images)
                     }
                 };
                 if *copying {
@@ -557,6 +588,18 @@ impl App {
                         })
                         .collect();
                     notes.extend(note_phantoms);
+                    let image_phantoms: Vec<_> = images
+                        .iter()
+                        .filter(|i| image_ids.contains(&i.id))
+                        .map(|i| {
+                            let mut ghost = i.clone();
+                            ghost.id = format!("__copy_{}", ghost.id);
+                            ghost.pos[0] += delta[0] as f32;
+                            ghost.pos[1] += delta[1] as f32;
+                            ghost
+                        })
+                        .collect();
+                    images.extend(image_phantoms);
                 } else {
                     for c in components.iter_mut().filter(|c| ids.contains(&c.id)) {
                         c.pos[0] += delta[0] as f32;
@@ -565,6 +608,10 @@ impl App {
                     for n in notes.iter_mut().filter(|n| note_ids.contains(&n.id)) {
                         n.pos[0] += delta[0] as f32;
                         n.pos[1] += delta[1] as f32;
+                    }
+                    for i in images.iter_mut().filter(|i| image_ids.contains(&i.id)) {
+                        i.pos[0] += delta[0] as f32;
+                        i.pos[1] += delta[1] as f32;
                     }
                 }
                 Cow::Owned(p)
@@ -634,6 +681,11 @@ impl App {
         matches!(self.mode, Mode::Run(_))
     }
 
+    /// Any modal layer open? Prompts and dialogs freeze the canvas.
+    pub fn any_modal(&self) -> bool {
+        self.prompt.is_some() || self.layout_dialog.is_some() || self.image_dialog.is_some()
+    }
+
     pub fn canvas_rect(&self) -> Rect {
         Rect {
             x: theme::PALETTE_WIDTH,
@@ -657,6 +709,8 @@ impl App {
                 wire_nets,
                 diycpu::editor::sheet_notes(&self.editor.project, self.editor.sheet)
                     .unwrap_or(&[]),
+                diycpu::editor::sheet_images(&self.editor.project, self.editor.sheet)
+                    .unwrap_or(&[]),
                 self.interface(),
                 g,
             )
@@ -673,6 +727,7 @@ impl App {
             "dff".to_string(),
             "const".to_string(),
             "note".to_string(),
+            "image".to_string(),
         ];
         items.extend(self.editor.project.abstractions.iter().map(|a| a.name.clone()));
         items
@@ -851,22 +906,65 @@ impl App {
         }
     }
 
+    /// "Save as" forks the project: a new directory in the projects folder
+    /// under a typed name, media files included.
     pub fn save_as(&mut self) {
-        let default_name: String = self
-            .editor
-            .project
-            .name
-            .chars()
-            .map(|c| if c == '/' || c == '\\' { '-' } else { c })
-            .collect();
-        let picked = rfd::FileDialog::new()
-            .add_filter("circuit", &["json"])
-            .set_file_name(format!("{default_name}.json"))
-            .save_file();
-        match picked {
-            Some(path) => self.write_to(path),
-            None => self.info("Save cancelled"),
+        if projects_base_dir().is_none() {
+            // No home folder to keep projects in — fall back to a raw
+            // file dialog.
+            let picked = rfd::FileDialog::new()
+                .add_filter("circuit", &["json"])
+                .set_file_name(format!("{}.json", sanitize_name(&self.editor.project.name)))
+                .save_file();
+            match picked {
+                Some(path) => self.write_to(path),
+                None => self.info("Save cancelled"),
+            }
+            return;
         }
+        self.gesture = Gesture::Idle;
+        self.prompt = Some(Prompt {
+            title: "Save a copy as (project name)".into(),
+            value: sanitize_name(&self.editor.project.name),
+            action: PromptAction::SaveCopyAs,
+            identifier: true,
+        });
+    }
+
+    /// Create `<projects>/<name>/`, copy every referenced media file into
+    /// it, and write the project there. Returns the new project.json path.
+    fn save_copy_into(&mut self, name: &str) -> Result<PathBuf, String> {
+        let base = projects_base_dir().ok_or("No home folder found")?;
+        std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
+        let dir = create_project_dir(&base, name)?;
+        if let Some(old_dir) = self.project_dir() {
+            let mut files: Vec<String> = self
+                .editor
+                .project
+                .images
+                .iter()
+                .map(|i| i.file.clone())
+                .collect();
+            for a in &self.editor.project.abstractions {
+                files.extend(a.images.iter().map(|i| i.file.clone()));
+            }
+            files.sort();
+            files.dedup();
+            for rel in files {
+                let src = old_dir.join(&rel);
+                let dst = dir.join(&rel);
+                if src.exists() {
+                    if let Some(parent) = dst.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let _ = std::fs::copy(&src, &dst);
+                }
+            }
+        }
+        let _ = self.editor.rename_project(name);
+        let path = dir.join("project.json");
+        self.persist(&path)?;
+        Ok(path)
     }
 
     /// Write-through persistence: every committed change lands on disk as
@@ -913,18 +1011,35 @@ impl App {
     }
 
     fn new_project(&mut self) {
-        if !self.confirm_discard(DiscardIntent::New, "press Ctrl+N") {
+        if projects_base_dir().is_none() {
+            // No projects folder available: the old in-memory new.
+            if !self.confirm_discard(DiscardIntent::New, "press Ctrl+N") {
+                return;
+            }
+            self.editor = Editor::empty();
+            self.file_path = None;
+            self.reset_to_fresh_view();
+            self.info("New circuit");
             return;
         }
-        self.editor = Editor::empty();
-        self.file_path = None;
+        // The current project is autosaved; a new one just needs a name.
+        self.gesture = Gesture::Idle;
+        self.prompt = Some(Prompt {
+            title: "New project name".into(),
+            value: String::new(),
+            action: PromptAction::NewProject,
+            identifier: true,
+        });
+    }
+
+    fn reset_to_fresh_view(&mut self) {
         self.view_root = SheetRef::Top;
         self.path.clear();
         self.selection.clear();
         self.gesture = Gesture::Idle;
         self.mode = Mode::Edit;
+        self.playing = false;
         self.pending_fit = true;
-        self.info("New circuit");
     }
 
     /// The window wants to close. True = allow it. A dirty never-saved
@@ -941,30 +1056,43 @@ impl App {
         if !self.confirm_discard(DiscardIntent::Open, "choose Open") {
             return;
         }
-        let picked = rfd::FileDialog::new()
-            .add_filter("circuit", &["json"])
-            .pick_file();
-        let Some(path) = picked else {
+        // Projects are folders; picking one opens its project.json.
+        // (A bare .json can still be opened from the command line.)
+        let mut dialog = rfd::FileDialog::new();
+        if let Some(base) = projects_base_dir() {
+            dialog = dialog.set_directory(&base);
+        }
+        let Some(dir) = dialog.pick_folder() else {
             self.info("Open cancelled");
             return;
         };
+        let path = if dir.join("project.json").exists() {
+            dir.join("project.json")
+        } else if dir.extension().is_some_and(|e| e == "json") {
+            dir
+        } else {
+            self.error(format!(
+                "{} has no project.json — pick a project folder",
+                dir.display()
+            ));
+            return;
+        };
+        self.open_path(path);
+    }
+
+    /// Load a project file and point the session at it.
+    fn open_path(&mut self, path: PathBuf) {
         match load_project(&path) {
             Ok((project, notes)) => {
                 self.editor = Editor::new(project);
                 self.file_path = Some(path.clone());
-                self.view_root = SheetRef::Top;
-                self.path.clear();
-                self.selection.clear();
-                self.gesture = Gesture::Idle;
-                self.mode = Mode::Edit;
-                self.playing = false;
-                self.pending_fit = true;
+                self.reset_to_fresh_view();
                 if notes.is_empty() {
-                    self.info(format!("Opened {}", path.display()));
+                    self.info(format!("Opened \"{}\"", self.editor.project.name));
                 } else {
                     self.error(format!(
-                        "Opened {} — repaired: {}",
-                        path.display(),
+                        "Opened \"{}\" — repaired: {}",
+                        self.editor.project.name,
                         notes.join("; ")
                     ));
                 }
@@ -1012,6 +1140,10 @@ impl App {
         let abstractions = &self.editor.project.abstractions;
         let (components, _) = self.editor.sheet_data();
         let mut bounds = layout::components_bounds(abstractions, components);
+        for img in self.editor.sheet_images() {
+            let r = layout::image_bounds(img);
+            bounds = Some(bounds.map_or(r, |b| b.union(&r)));
+        }
         // Interface pins float beside the content — include them.
         if let Some(def) = self.interface() {
             for pin in layout::interface_pins(abstractions, def) {
@@ -1037,7 +1169,7 @@ impl App {
     pub fn mouse_moved(&mut self, pos: [f32; 2]) {
         self.cursor = pos;
         // Modal layers freeze the canvas beneath them.
-        if self.prompt.is_some() || self.layout_dialog.is_some() {
+        if self.any_modal() {
             return;
         }
 
@@ -1058,21 +1190,24 @@ impl App {
                     // Promote to drag: the pressed component leads; if it's
                     // part of the selection the whole selection comes along.
                     let copying = *ctrl;
-                    let (ids, note_ids) = if self.selection.components.contains(id) {
-                        (
-                            self.selection.components.clone(),
-                            self.selection.notes.clone(),
-                        )
-                    } else {
-                        let ids = vec![id.clone()];
-                        self.selection.clear();
-                        self.selection.components = ids.clone();
-                        (ids, vec![])
-                    };
+                    let (ids, note_ids, image_ids) =
+                        if self.selection.components.contains(id) {
+                            (
+                                self.selection.components.clone(),
+                                self.selection.notes.clone(),
+                                self.selection.images.clone(),
+                            )
+                        } else {
+                            let ids = vec![id.clone()];
+                            self.selection.clear();
+                            self.selection.components = ids.clone();
+                            (ids, vec![], vec![])
+                        };
                     let press_grid = self.camera.screen_to_grid(*press_screen);
                     self.gesture = Gesture::DraggingComponents {
                         ids,
                         note_ids,
+                        image_ids,
                         press_grid,
                         delta: [0, 0],
                         copying,
@@ -1086,21 +1221,53 @@ impl App {
             } => {
                 if dist(pos, *press_screen) > DRAG_THRESHOLD_PX {
                     let copying = *ctrl;
-                    let (ids, note_ids) = if self.selection.notes.contains(id) {
+                    let (ids, note_ids, image_ids) = if self.selection.notes.contains(id) {
                         (
                             self.selection.components.clone(),
                             self.selection.notes.clone(),
+                            self.selection.images.clone(),
                         )
                     } else {
                         let note_ids = vec![id.clone()];
                         self.selection.clear();
                         self.selection.notes = note_ids.clone();
-                        (vec![], note_ids)
+                        (vec![], note_ids, vec![])
                     };
                     let press_grid = self.camera.screen_to_grid(*press_screen);
                     self.gesture = Gesture::DraggingComponents {
                         ids,
                         note_ids,
+                        image_ids,
+                        press_grid,
+                        delta: [0, 0],
+                        copying,
+                    };
+                }
+            }
+            Gesture::PressedImage {
+                id,
+                press_screen,
+                ctrl,
+            } => {
+                if dist(pos, *press_screen) > DRAG_THRESHOLD_PX {
+                    let copying = *ctrl;
+                    let (ids, note_ids, image_ids) = if self.selection.images.contains(id) {
+                        (
+                            self.selection.components.clone(),
+                            self.selection.notes.clone(),
+                            self.selection.images.clone(),
+                        )
+                    } else {
+                        let image_ids = vec![id.clone()];
+                        self.selection.clear();
+                        self.selection.images = image_ids.clone();
+                        (vec![], vec![], image_ids)
+                    };
+                    let press_grid = self.camera.screen_to_grid(*press_screen);
+                    self.gesture = Gesture::DraggingComponents {
+                        ids,
+                        note_ids,
+                        image_ids,
                         press_grid,
                         delta: [0, 0],
                         copying,
@@ -1192,6 +1359,9 @@ impl App {
             self.dismiss_prompt();
             return;
         }
+        if self.image_dialog.is_some() {
+            return; // the shell routes these to img_dialog_pressed
+        }
 
         // UI chrome clicks are resolved by the shell (main.rs) before this
         // is called; here we only handle the canvas.
@@ -1227,6 +1397,29 @@ impl App {
                 }
                 return;
             }
+            Gesture::PlacingImage { source, size } => {
+                let (source, size) = (source.clone(), *size);
+                let g = self.cursor_grid();
+                let pos = [
+                    ((g[0] - size[0] / 2.0) * 2.0).round() / 2.0,
+                    ((g[1] - size[1] / 2.0) * 2.0).round() / 2.0,
+                ];
+                // The file is copied into the project only now, on commit —
+                // cancelling a placement never leaves stray media behind.
+                match self.import_media(&source) {
+                    Ok(rel) => match self.editor.place_image(pos, &rel, size) {
+                        Ok(id) => {
+                            self.selection.clear();
+                            self.selection.images = vec![id];
+                            self.info("Image placed — hover it and click the cog to adjust");
+                        }
+                        Err(e) => self.error(e.to_string()),
+                    },
+                    Err(e) => self.error(e),
+                }
+                self.gesture = Gesture::Idle;
+                return;
+            }
             Gesture::DrawingWire { .. } => {
                 self.wire_click();
                 return;
@@ -1248,9 +1441,21 @@ impl App {
                     self.selection.clear();
                     self.selection.segments = vec![(net_id, segment_index)];
                 }
+                Hit::Image { image_id } => {
+                    self.selection.clear();
+                    self.selection.images = vec![image_id];
+                }
                 _ => self.selection.clear(),
             }
             return;
+        }
+
+        // The hover cogwheel wins over whatever is underneath it.
+        if let Some((rect, action)) = self.cog() {
+            if rect.contains(self.cursor) {
+                self.perform_cog(action);
+                return;
+            }
         }
 
         match self.hover.clone() {
@@ -1299,6 +1504,17 @@ impl App {
                 }
                 self.gesture = Gesture::PressedNote {
                     id: note_id,
+                    press_screen: self.cursor,
+                    ctrl: self.ctrl,
+                };
+            }
+            Hit::Image { image_id } => {
+                if !self.ctrl && !self.selection.images.contains(&image_id) {
+                    self.selection.clear();
+                    self.selection.images = vec![image_id.clone()];
+                }
+                self.gesture = Gesture::PressedImage {
+                    id: image_id,
                     press_screen: self.cursor,
                     ctrl: self.ctrl,
                 };
@@ -1409,7 +1625,7 @@ impl App {
         match std::mem::replace(&mut self.gesture, Gesture::Idle) {
             Gesture::Idle => {}
             Gesture::Panning { .. } => {}
-            gesture @ Gesture::Placing { .. } => {
+            gesture @ (Gesture::Placing { .. } | Gesture::PlacingImage { .. }) => {
                 // Placement acts on press; the gesture persists (Shift kept
                 // it alive or the press failed and the user gets to retry).
                 self.gesture = gesture;
@@ -1442,28 +1658,43 @@ impl App {
                     self.selection.notes = vec![id];
                 }
             }
+            Gesture::PressedImage { id, ctrl, .. } => {
+                if ctrl {
+                    if let Some(i) = self.selection.images.iter().position(|n| n == &id) {
+                        self.selection.images.remove(i);
+                    } else {
+                        self.selection.images.push(id);
+                    }
+                    self.selection.pin = None;
+                } else {
+                    self.selection.clear();
+                    self.selection.images = vec![id];
+                }
+            }
             Gesture::DraggingComponents {
                 ids,
                 note_ids,
+                image_ids,
                 delta,
                 copying,
                 ..
             } => {
                 if copying {
                     if delta != [0, 0] {
-                        let fragment = self.editor.fragment(&ids, &note_ids);
+                        let fragment = self.editor.fragment(&ids, &note_ids, &image_ids);
                         match self.editor.paste_fragment(&fragment, delta, false) {
-                            Ok((new_ids, new_notes)) => {
+                            Ok((new_ids, new_notes, new_images)) => {
                                 self.selection.clear();
                                 self.selection.components = new_ids;
                                 self.selection.notes = new_notes;
+                                self.selection.images = new_images;
                                 self.info("Copied");
                             }
                             Err(e) => self.error(e.to_string()),
                         }
                     }
                 } else {
-                    match self.editor.move_items(&ids, &note_ids, delta) {
+                    match self.editor.move_items(&ids, &note_ids, &image_ids, delta) {
                         Ok(()) => {}
                         Err(e) => self.error(e.to_string()),
                     }
@@ -1488,6 +1719,13 @@ impl App {
                     .iter()
                     .filter(|n| layout::note_bounds(n).intersects(&band))
                     .map(|n| n.id.clone())
+                    .collect();
+                let images: Vec<String> = self
+                    .editor
+                    .sheet_images()
+                    .iter()
+                    .filter(|i| layout::image_bounds(i).intersects(&band))
+                    .map(|i| i.id.clone())
                     .collect();
                 // Wire segments come along when both their endpoints are in
                 // the band — wires select like anything else.
@@ -1514,6 +1752,7 @@ impl App {
                 self.selection.clear();
                 self.selection.components = components;
                 self.selection.notes = notes;
+                self.selection.images = images;
                 self.selection.segments = segments;
             }
             gesture @ Gesture::DrawingWire { .. } => {
@@ -1586,7 +1825,7 @@ impl App {
     }
 
     pub fn middle_or_right_pressed(&mut self) {
-        if self.prompt.is_some() || self.layout_dialog.is_some() {
+        if self.any_modal() {
             return;
         }
         // An active constructive gesture? Right/middle click ends it.
@@ -1614,7 +1853,7 @@ impl App {
     }
 
     pub fn scrolled(&mut self, amount: f32) {
-        if self.prompt.is_some() || self.layout_dialog.is_some() {
+        if self.any_modal() {
             return;
         }
         // Over the palette, the wheel scrolls the palette itself.
@@ -1652,6 +1891,10 @@ impl App {
                 action: PromptAction::EditNote { id: note_id },
                 identifier: false,
             });
+            return;
+        }
+        if let Hit::Image { image_id } = self.hover.clone() {
+            self.action_open_image_dialog(&image_id);
             return;
         }
         if let Hit::Pin { name, kind } = self.hover.clone() {
@@ -1728,6 +1971,15 @@ impl App {
 
     pub fn palette_clicked(&mut self, type_name: &str) {
         if !self.require_edit_mode() {
+            return;
+        }
+        if type_name == "image" {
+            // Armed via the file picker instead of a ghost type.
+            if matches!(self.gesture, Gesture::PlacingImage { .. }) {
+                self.gesture = Gesture::Idle;
+                return;
+            }
+            self.action_place_image();
             return;
         }
         // Re-arming with the same item disarms it (toggle feel).
@@ -1854,12 +2106,14 @@ impl App {
         } else if !self.selection.is_empty() {
             let ids = self.selection.components.clone();
             let note_ids = self.selection.notes.clone();
+            let image_ids = self.selection.images.clone();
             let segments = self.selection.segments.clone();
             let pin_wires = self.selection.pin_wires.clone();
-            let n = ids.len() + note_ids.len() + segments.len() + pin_wires.len();
+            let n =
+                ids.len() + note_ids.len() + image_ids.len() + segments.len() + pin_wires.len();
             match self
                 .editor
-                .delete_mixed(&ids, &note_ids, &segments, &pin_wires)
+                .delete_mixed(&ids, &note_ids, &image_ids, &segments, &pin_wires)
             {
                 Ok(()) => {
                     self.selection.clear();
@@ -1911,14 +2165,16 @@ impl App {
     }
 
     pub fn copy_selection(&mut self) {
-        let fragment = self
-            .editor
-            .fragment(&self.selection.components, &self.selection.notes);
+        let fragment = self.editor.fragment(
+            &self.selection.components,
+            &self.selection.notes,
+            &self.selection.images,
+        );
         if fragment.is_empty() {
             self.info("Nothing selected to copy");
             return;
         }
-        let n = fragment.components.len() + fragment.notes.len();
+        let n = fragment.components.len() + fragment.notes.len() + fragment.images.len();
         self.clipboard = Some(fragment);
         self.info(format!("Copied {n} item(s)"));
     }
@@ -1927,18 +2183,22 @@ impl App {
         if !self.require_edit_mode() {
             return;
         }
-        let fragment = self
-            .editor
-            .fragment(&self.selection.components, &self.selection.notes);
+        let fragment = self.editor.fragment(
+            &self.selection.components,
+            &self.selection.notes,
+            &self.selection.images,
+        );
         if fragment.is_empty() {
             self.info("Nothing selected to cut");
             return;
         }
         let ids = self.selection.components.clone();
         let note_ids = self.selection.notes.clone();
-        match self.editor.delete_items(&ids, &note_ids) {
+        let image_ids = self.selection.images.clone();
+        match self.editor.delete_items(&ids, &note_ids, &image_ids) {
             Ok(()) => {
-                let n = fragment.components.len() + fragment.notes.len();
+                let n =
+                    fragment.components.len() + fragment.notes.len() + fragment.images.len();
                 self.clipboard = Some(fragment);
                 self.selection.clear();
                 self.info(format!("Cut {n} item(s)"));
@@ -1970,10 +2230,11 @@ impl App {
             [1, 1]
         };
         match self.editor.paste_fragment(&fragment, delta, true) {
-            Ok((new_ids, new_notes)) => {
+            Ok((new_ids, new_notes, new_images)) => {
                 self.selection.clear();
                 self.selection.components = new_ids;
                 self.selection.notes = new_notes;
+                self.selection.images = new_images;
                 self.gesture = Gesture::Idle;
                 self.info("Pasted");
             }
@@ -1985,22 +2246,25 @@ impl App {
         if !self.require_edit_mode() {
             return;
         }
-        let fragment = self
-            .editor
-            .fragment(&self.selection.components, &self.selection.notes);
+        let fragment = self.editor.fragment(
+            &self.selection.components,
+            &self.selection.notes,
+            &self.selection.images,
+        );
         if fragment.is_empty() {
             self.info("Nothing selected to duplicate");
             return;
         }
         match self.editor.paste_fragment(&fragment, [1, 1], true) {
-            Ok((new_ids, new_notes)) => {
+            Ok((new_ids, new_notes, new_images)) => {
                 self.info(format!(
                     "Duplicated {} item(s)",
-                    new_ids.len() + new_notes.len()
+                    new_ids.len() + new_notes.len() + new_images.len()
                 ));
                 self.selection.clear();
                 self.selection.components = new_ids;
                 self.selection.notes = new_notes;
+                self.selection.images = new_images;
             }
             Err(e) => self.error(e.to_string()),
         }
@@ -2016,6 +2280,12 @@ impl App {
         if self.layout_dialog.is_some() {
             if matches!(key, KeyInput::Escape | KeyInput::Enter) {
                 self.layout_dialog = None;
+            }
+            return;
+        }
+        if self.image_dialog.is_some() {
+            if matches!(key, KeyInput::Escape | KeyInput::Enter) {
+                self.image_dialog = None;
             }
             return;
         }
@@ -2144,6 +2414,64 @@ impl App {
                 Ok(()) => self.info(format!("Project renamed to \"{name}\"")),
                 Err(e) => retry(self, e, prompt),
             },
+            PromptAction::NewProject => {
+                let create = || -> Result<PathBuf, String> {
+                    let base = projects_base_dir().ok_or("No home folder found")?;
+                    std::fs::create_dir_all(&base).map_err(|e| e.to_string())?;
+                    let dir = create_project_dir(&base, &name)?;
+                    let mut project = Editor::empty().project;
+                    project.name = name.clone();
+                    let json = serde_json::to_string_pretty(&project)
+                        .map_err(|e| e.to_string())?;
+                    let path = dir.join("project.json");
+                    std::fs::write(&path, json + "\n").map_err(|e| e.to_string())?;
+                    Ok(path)
+                };
+                match create() {
+                    Ok(path) => {
+                        self.open_path(path);
+                        self.info(format!("Created project \"{name}\""));
+                    }
+                    Err(e) => {
+                        self.error(e);
+                        self.prompt = Some(prompt);
+                    }
+                }
+            }
+            PromptAction::SaveCopyAs => match self.save_copy_into(&name) {
+                Ok(path) => {
+                    self.file_path = Some(path);
+                    self.info(format!("Saved a copy as \"{name}\" — now editing it"));
+                }
+                Err(e) => {
+                    self.error(e);
+                    self.prompt = Some(prompt);
+                }
+            },
+            PromptAction::SetImageDim { id, which } => {
+                let Ok(value) = name.parse::<f32>() else {
+                    self.error("Enter a number of grid cells");
+                    self.prompt = Some(prompt);
+                    return;
+                };
+                let value = value.clamp(IMG_SIZE_MIN, IMG_SIZE_MAX);
+                let current = self
+                    .editor
+                    .sheet_images()
+                    .iter()
+                    .find(|i| i.id == id)
+                    .map(|i| i.size)
+                    .unwrap_or([6.0, 4.0]);
+                let (w, h) = if which == 0 {
+                    (value, current[1])
+                } else {
+                    (current[0], value)
+                };
+                match self.editor.set_image_size(&id, w, h) {
+                    Ok(()) => self.info("Resized"),
+                    Err(e) => retry(self, e, prompt),
+                }
+            }
             PromptAction::SetAbstractionDim { index, which } => {
                 let Ok(value) = name.parse::<f32>() else {
                     self.error("Enter a number of grid cells");
@@ -2310,7 +2638,12 @@ impl App {
 
     pub fn focus_lost(&mut self) {
         // Mid-gesture state must never survive without live input.
-        if !matches!(self.gesture, Gesture::Placing { .. }) {
+        // Placement gestures carry no pointer state and survive — the file
+        // picker itself steals focus right before image placement starts.
+        if !matches!(
+            self.gesture,
+            Gesture::Placing { .. } | Gesture::PlacingImage { .. }
+        ) {
             self.gesture = Gesture::Idle;
         }
         self.ctrl = false;
@@ -2351,6 +2684,124 @@ fn rect_between(a: [f32; 2], b: [f32; 2]) -> Rect {
         w: (a[0] - b[0]).abs(),
         h: (a[1] - b[1]).abs(),
     }
+}
+
+/// A string safe to use as a project directory name.
+fn sanitize_name(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if cleaned.is_empty() {
+        "circuit".into()
+    } else {
+        cleaned
+    }
+}
+
+// ── The projects folder ──────────────────────────────────────────────────────
+//
+// Projects are DIRECTORIES: <name>/project.json plus a media/ folder for
+// pictures (and room for caches later). They live together in one
+// user-visible place.
+
+/// Where projects live: Documents/diycpu, or ~/diycpu when there is no
+/// documents folder. None when even a home directory can't be found.
+pub fn projects_base_dir() -> Option<PathBuf> {
+    let base = dirs::document_dir().or_else(dirs::home_dir)?;
+    Some(base.join("diycpu"))
+}
+
+/// Create `<base>/<name>/` (with its media folder). The name must be free.
+pub fn create_project_dir(base: &Path, name: &str) -> Result<PathBuf, String> {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err("Project names use letters, digits, _ and -".into());
+    }
+    let dir = base.join(name);
+    if dir.exists() {
+        return Err(format!("A project called \"{name}\" already exists"));
+    }
+    std::fs::create_dir_all(dir.join("media")).map_err(|e| e.to_string())?;
+    Ok(dir)
+}
+
+/// What to open when the app starts without a path: the most recently
+/// modified project in the folder — or, on the very first launch, a fresh
+/// starter project created right there.
+pub fn default_project_path(base: &Path) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(base).map_err(|e| e.to_string())?;
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in std::fs::read_dir(base).map_err(|e| e.to_string())? {
+        let Ok(entry) = entry else { continue };
+        let candidate = entry.path().join("project.json");
+        let Ok(meta) = std::fs::metadata(&candidate) else {
+            continue;
+        };
+        let t = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+        if newest.as_ref().is_none_or(|(bt, _)| t > *bt) {
+            newest = Some((t, candidate));
+        }
+    }
+    if let Some((_, path)) = newest {
+        return Ok(path);
+    }
+    let dir = create_project_dir(base, "welcome")?;
+    let path = dir.join("project.json");
+    let json =
+        serde_json::to_string_pretty(&starter_project()).map_err(|e| e.to_string())?;
+    std::fs::write(&path, json + "\n").map_err(|e| e.to_string())?;
+    Ok(path)
+}
+
+/// The first thing a new user sees: a little blinker with a welcome note,
+/// built through the same editor ops the GUI uses so it can never drift
+/// from the format.
+pub fn starter_project() -> Project {
+    fn build() -> Result<Project, diycpu::editor::EditError> {
+        let port = |c: &str, p: &str| PortRef {
+            component_id: c.into(),
+            port_name: p.into(),
+        };
+        let mut ed = Editor::empty();
+        ed.rename_project("welcome")?;
+        ed.place_component("clk", [1, 6])?; // clk_1
+        ed.place_component("dff", [6, 2])?; // dff_1
+        ed.place_component("nand", [12, 2])?; // nand_1
+        // dff.out feeds both NAND inputs: the NAND is an inverter.
+        ed.connect(port("dff_1", "out"), port("nand_1", "a"), &[])?;
+        ed.connect(
+            port("dff_1", "out"),
+            port("nand_1", "b"),
+            &[[10.5, 2.5], [10.5, 3.5]],
+        )?;
+        // ...and the inverse loops back into the flip-flop, around the top.
+        ed.connect(
+            port("nand_1", "out"),
+            port("dff_1", "d"),
+            &[[16.5, 2.5], [16.5, 0.5], [4.5, 0.5], [4.5, 2.5]],
+        )?;
+        ed.connect(
+            port("clk_1", "out"),
+            port("dff_1", "clk"),
+            &[[4.5, 6.5], [4.5, 3.5]],
+        )?;
+        ed.place_note(
+            [10.5, 6.0],
+            "Welcome! This loop blinks: the NAND feeds the flip-flop its own inverse. Press Space to run. Scroll zooms, right-drag pans.",
+        )?;
+        Ok(ed.project)
+    }
+    build().unwrap_or_else(|_| Editor::empty().project)
 }
 
 pub fn load_project(path: &std::path::Path) -> Result<(Project, Vec<String>), String> {
@@ -3222,6 +3673,510 @@ impl App {
     }
 }
 
+
+// ── The hover cogwheel ───────────────────────────────────────────────────────
+
+/// What clicking the gear on a hovered thing does.
+#[derive(Clone, PartialEq, Debug)]
+pub enum CogAction {
+    /// Open the layout dialog for this abstraction type.
+    Layout { index: usize },
+    /// Open the image settings dialog.
+    ImageSettings { id: String },
+    /// Open the note text prompt.
+    EditNote { id: String },
+    /// Flip a dff/const start value (the face shows it immediately).
+    ToggleInit { id: String },
+}
+
+/// The gear button's screen-space size.
+const COG_SIZE: f32 = 20.0;
+
+// ── Image settings dialog ────────────────────────────────────────────────────
+
+/// The image dialog: swap the file, resize with sliders. Pure preview
+/// state; edits commit on release / confirm.
+pub struct ImageDialog {
+    pub id: String,
+    /// Index of the slider being dragged (0 = width, 1 = height).
+    pub drag: Option<usize>,
+    pub pending_size: Option<(f32, f32)>,
+}
+
+/// Everything the image dialog's renderer and hit-testing share.
+pub struct ImageDialogGeom {
+    pub panel: Rect,
+    /// Where the picture itself is previewed, aspect-fit, in pixels.
+    pub preview: Rect,
+    pub file_label: String,
+    pub choose_rect: Rect,
+    pub sliders: [DialogSlider; 2],
+    pub close_rect: Rect,
+}
+
+/// Image size sliders cover this range of grid cells.
+pub const IMG_SIZE_MIN: f32 = 1.0;
+pub const IMG_SIZE_MAX: f32 = 40.0;
+
+/// Media files are capped so projects stay portable.
+pub const MAX_MEDIA_BYTES: u64 = 20 * 1024 * 1024;
+
+impl App {
+    /// The gear affordance for whatever is hovered, if it has settings:
+    /// its screen rect and what clicking it does.
+    pub fn cog(&self) -> Option<(Rect, CogAction)> {
+        if self.is_running() || self.any_modal() || !matches!(self.gesture, Gesture::Idle) {
+            return None;
+        }
+        // Hovering a component's port still counts as hovering the
+        // component: the gear sits near the top-right port slot, and it
+        // must not flicker away as the pointer crosses a port's hit ring.
+        let hovered_component = match &self.hover {
+            Hit::Component { component_id } | Hit::Port { component_id, .. } => {
+                Some(component_id.clone())
+            }
+            _ => None,
+        };
+        let (target, action) = match (&self.hover, hovered_component) {
+            (_, Some(component_id)) => {
+                let (components, _) = self.editor.sheet_data();
+                let comp = components.iter().find(|c| c.id == component_id)?;
+                let rect = layout::footprint(&self.editor.project.abstractions, comp);
+                let action = match comp.component_type.as_str() {
+                    "dff" | "const" => CogAction::ToggleInit {
+                        id: comp.id.clone(),
+                    },
+                    "nand" | "clk" => return None, // nothing to configure
+                    _ => CogAction::Layout {
+                        index: self
+                            .editor
+                            .project
+                            .abstractions
+                            .iter()
+                            .position(|a| a.name == comp.component_type)?,
+                    },
+                };
+                (rect, action)
+            }
+            (Hit::Image { image_id }, _) => {
+                let img = self
+                    .editor
+                    .sheet_images()
+                    .iter()
+                    .find(|i| &i.id == image_id)?;
+                (
+                    layout::image_bounds(img),
+                    CogAction::ImageSettings {
+                        id: img.id.clone(),
+                    },
+                )
+            }
+            (Hit::Note { note_id }, _) => {
+                let note = self
+                    .editor
+                    .sheet_notes()
+                    .iter()
+                    .find(|n| &n.id == note_id)?;
+                (
+                    layout::note_bounds(note),
+                    CogAction::EditNote {
+                        id: note.id.clone(),
+                    },
+                )
+            }
+            _ => return None,
+        };
+        // Tucked into the top-right corner, INSIDE the footprint so hovering
+        // the gear still hovers the thing it belongs to.
+        let tl = self.camera.grid_to_screen([target.x, target.y]);
+        let w = target.w * self.camera.cell_px();
+        let h = target.h * self.camera.cell_px();
+        if w < COG_SIZE * 2.4 || h < COG_SIZE * 1.3 {
+            return None; // too small on screen for a corner button
+        }
+        Some((
+            Rect {
+                x: tl[0] + w - COG_SIZE - 4.0,
+                y: tl[1] + 4.0,
+                w: COG_SIZE,
+                h: COG_SIZE,
+            },
+            action,
+        ))
+    }
+
+    fn perform_cog(&mut self, action: CogAction) {
+        match action {
+            CogAction::Layout { index } => {
+                self.gesture = Gesture::Idle;
+                self.layout_dialog = Some(LayoutDialog {
+                    index,
+                    drag: None,
+                    pending_port: None,
+                    pending_size: None,
+                });
+            }
+            CogAction::ImageSettings { id } => self.action_open_image_dialog(&id),
+            CogAction::EditNote { id } => {
+                let text = self
+                    .editor
+                    .sheet_notes()
+                    .iter()
+                    .find(|n| n.id == id)
+                    .map(|n| n.text.clone())
+                    .unwrap_or_default();
+                self.prompt = Some(Prompt {
+                    title: "Edit note (empty text removes it)".into(),
+                    value: text,
+                    action: PromptAction::EditNote { id },
+                    identifier: false,
+                });
+            }
+            CogAction::ToggleInit { id } => match self.editor.toggle_dff_init(&id) {
+                Ok(v) => self.info(format!(
+                    "Starts at {} now",
+                    if v { "1" } else { "0" }
+                )),
+                Err(e) => self.error(e.to_string()),
+            },
+        }
+    }
+
+    // ── Image dialog ─────────────────────────────────────────────────────
+
+    pub fn action_open_image_dialog(&mut self, id: &str) {
+        if !self.require_edit_mode() {
+            return;
+        }
+        self.gesture = Gesture::Idle;
+        self.image_dialog = Some(ImageDialog {
+            id: id.to_string(),
+            drag: None,
+            pending_size: None,
+        });
+    }
+
+    /// The dialog's image with pending preview edits applied.
+    pub fn image_dialog_image(&self) -> Option<diycpu::project::MediaImage> {
+        let dialog = self.image_dialog.as_ref()?;
+        let mut img = self
+            .editor
+            .sheet_images()
+            .iter()
+            .find(|i| i.id == dialog.id)?
+            .clone();
+        if let Some((w, h)) = dialog.pending_size {
+            img.size = [w, h];
+        }
+        Some(img)
+    }
+
+    pub fn image_dialog_geometry(&self) -> Option<ImageDialogGeom> {
+        let img = self.image_dialog_image()?;
+        let panel_w = 460.0f32;
+        let panel_h = 440.0f32;
+        let panel = Rect {
+            x: (self.window_size[0] - panel_w) / 2.0,
+            y: (self.window_size[1] - panel_h) / 2.5,
+            w: panel_w,
+            h: panel_h,
+        };
+        // Aspect-fit preview of the picture (by its display proportions).
+        let area = Rect {
+            x: panel.x + 30.0,
+            y: panel.y + 56.0,
+            w: panel.w - 60.0,
+            h: panel.h - 240.0,
+        };
+        let (gw, gh) = (img.size[0].max(0.1), img.size[1].max(0.1));
+        let scale = (area.w / gw).min(area.h / gh);
+        let (pw, ph) = (gw * scale, gh * scale);
+        let preview = Rect {
+            x: area.x + (area.w - pw) / 2.0,
+            y: area.y + (area.h - ph) / 2.0,
+            w: pw,
+            h: ph,
+        };
+        let choose_rect = Rect {
+            x: panel.x + 30.0,
+            y: panel.y + panel.h - 156.0,
+            w: panel.w - 60.0,
+            h: 30.0,
+        };
+        let slider_row = |row: usize, label: &'static str, value: f32| DialogSlider {
+            label,
+            track: Rect {
+                x: panel.x + 90.0,
+                y: panel.y + panel.h - 96.0 + row as f32 * 32.0,
+                w: panel.w - 220.0,
+                h: 14.0,
+            },
+            value_rect: Rect {
+                x: panel.x + panel.w - 110.0,
+                y: panel.y + panel.h - 102.0 + row as f32 * 32.0,
+                w: 84.0,
+                h: 24.0,
+            },
+            value,
+        };
+        Some(ImageDialogGeom {
+            panel,
+            preview,
+            file_label: img.file.clone(),
+            choose_rect,
+            sliders: [
+                slider_row(0, "Width", img.size[0]),
+                slider_row(1, "Height", img.size[1]),
+            ],
+            close_rect: Rect {
+                x: panel.x + panel_w - 34.0,
+                y: panel.y + 10.0,
+                w: 24.0,
+                h: 24.0,
+            },
+        })
+    }
+
+    pub fn img_dialog_pressed(&mut self) {
+        let Some(geom) = self.image_dialog_geometry() else {
+            self.image_dialog = None;
+            return;
+        };
+        if geom.close_rect.contains(self.cursor) || !geom.panel.contains(self.cursor) {
+            self.image_dialog = None;
+            return;
+        }
+        if geom.choose_rect.contains(self.cursor) {
+            self.choose_image_for_dialog();
+            return;
+        }
+        for (i, slider) in geom.sliders.iter().enumerate() {
+            let grab = Rect {
+                x: slider.track.x - 8.0,
+                y: slider.track.y - 8.0,
+                w: slider.track.w + 16.0,
+                h: slider.track.h + 16.0,
+            };
+            if grab.contains(self.cursor) {
+                if let Some(d) = &mut self.image_dialog {
+                    d.drag = Some(i);
+                }
+                self.img_dialog_moved(); // jump the value to the click
+                return;
+            }
+            if slider.value_rect.contains(self.cursor) {
+                let id = self.image_dialog.as_ref().unwrap().id.clone();
+                self.prompt = Some(Prompt {
+                    title: format!("{} in grid cells", slider.label),
+                    value: format!("{}", slider.value),
+                    action: PromptAction::SetImageDim { id, which: i },
+                    identifier: false,
+                });
+                return;
+            }
+        }
+    }
+
+    pub fn img_dialog_moved(&mut self) {
+        let Some(geom) = self.image_dialog_geometry() else {
+            return;
+        };
+        let cursor = self.cursor;
+        let Some(dialog) = &mut self.image_dialog else {
+            return;
+        };
+        if let Some(i) = dialog.drag {
+            let track = &geom.sliders[i].track;
+            let f = ((cursor[0] - track.x) / track.w).clamp(0.0, 1.0);
+            // Half-cell steps: fine enough for pictures, still tidy.
+            let value =
+                ((IMG_SIZE_MIN + f * (IMG_SIZE_MAX - IMG_SIZE_MIN)) * 2.0).round() / 2.0;
+            let current = (geom.sliders[0].value, geom.sliders[1].value);
+            dialog.pending_size = Some(if i == 0 {
+                (value, current.1)
+            } else {
+                (current.0, value)
+            });
+        }
+    }
+
+    pub fn img_dialog_released(&mut self) {
+        let Some(dialog) = &mut self.image_dialog else {
+            return;
+        };
+        let id = dialog.id.clone();
+        let pending = dialog.pending_size.take();
+        if dialog.drag.take().is_some() {
+            if let Some((w, h)) = pending {
+                if let Err(e) = self.editor.set_image_size(&id, w, h) {
+                    self.error(e.to_string());
+                }
+            }
+        }
+    }
+
+    fn choose_image_for_dialog(&mut self) {
+        let Some(dialog) = &self.image_dialog else {
+            return;
+        };
+        let id = dialog.id.clone();
+        let picked = rfd::FileDialog::new()
+            .add_filter("images", &["png", "jpg", "jpeg", "gif", "webp"])
+            .pick_file();
+        let Some(path) = picked else {
+            self.info("Cancelled");
+            return;
+        };
+        let dims = match Self::validate_image_file(&path) {
+            Ok(d) => d,
+            Err(e) => {
+                self.error(e);
+                return;
+            }
+        };
+        let rel = match self.import_media(&path) {
+            Ok(r) => r,
+            Err(e) => {
+                self.error(e);
+                return;
+            }
+        };
+        // Keep the current width; the new file brings its own aspect.
+        let w = self
+            .image_dialog_image()
+            .map(|i| i.size[0])
+            .unwrap_or(6.0);
+        let h = ((w * dims.1 as f32 / dims.0.max(1) as f32) * 2.0).round() / 2.0;
+        match self
+            .editor
+            .set_image_file(&id, &rel, Some([w, h.clamp(IMG_SIZE_MIN, IMG_SIZE_MAX)]))
+        {
+            Ok(()) => self.info(format!("Image set to {rel}")),
+            Err(e) => self.error(e.to_string()),
+        }
+    }
+
+    // ── Media files ──────────────────────────────────────────────────────
+
+    /// The directory the project file lives in — media paths are relative
+    /// to it.
+    pub fn project_dir(&self) -> Option<PathBuf> {
+        Some(self.file_path.as_ref()?.parent()?.to_path_buf())
+    }
+
+    /// Absolute path of a project-relative media file.
+    pub fn resolve_media(&self, rel: &str) -> Option<PathBuf> {
+        Some(self.project_dir()?.join(rel))
+    }
+
+    /// Check a media candidate: exists, within the size cap, and a format
+    /// we can actually decode.
+    fn validate_image_file(path: &Path) -> Result<(u32, u32), String> {
+        let meta = std::fs::metadata(path)
+            .map_err(|e| format!("Could not read {}: {e}", path.display()))?;
+        if meta.len() > MAX_MEDIA_BYTES {
+            return Err(format!(
+                "That file is {:.1} MB — the limit is 20 MB",
+                meta.len() as f64 / (1024.0 * 1024.0)
+            ));
+        }
+        let reader = image::ImageReader::open(path)
+            .map_err(|e| format!("Could not open {}: {e}", path.display()))?
+            .with_guessed_format()
+            .map_err(|e| e.to_string())?;
+        use image::ImageFormat;
+        match reader.format() {
+            Some(
+                ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::Gif | ImageFormat::WebP,
+            ) => {}
+            _ => {
+                return Err(
+                    "Unsupported format — png, jpeg, gif or webp (videos like webm aren't supported)"
+                        .into(),
+                )
+            }
+        }
+        reader
+            .into_dimensions()
+            .map_err(|e| format!("Could not decode the image: {e}"))
+    }
+
+    /// Copy a file into the project's media folder (unless it's already
+    /// there) and return its project-relative path.
+    fn import_media(&self, source: &Path) -> Result<String, String> {
+        let dir = self
+            .project_dir()
+            .ok_or("Save the project first — images are copied into its folder")?;
+        let media = dir.join("media");
+        // Already one of ours? Reference it as-is.
+        if source.starts_with(&media) {
+            if let Some(name) = source.file_name() {
+                return Ok(format!("media/{}", name.to_string_lossy()));
+            }
+        }
+        std::fs::create_dir_all(&media).map_err(|e| e.to_string())?;
+        let stem: String = source
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "image".into())
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let ext = source
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_else(|| "png".into());
+        let mut name = format!("{stem}.{ext}");
+        let mut n = 1;
+        while media.join(&name).exists() {
+            n += 1;
+            name = format!("{stem}-{n}.{ext}");
+        }
+        std::fs::copy(source, media.join(&name)).map_err(|e| e.to_string())?;
+        Ok(format!("media/{name}"))
+    }
+
+    /// Palette "image": pick a file first, then place it like a component.
+    pub fn action_place_image(&mut self) {
+        if self.project_dir().is_none() {
+            self.error("Save the project first — images are copied into its folder");
+            return;
+        }
+        let picked = rfd::FileDialog::new()
+            .add_filter("images", &["png", "jpg", "jpeg", "gif", "webp"])
+            .pick_file();
+        let Some(path) = picked else {
+            self.info("Cancelled");
+            return;
+        };
+        self.begin_image_placement(path);
+    }
+
+    /// Validate a picked file and arm placement (split from the picker so
+    /// tests can drive it).
+    pub fn begin_image_placement(&mut self, source: PathBuf) {
+        match Self::validate_image_file(&source) {
+            Ok((iw, ih)) => {
+                let aspect = ih as f32 / iw.max(1) as f32;
+                let w = 6.0f32;
+                let h = (((w * aspect) * 2.0).round() / 2.0).clamp(1.0, 24.0);
+                self.gesture = Gesture::PlacingImage {
+                    source,
+                    size: [w, h],
+                };
+                self.info("Placing the image — click the canvas, Esc cancels");
+            }
+            Err(e) => self.error(e),
+        }
+    }
+}
+
 #[cfg(test)]
 mod clipboard_tests {
     use super::tests::*;
@@ -3402,5 +4357,328 @@ mod wire_selection_tests {
             d.app.editor.project.abstractions[0].outputs.get("q"),
             Some(&String::new())
         );
+    }
+}
+
+#[cfg(test)]
+mod image_and_cog_tests {
+    use super::tests::*;
+    use super::*;
+
+    fn place_test_image(d: &mut Driver, pos: [f32; 2], size: [f32; 2]) -> String {
+        let id = d.app.editor.place_image(pos, "media/test.png", size).unwrap();
+        d.app.recompute_hover();
+        id
+    }
+
+    #[test]
+    fn image_selects_drags_and_deletes_like_anything_else() {
+        let mut d = Driver::new();
+        let id = place_test_image(&mut d, [2.0, 2.0], [6.0, 4.0]);
+
+        // Click selects.
+        d.click([5.0, 4.0]);
+        assert_eq!(d.app.selection.images, vec![id.clone()]);
+
+        // Drag moves (whole-cell deltas, like components).
+        d.drag([5.0, 4.0], [10.0, 6.0]);
+        assert_eq!(d.app.editor.project.images[0].pos, [7.0, 4.0]);
+
+        // Box-select sweeps it up together with a component.
+        d.place("nand", [16.0, 2.0]);
+        d.drag([5.0, 2.0], [19.0, 9.0]);
+        assert_eq!(d.app.selection.images.len(), 1);
+        assert_eq!(d.app.selection.components.len(), 1);
+
+        // Delete removes the whole mix in one undo step.
+        d.app.handle_key(KeyInput::Delete);
+        assert!(d.app.editor.project.images.is_empty());
+        assert!(d.app.editor.project.components.is_empty());
+        d.app.undo();
+        assert_eq!(d.app.editor.project.images.len(), 1);
+        assert_eq!(d.app.editor.project.components.len(), 1);
+    }
+
+    #[test]
+    fn clipboard_carries_images() {
+        let mut d = Driver::new();
+        let id = place_test_image(&mut d, [2.0, 2.0], [4.0, 3.0]);
+        d.click([4.0, 3.5]);
+        assert_eq!(d.app.selection.images, vec![id]);
+        d.app.copy_selection();
+        d.move_to([20.0, 10.0]);
+        d.app.paste_clipboard();
+        assert_eq!(d.app.editor.project.images.len(), 2);
+        assert_eq!(d.app.selection.images.len(), 1);
+        assert_eq!(d.app.editor.project.images[1].file, "media/test.png");
+    }
+
+    #[test]
+    fn ctrl_drag_copies_an_image() {
+        let mut d = Driver::new();
+        place_test_image(&mut d, [2.0, 2.0], [4.0, 3.0]);
+        d.app.ctrl = true;
+        d.drag([4.0, 3.5], [14.0, 3.5]);
+        d.app.ctrl = false;
+        assert_eq!(d.app.editor.project.images.len(), 2);
+        assert_eq!(d.app.editor.project.images[0].pos, [2.0, 2.0]);
+        assert_eq!(d.app.editor.project.images[1].pos, [12.0, 2.0]);
+    }
+
+    #[test]
+    fn cog_on_dff_toggles_start_value() {
+        let mut d = Driver::new();
+        d.place("dff", [4.0, 4.0]);
+        let center = center_of(&d.app, "dff_1");
+        d.move_to(center);
+        let (rect, action) = d.app.cog().expect("dff shows a cog");
+        assert_eq!(
+            action,
+            CogAction::ToggleInit {
+                id: "dff_1".into()
+            }
+        );
+        // Click inside the cog: the init flips, nothing gets selected.
+        d.app.mouse_moved([rect.x + rect.w / 2.0, rect.y + rect.h / 2.0]);
+        d.app.left_pressed();
+        d.app.left_released();
+        assert_eq!(d.app.editor.project.components[0].init, Some(true));
+    }
+
+    #[test]
+    fn cog_on_instance_opens_the_layout_dialog_from_any_sheet() {
+        let mut d = Driver::new();
+        d.app.action_new_abstraction();
+        d.type_text("box");
+        d.app.handle_key(KeyInput::Enter);
+        d.app.action_add_pin(PortKind::Input);
+        d.type_text("x");
+        d.app.handle_key(KeyInput::Enter);
+        d.place("nand", [2.0, 2.0]);
+        d.app.action_back_to_top();
+        d.place("box", [4.0, 4.0]);
+
+        d.move_to(center_of(&d.app, "box_1"));
+        let (rect, action) = d.app.cog().expect("instances show a cog");
+        assert_eq!(action, CogAction::Layout { index: 0 });
+        d.app.mouse_moved([rect.x + rect.w / 2.0, rect.y + rect.h / 2.0]);
+        d.app.left_pressed();
+        d.app.left_released();
+        // The dialog opened for the right abstraction — from the TOP sheet.
+        assert_eq!(d.app.layout_dialog.as_ref().map(|l| l.index), Some(0));
+        assert_eq!(d.app.editor.sheet, SheetRef::Top);
+    }
+
+    #[test]
+    fn no_cog_on_gates_and_none_while_running() {
+        let mut d = Driver::new();
+        d.place("nand", [4.0, 4.0]);
+        d.move_to(center_of(&d.app, "nand_1"));
+        assert!(d.app.cog().is_none(), "a bare gate has no settings");
+
+        d.place("dff", [10.0, 4.0]);
+        d.move_to(center_of(&d.app, "dff_1"));
+        assert!(d.app.cog().is_some());
+        d.app.action_run_toggle();
+        d.move_to(center_of(&d.app, "dff_1"));
+        assert!(d.app.cog().is_none(), "no cog while running");
+    }
+
+    #[test]
+    fn cog_on_image_opens_settings_and_sliders_resize() {
+        let mut d = Driver::new();
+        let id = place_test_image(&mut d, [2.0, 2.0], [6.0, 4.0]);
+        d.move_to([5.0, 4.0]);
+        let (rect, action) = d.app.cog().expect("images show a cog");
+        assert_eq!(action, CogAction::ImageSettings { id: id.clone() });
+        d.app.mouse_moved([rect.x + rect.w / 2.0, rect.y + rect.h / 2.0]);
+        d.app.left_pressed();
+        assert!(d.app.image_dialog.is_some());
+
+        // Drag the width slider to its far end.
+        let geom = d.app.image_dialog_geometry().unwrap();
+        let track = geom.sliders[0].track;
+        d.app.cursor = [track.x + 4.0, track.y + track.h / 2.0];
+        d.app.img_dialog_pressed();
+        d.app.cursor = [track.x + track.w, track.y + track.h / 2.0];
+        d.app.img_dialog_moved();
+        d.app.img_dialog_released();
+        assert_eq!(d.app.editor.project.images[0].size[0], IMG_SIZE_MAX);
+
+        // Type the height instead: value button → prompt → commit.
+        let geom = d.app.image_dialog_geometry().unwrap();
+        let v = geom.sliders[1].value_rect;
+        d.app.cursor = [v.x + 2.0, v.y + 2.0];
+        d.app.img_dialog_pressed();
+        assert!(d.app.prompt.is_some());
+        d.app.prompt.as_mut().unwrap().value.clear();
+        d.type_text("2.5");
+        d.app.handle_key(KeyInput::Enter);
+        assert_eq!(d.app.editor.project.images[0].size, [IMG_SIZE_MAX, 2.5]);
+
+        // Esc closes; editing is unlocked again.
+        d.app.handle_key(KeyInput::Escape);
+        assert!(d.app.image_dialog.is_none());
+    }
+
+    #[test]
+    fn image_dialog_is_modal() {
+        let mut d = Driver::new();
+        let id = place_test_image(&mut d, [2.0, 2.0], [6.0, 4.0]);
+        d.app.action_open_image_dialog(&id);
+        let zoom = d.app.camera.zoom;
+        d.app.scrolled(120.0);
+        assert_eq!(d.app.camera.zoom, zoom, "wheel is swallowed");
+        let geom = d.app.image_dialog_geometry().unwrap();
+        // A click outside the panel closes it and does nothing else.
+        d.app.cursor = [geom.panel.x - 40.0, geom.panel.y - 40.0];
+        d.app.img_dialog_pressed();
+        assert!(d.app.image_dialog.is_none());
+    }
+}
+
+#[cfg(test)]
+mod project_dir_tests {
+    use super::*;
+
+    fn temp_base(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "diycpu-test-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn first_launch_creates_the_starter_then_reopens_it() {
+        let base = temp_base("first");
+        let path = default_project_path(&base).unwrap();
+        assert!(path.ends_with("welcome/project.json"));
+        assert!(base.join("welcome/media").is_dir());
+        let (project, repairs) = load_project(&path).unwrap();
+        assert!(repairs.is_empty(), "starter loads clean: {repairs:?}");
+        assert_eq!(project.name, "welcome");
+        assert!(!project.components.is_empty());
+        assert!(!project.notes.is_empty());
+
+        // Second launch: same project, no duplicate.
+        let again = default_project_path(&base).unwrap();
+        assert_eq!(again, path);
+        assert_eq!(std::fs::read_dir(&base).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn most_recently_touched_project_wins() {
+        let base = temp_base("recent");
+        let first = default_project_path(&base).unwrap();
+        // A second project, saved later.
+        let dir = create_project_dir(&base, "newer").unwrap();
+        std::fs::write(dir.join("project.json"), "{}").unwrap();
+        // File mtimes need to differ; nudge the newer one forward.
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(5);
+        let f = std::fs::File::options()
+            .write(true)
+            .open(dir.join("project.json"))
+            .unwrap();
+        f.set_modified(later).unwrap();
+        drop(f);
+        let picked = default_project_path(&base).unwrap();
+        assert!(picked.ends_with("newer/project.json"), "picked {picked:?}");
+        assert_ne!(picked, first);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn project_dir_names_are_validated() {
+        let base = temp_base("names");
+        std::fs::create_dir_all(&base).unwrap();
+        assert!(create_project_dir(&base, "ok-name_2").is_ok());
+        assert!(create_project_dir(&base, "ok-name_2").is_err(), "taken");
+        assert!(create_project_dir(&base, "no/slash").is_err());
+        assert!(create_project_dir(&base, "").is_err());
+        assert!(create_project_dir(&base, "no.dots").is_err());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn tiny_png(path: &Path) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut enc = png::Encoder::new(std::io::BufWriter::new(file), 4, 2);
+        enc.set_color(png::ColorType::Rgba);
+        enc.set_depth(png::BitDepth::Eight);
+        let mut writer = enc.write_header().unwrap();
+        writer.write_image_data(&[200u8; 4 * 2 * 4]).unwrap();
+    }
+
+    #[test]
+    fn placing_an_image_copies_it_into_the_project_media_folder() {
+        let base = temp_base("place");
+        std::fs::create_dir_all(&base).unwrap();
+        let dir = create_project_dir(&base, "proj").unwrap();
+        let source = base.join("photo.png");
+        tiny_png(&source);
+
+        let mut d = super::tests::Driver::new();
+        d.app.file_path = Some(dir.join("project.json"));
+
+        d.app.begin_image_placement(source.clone());
+        assert!(
+            matches!(d.app.gesture, Gesture::PlacingImage { .. }),
+            "{}",
+            d.app.status.text
+        );
+        d.click([6.0, 6.0]);
+        assert_eq!(d.app.editor.project.images.len(), 1, "{}", d.app.status.text);
+        let img = &d.app.editor.project.images[0];
+        assert_eq!(img.file, "media/photo.png");
+        // 4x2 source → width 6 cells, height keeps the 1:2 aspect.
+        assert_eq!(img.size, [6.0, 3.0]);
+        assert!(dir.join("media/photo.png").exists(), "file was copied");
+
+        // Placing the same file again gets a fresh name, not a clobber.
+        d.app.begin_image_placement(source);
+        d.click([6.0, 12.0]);
+        assert_eq!(d.app.editor.project.images[1].file, "media/photo-2.png");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn oversized_and_bogus_media_are_rejected() {
+        let base = temp_base("reject");
+        std::fs::create_dir_all(&base).unwrap();
+        let mut d = super::tests::Driver::new();
+        d.app.file_path = Some(base.join("project.json"));
+
+        // Not an image at all (webm and friends land here too).
+        let junk = base.join("video.webm");
+        std::fs::write(&junk, b"\x1a\x45\xdf\xa3 not decodable").unwrap();
+        d.app.begin_image_placement(junk);
+        assert!(matches!(d.app.gesture, Gesture::Idle));
+        assert!(d.app.status.is_error);
+        assert!(d.app.status.text.contains("Unsupported"), "{}", d.app.status.text);
+
+        // Over the 20 MB cap.
+        let big = base.join("big.png");
+        std::fs::write(&big, vec![0u8; 21 * 1024 * 1024]).unwrap();
+        d.app.begin_image_placement(big);
+        assert!(matches!(d.app.gesture, Gesture::Idle));
+        assert!(d.app.status.text.contains("limit is 20 MB"), "{}", d.app.status.text);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn starter_project_actually_blinks() {
+        let project = starter_project();
+        let mut sim = crate::sim::SimSession::new(&project).expect("starter compiles");
+        let dff = |s: &crate::sim::SimSession| {
+            s.component_value_at(&[], "dff_1").unwrap()
+        };
+        let v0 = dff(&sim);
+        // Two toggles = one rising edge = half a blink period.
+        sim.step_forward();
+        sim.step_forward();
+        let v2 = dff(&sim);
+        assert_ne!(v0, v2, "the blinker blinks");
     }
 }

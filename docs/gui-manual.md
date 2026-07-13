@@ -1,12 +1,19 @@
 # GUI manual
 
 ```
-cargo run --features gui --bin diycpu-gui -- [project.json]
+cargo run --features gui --bin diycpu-gui -- [project-dir | project.json]
 ```
+
+Projects are **folders** — `<name>/project.json` plus a `media/` directory
+for pictures — and they all live together in `Documents/diycpu` (or
+`~/diycpu`). Started with no argument, the app opens whichever project you
+touched last; on the very first launch it creates a little “welcome”
+blinker for you. Everything autosaves on every change.
 
 Extra flags for headless work: `--screenshot out.png` (render one frame and
 exit), `--run N` (enter run mode and step N times first), `--sheet name`
-(open an abstraction's sheet), `--size WxH`.
+(open an abstraction's sheet), `--size WxH`, `--cursor gx,gy` (hover a grid
+point), `--image-dialog`, `--anim-t seconds`.
 
 ## Editing
 
@@ -22,12 +29,14 @@ exit), `--run N` (enter run mode and step N times first), `--sheet name`
 | Flip a DFF's start value | Double-click it — the big digit on its face is the stored bit. |
 | Constant signal | The “const” primitive is a toggleable 0/1 source (double-click flips it) — handy for feeding test inputs. Unconnected inputs always read as 0. |
 | Notes | Pick “note” in the palette, click the canvas, type. Double-click a note to edit it (empty text removes it); drag to move; notes can sit anywhere. |
+| Images | Pick “image” in the palette, choose a file (png/jpeg/gif/webp, up to 20 MB — the file is copied into the project's `media/` folder), click to place. Animated GIFs play right on the canvas. Images select, drag, box-select, copy and delete like everything else; the cog on a hovered image opens its settings (swap the file, resize with sliders). Video files (webm) aren't supported. |
+| The cog ⚙ | Hover anything configurable and a little gear appears in its corner — that's where its settings live. On an abstraction instance it opens the layout dialog, on an image the image settings, on a note the text editor, and on a dff/const it flips the start value. |
 | Copy / cut / paste | Ctrl+C / Ctrl+X / Ctrl+V — the selection travels with the wiring that runs among the copied parts; paste lands centered on your cursor. Ctrl+D duplicates in place. |
 | Copy by dragging | Hold Ctrl and drag a selection: the originals stay, copies (wires included) land where you drop. Ctrl+click still toggles items in and out of the selection. |
 | Undo / redo | Ctrl+Z / Ctrl+Shift+Z (or Ctrl+Y). One action = one undo step; a cancelled gesture never becomes one. |
 | Cancel anything | Esc or right-click. |
 | Pan / zoom | Middle- or right-drag; scroll wheel zooms at the cursor. `F` fits the circuit, Ctrl+0 resets zoom. |
-| Files | Saving is automatic: once the project has a file (opened, or Save As once), every change writes straight through. Ctrl+S/Ctrl+Shift+S choose the file, Ctrl+O opens, Ctrl+N starts fresh. |
+| Files | Saving is automatic — every change writes straight through to the project folder. Ctrl+N names a new project, Ctrl+Shift+S (“Save copy”) forks the current one under a new name (media included), Ctrl+O opens another project folder. |
 | Rename the project | Click its name in the title bar. |
 
 ## Infinite zoom

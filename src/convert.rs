@@ -214,6 +214,7 @@ mod tests {
     fn convert_simple_circuit() {
         let project = Project {
             notes: vec![],
+            images: vec![],
             name: "test".into(),
             steps: 4,
             abstractions: vec![],
@@ -270,12 +271,14 @@ mod tests {
     fn convert_abstraction_with_dot_notation() {
         let project = Project {
             notes: vec![],
+            images: vec![],
             name: "test".into(),
             steps: 0,
             abstractions: vec![ProjectAbstraction {
                 pin_positions: HashMap::new(),
                 port_layout: HashMap::new(),
                 notes: vec![],
+            images: vec![],
                 name: "not".into(),
                 inputs: vec!["x".into()],
                 outputs: {
@@ -325,12 +328,14 @@ mod tests {
     fn convert_abstraction_instance_source_uses_dot_notation() {
         let project = Project {
             notes: vec![],
+            images: vec![],
             name: "test".into(),
             steps: 0,
             abstractions: vec![ProjectAbstraction {
                 pin_positions: HashMap::new(),
                 port_layout: HashMap::new(),
                 notes: vec![],
+            images: vec![],
                 name: "not".into(),
                 inputs: vec!["x".into()],
                 outputs: {
@@ -381,6 +386,7 @@ mod tests {
     fn convert_unconnected_net() {
         let project = Project {
             notes: vec![],
+            images: vec![],
             name: "test".into(),
             steps: 0,
             abstractions: vec![],
@@ -401,6 +407,7 @@ mod tests {
     fn convert_net_with_source_no_sinks() {
         let project = Project {
             notes: vec![],
+            images: vec![],
             name: "test".into(),
             steps: 0,
             abstractions: vec![],
@@ -419,6 +426,7 @@ mod tests {
     fn convert_branching_net() {
         let project = Project {
             notes: vec![],
+            images: vec![],
             name: "test".into(),
             steps: 0,
             abstractions: vec![],
@@ -459,6 +467,7 @@ mod tests {
 
         let project = Project {
             notes: vec![],
+            images: vec![],
             name: "toggle".into(),
             steps: 8,
             abstractions: vec![],

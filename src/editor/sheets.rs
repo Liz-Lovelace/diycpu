@@ -157,14 +157,18 @@ pub(crate) fn generate_junction_id(net: &WireNet) -> String {
 
 /// Port-kind resolution context, captured up front so operations can hold
 /// mutable borrows of the sheet while classifying ports.
-pub(crate) struct KindCtx {
+/// Answers "what is this port?" for one sheet — direction (in/out) and
+/// wire kind (signal/bundle) — with the interface pseudo-ports
+/// (`INPUT:x` / `OUTPUT:x`) included. Ops capture one of these before
+/// mutating so validation always sees a consistent snapshot.
+pub(crate) struct PortResolver {
     pub(crate) abstractions: Vec<crate::project::ProjectAbstraction>,
     pub(crate) interface_inputs: Option<Vec<String>>,
     pub(crate) interface_outputs: Option<Vec<String>>,
     pub(crate) interface_bundles: HashMap<String, u32>,
 }
 
-impl KindCtx {
+impl PortResolver {
     pub(crate) fn new(project: &Project, sheet: SheetRef) -> Result<Self, EditError> {
         let (interface_inputs, interface_outputs) = match sheet {
             SheetRef::Top => (None, None),
@@ -184,7 +188,7 @@ impl KindCtx {
                 .map(|d| d.bundle_pins.clone())
                 .unwrap_or_default(),
         };
-        Ok(KindCtx {
+        Ok(PortResolver {
             abstractions: project.abstractions.clone(),
             interface_inputs,
             interface_outputs,

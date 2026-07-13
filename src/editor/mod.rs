@@ -9,6 +9,17 @@
 //! Operations work on a *sheet*: either the top-level circuit or the inside
 //! of one abstraction. Both have the same shape (components + wire nets),
 //! so the same operations serve both.
+//!
+//! The map:
+//! - this file — the `Editor` itself: document + sheet + undo machinery
+//! - `sheets` — uniform sheet access, `PortResolver`, id generation
+//! - `items` — components, notes, images on a sheet
+//! - `wires` — the wire graph (nets, nodes, segments, sync/merge/split)
+//! - `pins` — abstraction definitions and their interfaces
+//! - `bundles` — lane counts for bundlers and bundle pins
+//! - `clipboard` — copyable sheet fragments
+//! - `guard` — the combinational-loop refusal
+//! - `normalize` — the repair pass for loaded/hand-edited files
 
 use std::fmt;
 
@@ -36,7 +47,7 @@ pub use wires::{WireAttach, WirePoint};
 pub(crate) use guard::*;
 pub(crate) use sheets::{
     generate_id, generate_image_id, generate_junction_id, generate_net_id,
-    generate_note_id, sheet_images_mut, sheet_mut, sheet_notes_mut, KindCtx,
+    generate_note_id, sheet_images_mut, sheet_mut, sheet_notes_mut, PortResolver,
 };
 pub(crate) use wires::{
     drop_orphan_junctions, endpoint_is_port, gc_nets,

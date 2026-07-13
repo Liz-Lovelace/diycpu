@@ -1,128 +1,85 @@
-# Frontend architecture
+# Architecture
 
-The GUI is a layered editor over the exact same data the backend consumes.
-There is no GUI-local mirror of the design: what you see is rendered from the
-`Project` struct, and what you save is that same struct. This is the core
-defense against the "canvas shows one thing, file contains another" class of
-bugs.
-
-## Layers
+The system is a stack of layers. Each layer only looks *down*, and every
+layer states its one rule in its module docs. When adding a feature, find
+the layer each piece belongs to — if a change wants to smear across
+layers, that's the design telling you to stop and split it.
 
 ```
-input events (winit)
-        │
-        ▼
-┌─────────────────────┐     reads      ┌──────────────────────┐
-│ interaction         │───────────────▶│ layout (pure)        │
-│ gesture state       │                │ footprints, ports,   │
-│ machine             │                │ hit-testing, routing │
-└────────┬────────────┘                └──────────────────────┘
-         │ commits intents (once, at gesture end)
-         ▼
-┌─────────────────────┐
-│ editor              │  validated operations + snapshot undo
-│ owns Project        │  place / move / connect / delete / …
-└────────┬────────────┘
-         │ document + derived geometry
-         ▼
-┌─────────────────────┐                ┌──────────────────────┐
-│ render (pure)       │◀───────────────│ sim session          │
-│ theme + drawing     │   wire values  │ compile + replay     │
-└─────────────────────┘                └──────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│ shell        src/bin/gui/main.rs — event loop, timers, CLI   │
+├──────────────────────────────────────────────────────────────┤
+│ render/      pure draw: (document, app state, camera) → px   │
+│ ui.rs        chrome rects shared by renderer and hit-testing │
+├──────────────────────────────────────────────────────────────┤
+│ app/         gestures, selection, dialogs, files, view focus │
+│ camera.rs    grid ↔ screen transform                         │
+│ sim.rs       run-mode session (replay-based stepping)        │
+├──────────────────────────────────────────────────────────────┤
+│ editor/      validated, atomic, undoable ops on the document │
+│ layout.rs    pure geometry IR: footprints, ports, hit tests  │
+├──────────────────────────────────────────────────────────────┤
+│ project.rs   the document: serde JSON, the single truth      │
+├──────────────────────────────────────────────────────────────┤
+│ engine       convert → expander → compiler → simulator       │
+│              (bundles and GUI concepts never reach it)       │
+└──────────────────────────────────────────────────────────────┘
 ```
 
-### Document (`diycpu::project::Project`)
-The single source of truth. Every persistent thing — component positions,
-wire nets, junctions, segments, abstractions — lives here and only here.
-Editing in the GUI and editing the JSON by hand are the same operation.
+## The rules that hold it together
 
-### Editor (`editor.rs`)
-Owns the `Project` plus undo/redo stacks. All mutations go through
-intent-level operations (`place_component`, `move_components`, `connect`,
-`delete`, …). Each operation:
+- **The document is the only truth.** `project.rs` is what's on disk;
+  wire segments are the truth of a net (`source`/`sinks` are derived);
+  everything visual is recomputed from the document every frame.
+- **All mutation goes through `Editor::mutate`**: snapshot before,
+  rollback on error, one op = one undo step. An operation can never
+  leave the document half-mutated, so the GUI can fire ops speculatively
+  and just show the error.
+- **Gestures never touch the document until they commit.** A gesture is
+  ephemeral state in `app/gestures.rs`; dropping it is always safe.
+  Mid-drag rendering uses `App::display_project()` — a temporary copy
+  with the gesture applied.
+- **The renderer only reads.** `render/` is a pure function; its
+  geometry vocabulary is `SheetCtx::px/px_rect`, its simulation
+  vocabulary is `SheetCtx::{sim_value, stored_bit, face_bit,
+  output_value}` — the *only* places drawing asks the simulation
+  anything.
+- **The engine never learns GUI concepts.** `convert.rs` lowers const
+  (→ input-less DFF) and the whole bundle layer (→ per-lane wires)
+  before the expander runs. If a feature needs engine support, lower it
+  in convert instead.
+- **Frontend format additions are serde-default** so the engine and old
+  files ignore them (`notes`, `images`, `bundle`, `bits`,
+  `bundle_pins`, `port_layout`, `pin_positions`).
 
-1. validates against the document invariants (below); invalid intents are
-   rejected with a human-readable reason (shown in the status bar), leaving
-   the document untouched;
-2. mutates the document;
-3. participates in undo via whole-`Project` snapshots.
+## Where things live
 
-Snapshot undo is deliberate: designs are toy-scale, and snapshotting the
-whole document makes undo correct by construction — there is no operation
-whose inverse can be implemented wrong. A drag is one undo step (snapshot
-taken when the gesture commits, not per mouse-move).
+- `src/editor/` — one file per op family; `mod.rs` has the map.
+  `sheets.rs` owns `PortResolver` (what is this port? — direction and
+  signal/bundle kind, pseudo-pins included), which every validating op
+  captures before mutating.
+- `src/layout.rs` — geometry only, in **grid units**; stateless; no
+  document mutation. Half-grid port slots are what make straight wires
+  line up across components.
+- `src/bin/gui/app/` — `mod.rs` has the map. The infinite zoom lives in
+  `view.rs`: the camera is always in the focused sheet's coordinates,
+  and descending/ascending re-expresses it through `SheetMap`s so
+  hand-offs are visually invisible and floats stay bounded at any depth.
+- `src/bin/gui/render/` — `mod.rs` has the map, the paint helpers and
+  `SheetCtx`. `parts.rs` shows the pattern the rest of the renderer
+  follows: measure once into a shape struct, then one small draw
+  function per conceptual element.
+- Tests live next to their subject (`editor/*tests*.rs` and the
+  `app/*_tests.rs` files); the gesture tests drive the real state
+  machine through a `Driver` that moves a fake cursor.
 
-Operations are generic over a **sheet** — either the top level
-(`Project.components` / `Project.wire_nets`) or the inside of one
-abstraction (`ProjectAbstraction.components` / `.wire_nets`). Abstraction
-editing is the same editor pointed at a different sheet.
+## Verification
 
-### Document invariants (enforced by every editor op)
-- Component IDs are unique per sheet; generated as `nand_1`, `dff_2`, …
-- A wire net has at most one source, and it is always an *output* port.
-- An input port is a sink of at most one net across the whole sheet.
-  Connecting to an occupied input replaces the old connection.
-- At most one `clk` component per design (compiler rule, enforced at edit
-  time rather than at compile time).
-- Deleting a component removes every reference to it: nets it sources lose
-  their source, nets it sinks drop that sink, segments touching its ports
-  are removed, and nets left with no logical endpoints are deleted.
-- Segments only reference junctions that exist in their net and ports that
-  exist on the sheet.
-- Components never overlap: moves/placements that would overlap another
-  footprint are rejected (the drag preview shows invalid-red and the drop
-  snaps back).
-
-### Layout (`layout.rs`) — the "intermediate representation"
-Pure functions from document to geometry; holds no state. Given a component
-(primitive or abstraction instance) it yields the footprint in grid units and
-the position/direction/kind of every port. Given a net it yields the routed
-polyline of every segment. Hit-testing ("what is under this grid point:
-port / body / wire / nothing") lives here too, so interaction logic never
-does its own geometry math.
-
-Everything is in **grid units** (one cell = 40 px at zoom 1). Component
-positions snap to integer cells; ports sit on component edges at cell
-centers. `pos`, and abstraction `width`/`height`, are stored in grid units.
-
-### Wire model
-The document stores logical connectivity (`source`/`sinks`) *and* visual
-routing (`junctions`/`segments`), as before. The rules that keep them honest:
-
-- Segment endpoints reference ports symbolically, so wires follow components
-  automatically — there are no stored wire pixel-coordinates to go stale.
-- There is exactly **one** routing algorithm (`layout::route_segment`): a
-  deterministic orthogonal elbow between two points with port stub-outs. The
-  committed wire, the live drag preview, and hit-testing all use it. The
-  preview can therefore never differ from the wire you end up with.
-- `connect(output, input)` merges into the existing net of that output (a
-  net = one source, many sinks) and appends a port→port segment. Junctions
-  are optional user-placed branch points, not an implicit side effect.
-
-### Interaction (`app.rs`)
-A single gesture enum — `Idle`, `Panning`, `PlacingComponent`,
-`DraggingComponents`, `DrawingWire`, `BandSelecting` — so it is impossible
-to be in two gestures at once. Gestures hold only ephemeral data (anchor
-point, ghost position, pending port) and never touch the document until they
-commit exactly once at mouse-up. `Esc` (or starting undo, entering run mode,
-losing window focus) cancels the active gesture by simply dropping it — the
-document was never touched, so there is nothing to roll back.
-
-### Renderer (`render.rs`, `theme.rs`)
-Pure: draws (document, gesture, sim values, camera) each frame. Light theme.
-No retained scene graph, no cached positions.
-
-### Simulation (`sim.rs`)
-`Mode::Edit` / `Mode::Run`. Entering Run converts → expands → compiles the
-project; errors land in the status bar and you stay in Edit. Run mode locks
-editing and supports stepping the clock forward *and back* — states are
-recomputed by replaying from step 0, which is trivially cheap at toy scale
-and keeps the session stateless. A wire is energized iff its net's source
-value is true in the current step (abstraction outputs resolve through the
-expander's aliases).
-
-## Testing
-The editor and layout layers are pure Rust with no GL dependency and carry
-the edge-case burden: invariant enforcement, connect/delete/undo interactions,
-hit-testing. The renderer is verified visually via `--screenshot` (headless
-Xvfb render to PNG).
+- `cargo test --lib` (152) + `cargo test --features gui --bin
+  diycpu-gui` (47); clippy is kept at zero warnings.
+- Headless visuals: `Xvfb :99 &`, then `diycpu-gui file.json
+  --screenshot out.png` with `--run N`, `--sheet name`, `--camera
+  z,x,y`, `--cursor gx,gy`, `--dialog`, `--image-dialog`, `--anim-t s`.
+  Refactors are checked by pixel-diffing screenshots before and after.
+- femtovg gotcha: `set_size(w, h, 1.0)` always — we draw in physical
+  pixels, and a real dpi would double-scale glyphs into blur.

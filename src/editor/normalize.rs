@@ -422,7 +422,7 @@ pub(crate) fn normalize_sheet(
         drop_orphan_junctions(net);
     }
     split_all_nets(wire_nets);
-    let ctx = KindCtx {
+    let ctx = PortResolver {
         abstractions: abstractions.to_vec(),
         interface_outputs: interface_inputs.as_ref().map(|_| vec![]),
         interface_inputs,

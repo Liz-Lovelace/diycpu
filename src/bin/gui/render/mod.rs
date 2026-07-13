@@ -1,5 +1,17 @@
 //! The renderer: a pure function of (document, gesture, simulation, camera).
 //! Nothing here is stateful except the loaded fonts and the media cache.
+//!
+//! The map:
+//! - this file — the `Renderer`, draw() order, `SheetCtx` (one sheet's
+//!   draw context + THE sim-value lookups), text and paint helpers
+//! - `world` — the recursive sheet tree and the grid
+//! - `parts` — one component: shape, body, face, ports
+//! - `wires` — nets, the drawing preview, derived output-pin wires
+//! - `pins` — interface pins on an abstraction sheet
+//! - `media` — the GPU image cache and everything that blits pictures
+//! - `overlays` — band, ghosts, the hover cog
+//! - `chrome` — palette, toolbar, status bar
+//! - `dialogs` — modal layers and prompts
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;

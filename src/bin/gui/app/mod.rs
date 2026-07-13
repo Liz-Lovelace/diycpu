@@ -3,6 +3,15 @@
 //! gestures collect intent and commit through `Editor` operations exactly
 //! once, so cancelling a gesture (Esc, right-click, focus loss) is always
 //! just dropping it.
+//!
+//! The map:
+//! - this file — the `App` state and its shared vocabulary
+//! - `view` — the zoomable world: focus descent/ascent, camera rebasing
+//! - `gestures` — the input state machine (mouse, keys, wire drawing)
+//! - `actions` — commands: buttons, shortcuts, prompts, clipboard
+//! - `dialogs` — the layout and image dialogs (geometry + mouse)
+//! - `cog` — the hover gear and where it leads
+//! - `files` — projects on disk, autosave, media import, the starter
 
 use std::path::PathBuf;
 

@@ -174,7 +174,7 @@ impl Editor {
                             })
                         });
                     }
-                    let ctx = KindCtx {
+                    let ctx = PortResolver {
                         abstractions: abstractions_snapshot,
                         interface_inputs: Some(def.inputs.clone()),
                         interface_outputs: Some(def.outputs.keys().cloned().collect()),
@@ -233,7 +233,7 @@ impl Editor {
                 } else {
                     abstractions_snapshot.get(sheet_index - 1)
                 };
-                let ctx = KindCtx {
+                let ctx = PortResolver {
                     abstractions: abstractions_snapshot.clone(),
                     interface_inputs: interface.map(|a| a.inputs.clone()),
                     interface_outputs: interface

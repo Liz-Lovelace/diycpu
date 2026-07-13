@@ -17,7 +17,7 @@ impl Editor {
             if !(2..=32).contains(&width) {
                 return Err(EditError::BadBundleWidth);
             }
-            let ctx = KindCtx::new(project, sheet)?;
+            let ctx = PortResolver::new(project, sheet)?;
             let abstractions = project.abstractions.clone();
             let (components, wire_nets) =
                 sheet_mut(project, sheet).ok_or(EditError::BadSheet)?;
@@ -149,7 +149,7 @@ impl Editor {
                 } else {
                     abstractions_snapshot.get(sheet_index - 1)
                 };
-                let ctx = KindCtx {
+                let ctx = PortResolver {
                     abstractions: abstractions_snapshot.clone(),
                     interface_inputs: interface.map(|a| a.inputs.clone()),
                     interface_outputs: interface

@@ -29,7 +29,7 @@ impl Editor {
     ) -> Result<(), EditError> {
         let bends = bends.to_vec();
         self.mutate(move |project, sheet| {
-            let ctx = KindCtx::new(project, sheet)?;
+            let ctx = PortResolver::new(project, sheet)?;
             let (components, _) = sheet_of(project, sheet).ok_or(EditError::BadSheet)?;
 
             // Draw from the output side so bend order matches wire flow.
@@ -114,7 +114,7 @@ impl Editor {
         let net_id = net_id.to_string();
         let junction_id = junction_id.to_string();
         self.mutate(move |project, sheet| {
-            let ctx = KindCtx::new(project, sheet)?;
+            let ctx = PortResolver::new(project, sheet)?;
             let (components, wire_nets) =
                 sheet_mut(project, sheet).ok_or(EditError::BadSheet)?;
             let net = wire_nets
@@ -144,7 +144,7 @@ impl Editor {
     ) -> Result<(), EditError> {
         let net_id = net_id.to_string();
         self.mutate(move |project, sheet| {
-            let ctx = KindCtx::new(project, sheet)?;
+            let ctx = PortResolver::new(project, sheet)?;
             let (components, wire_nets) =
                 sheet_mut(project, sheet).ok_or(EditError::BadSheet)?;
             let net = wire_nets
@@ -203,7 +203,7 @@ impl Editor {
     /// any nodes that now dangle as reusable stubs).
     pub fn disconnect_sink(&mut self, sink: PortRef) -> Result<(), EditError> {
         self.mutate(move |project, sheet| {
-            let ctx = KindCtx::new(project, sheet)?;
+            let ctx = PortResolver::new(project, sheet)?;
             let (components, wire_nets) =
                 sheet_mut(project, sheet).ok_or(EditError::BadSheet)?;
             detach_port(wire_nets, &sink);
@@ -271,7 +271,7 @@ pub(crate) fn attach_wire(
     from: &WirePoint,
     to: &WirePoint,
 ) -> Result<WireAttach, EditError> {
-    let ctx = KindCtx::new(project, sheet)?;
+    let ctx = PortResolver::new(project, sheet)?;
 
     // Output-pin connections are outputs-map writes, not net edits —
     // except BUNDLE output pins, which take real bundle nets (the lowering
@@ -459,7 +459,7 @@ pub(crate) fn attach_wire(
 pub(crate) fn attach_to_output_pin(
     project: &mut Project,
     sheet: SheetRef,
-    ctx: &KindCtx,
+    ctx: &PortResolver,
     from: &WirePoint,
     to: &WirePoint,
 ) -> Result<WireAttach, EditError> {
@@ -546,7 +546,7 @@ pub(crate) fn detach_port(wire_nets: &mut [WireNet], port: &PortRef) {
 pub(crate) fn sync_net_logic(
     net: &mut WireNet,
     components: &[ProjectComponent],
-    ctx: &KindCtx,
+    ctx: &PortResolver,
 ) -> Result<(), EditError> {
     let mut source: Option<PortRef> = None;
     let mut sinks: Vec<PortRef> = Vec::new();
@@ -716,7 +716,7 @@ pub(crate) fn split_off_islands(
 pub(crate) fn repair_nets(
     wire_nets: &mut Vec<WireNet>,
     components: &[ProjectComponent],
-    ctx: &KindCtx,
+    ctx: &PortResolver,
 ) -> Result<(), EditError> {
     for net in wire_nets.iter_mut() {
         drop_orphan_junctions(net);

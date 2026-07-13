@@ -175,7 +175,7 @@ impl Editor {
         let segments = segments.to_vec();
         let pin_wires = pin_wires.to_vec();
         self.mutate(move |project, sheet| {
-            let ctx = KindCtx::new(project, sheet)?;
+            let ctx = PortResolver::new(project, sheet)?;
             let (components, wire_nets) =
                 sheet_mut(project, sheet).ok_or(EditError::BadSheet)?;
             for id in &ids {

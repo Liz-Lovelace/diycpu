@@ -76,7 +76,7 @@ impl Editor {
     ) -> Result<PastedIds, EditError> {
         let fragment = fragment.clone();
         self.mutate(move |project, sheet| {
-            let ctx = KindCtx::new(project, sheet)?;
+            let ctx = PortResolver::new(project, sheet)?;
             let abstractions = project.abstractions.clone();
 
             // Types must exist here, and pasting an abstraction into its

@@ -3,8 +3,10 @@
 
 use diycpu::layout::{Rect, SheetMap};
 
-/// Pixels per grid cell at zoom 1.
-pub const CELL: f32 = 40.0;
+/// Pixels per grid cell at zoom 1. Deliberately small relative to text
+/// (roughly 1.6× the label size): designs read dense and sleek, and the
+/// text stays comfortably legible at the default zoom.
+pub const CELL: f32 = 22.0;
 
 // Zoom limits per focus level: descending into an abstraction rebases the
 // camera into the child's coordinates, so these bound each level, not the

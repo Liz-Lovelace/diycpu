@@ -695,9 +695,11 @@ pub fn instance_inner_map(
 // rectangle and the rendered text always agree (no font metrics needed).
 
 pub const NOTE_WRAP_CHARS: usize = 26;
-pub const NOTE_LINE_HEIGHT: f32 = 0.55;
-pub const NOTE_CHAR_WIDTH: f32 = 0.24;
-pub const NOTE_PADDING: f32 = 0.3;
+// Sized against the note font, which is fixed in pixels — these grid
+// constants are tuned to CELL so the wrapped text fills its box.
+pub const NOTE_LINE_HEIGHT: f32 = 1.0;
+pub const NOTE_CHAR_WIDTH: f32 = 0.44;
+pub const NOTE_PADDING: f32 = 0.55;
 
 /// Greedy word wrap at [`NOTE_WRAP_CHARS`]; over-long words are hard-broken.
 pub fn wrap_note_text(text: &str) -> Vec<String> {

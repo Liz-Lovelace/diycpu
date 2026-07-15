@@ -81,7 +81,7 @@ impl App {
         let tl = self.camera.grid_to_screen([target.x, target.y]);
         let w = target.w * self.camera.cell_px();
         let h = target.h * self.camera.cell_px();
-        if w < COG_SIZE * 2.4 || h < COG_SIZE * 1.3 {
+        if w < COG_SIZE * 2.2 || h < COG_SIZE * 1.3 {
             return None; // too small on screen for a corner button
         }
         Some((
@@ -165,4 +165,4 @@ pub enum CogAction {
 }
 
 /// The gear button's screen-space size.
-pub(crate) const COG_SIZE: f32 = 20.0;
+pub(crate) const COG_SIZE: f32 = 16.0;

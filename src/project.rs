@@ -46,7 +46,7 @@ pub struct MediaImage {
 }
 
 fn default_image_size() -> [f32; 2] {
-    [6.0, 4.0]
+    [11.0, 7.0]
 }
 
 /// A component as stored in a project file.
@@ -378,7 +378,7 @@ mod tests {
         let project: Project = serde_json::from_str(json).unwrap();
         assert_eq!(project.images.len(), 2);
         assert_eq!(project.images[0].file, "media/cat.gif");
-        assert_eq!(project.images[1].size, [6.0, 4.0]); // default size
+        assert_eq!(project.images[1].size, [11.0, 7.0]); // default size
         let back = serde_json::to_string(&project).unwrap();
         let again: Project = serde_json::from_str(&back).unwrap();
         assert_eq!(again.images, project.images);

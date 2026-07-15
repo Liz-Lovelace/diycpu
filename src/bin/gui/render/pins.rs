@@ -82,7 +82,7 @@ impl Renderer {
             // Port circle (wire attachment point) — square when the pin
             // carries a bundle. Input pins drive wires, so they get the
             // filled "source" look.
-            let r = (5.0 * zoom).clamp(2.5, 8.0);
+            let r = (4.0 * zoom).clamp(2.0, 6.5);
             let mut c = Path::new();
             if pin.bundle.is_some() {
                 c.rounded_rect(s[0] - r, s[1] - r, r * 2.0, r * 2.0, r * 0.3);

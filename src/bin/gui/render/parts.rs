@@ -225,7 +225,10 @@ impl Renderer {
     ) {
         let [cx, cy] = shape.center();
 
-        let label_size = (13.0 * shape.zoom).clamp(5.0, 22.0);
+        // Cap the label so long names stay inside the body.
+        let chars = comp.component_type.chars().count().max(1) as f32;
+        let fit = shape.px.w * 0.78 / (chars * 0.55);
+        let label_size = (13.0 * shape.zoom).min(fit).clamp(5.0, 22.0);
         let wants_label = !is_primitive(&comp.component_type)
             && !layout::is_bundle_component(&comp.component_type);
         if wants_label && label_size >= 5.0 {
@@ -251,7 +254,7 @@ impl Renderer {
                 // A constant signal's face is the value it feeds out, with
                 // a ring saying "this is a source".
                 let value = ctx.face_bit(app, comp);
-                let digit_size = (18.0 * shape.zoom).clamp(6.0, 30.0);
+                let digit_size = (14.0 * shape.zoom).clamp(6.0, 24.0);
                 let color = value_digit_color(value);
                 let center = [shape.px.x + shape.px.w * 0.45, cy];
                 stroke_circle(
@@ -267,7 +270,7 @@ impl Renderer {
                 // The flip-flop's face IS its bit: init while editing, live
                 // state while running. Double-click flips the init.
                 let value = ctx.face_bit(app, comp);
-                let digit_size = (20.0 * shape.zoom).clamp(6.0, 32.0);
+                let digit_size = (15.0 * shape.zoom).clamp(6.0, 26.0);
                 self.draw_bit_digit(
                     canvas,
                     [shape.px.x + shape.px.w * 0.58, cy],
@@ -328,10 +331,13 @@ impl Renderer {
         };
         let show_labels = shape.zoom >= 0.5
             && (comp.component_type == "dff" || !is_primitive(&comp.component_type));
+        let skip_label = |port: &layout::PortGeom| {
+            layout::is_bundle_component(&comp.component_type) && port.info.name == "bundle"
+        };
 
         for port in &layout::component_ports(ctx.abstractions, comp) {
             let s = ctx.px(port.pos);
-            let r = (5.0 * shape.zoom).clamp(1.0, 8.0);
+            let r = (3.5 * shape.zoom).clamp(1.0, 6.0);
             let hovered = hovered_port.as_deref() == Some(port.info.name.as_str());
 
             let fill = match port.info.kind {
@@ -367,9 +373,9 @@ impl Renderer {
             canvas.stroke_path(&p, &ring);
 
             // Port names belong to the closed look.
-            if show_labels && chrome_alpha > 0.01 {
+            if show_labels && chrome_alpha > 0.01 && !skip_label(port) {
                 canvas.set_global_alpha(chrome_alpha);
-                self.draw_port_label(canvas, port, s, r + 4.0, shape.zoom);
+                self.draw_port_label(canvas, port, s, r + 3.0, shape.zoom);
                 canvas.set_global_alpha(ctx.alpha);
             }
         }
@@ -384,7 +390,7 @@ impl Renderer {
         pad: f32,
         zoom: f32,
     ) {
-        let size = (9.0 * zoom).clamp(7.0, 13.0);
+        let size = (8.0 * zoom).clamp(6.0, 12.0);
         let (lx, ly, align, baseline) = match port.side {
             layout::Side::Left => (s[0] + pad, s[1], Align::Left, Baseline::Middle),
             layout::Side::Right => (s[0] - pad, s[1], Align::Right, Baseline::Middle),

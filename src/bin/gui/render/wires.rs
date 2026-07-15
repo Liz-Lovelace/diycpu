@@ -34,14 +34,14 @@ impl Renderer {
         let abstractions = ctx.abstractions;
         let (components, wire_nets) = (ctx.components, ctx.wire_nets);
         let zoom = ctx.zoom();
-        let width = (2.5 * zoom).clamp(0.5, 4.5);
+        let width = (2.0 * zoom).clamp(0.5, 4.0);
 
         for net in wire_nets {
             let color = self.net_color(app, ctx, net);
             // Bundles draw as a wide rail with a light core: visibly "many
             // wires running together".
             let width = if net.bundle {
-                (6.0 * zoom).clamp(2.5, 10.0)
+                (5.0 * zoom).clamp(2.5, 9.0)
             } else {
                 width
             };
@@ -129,7 +129,7 @@ impl Renderer {
                     );
                 let s = ctx.view.to_screen(junction.pos);
                 let mut p = Path::new();
-                p.circle(s[0], s[1], (3.5 * zoom).clamp(1.0, 5.5));
+                p.circle(s[0], s[1], (3.0 * zoom).clamp(1.0, 5.0));
                 canvas.fill_path(&p, &Paint::color(color));
                 if hovered && !app.is_running() {
                     let mut ring_path = Path::new();

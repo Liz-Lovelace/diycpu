@@ -96,8 +96,8 @@ fn placing_an_image_copies_it_into_the_project_media_folder() {
     assert_eq!(d.app.editor.project.images.len(), 1, "{}", d.app.status.text);
     let img = &d.app.editor.project.images[0];
     assert_eq!(img.file, "media/photo.png");
-    // 4x2 source → width 6 cells, height keeps the 1:2 aspect.
-    assert_eq!(img.size, [6.0, 3.0]);
+    // 4x2 source → width 11 cells, height keeps the 1:2 aspect.
+    assert_eq!(img.size, [11.0, 5.5]);
     assert!(dir.join("media/photo.png").exists(), "file was copied");
 
     // Placing the same file again gets a fresh name, not a clobber.

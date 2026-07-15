@@ -322,7 +322,7 @@ impl App {
         match Self::validate_image_file(&source) {
             Ok((iw, ih)) => {
                 let aspect = ih as f32 / iw.max(1) as f32;
-                let w = 6.0f32;
+                let w = 11.0f32;
                 let h = (((w * aspect) * 2.0).round() / 2.0).clamp(1.0, 24.0);
                 self.gesture = Gesture::PlacingImage {
                     source,

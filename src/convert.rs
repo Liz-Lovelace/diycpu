@@ -153,6 +153,31 @@ fn lower_bundles(original: &Project) -> Result<Project, ConvertError> {
             Some(&mut a.outputs),
         )?;
     }
+
+    // A bundle output pin always presents ALL its lanes: any lane its
+    // sheet doesn't drive (a narrower bundle wired in, or nothing at all)
+    // reads as constant 0 — same rule as unconnected inputs everywhere.
+    for a in &mut p.abstractions {
+        for (pin, w) in a.bundle_pins.clone() {
+            if !a.outputs.contains_key(&lane_name(&pin, 0)) {
+                continue; // an input pin
+            }
+            for k in 0..w {
+                let lane = lane_name(&pin, k);
+                if a.outputs.get(&lane).is_none_or(|t| t.is_empty()) {
+                    let zero = format!("__zero_{lane}");
+                    a.components.push(ProjectComponent {
+                        id: zero.clone(),
+                        component_type: "dff".into(),
+                        init: Some(false),
+                        bits: None,
+                        pos: [0.0, 0.0],
+                    });
+                    a.outputs.insert(lane, zero);
+                }
+            }
+        }
+    }
     Ok(p)
 }
 

@@ -12,6 +12,66 @@ use crate::theme;
 use super::*;
 
 
+/// The distinct port endpoints of a bundle net: position, width, and the
+/// inward direction of their segment (labels sit a step along the wire,
+/// clear of the port socket). These are the ends that get numbered, and
+/// the evidence of a mismatch.
+fn bundle_endpoints(
+    ctx: &SheetCtx,
+    net: &WireNet,
+) -> Vec<([f32; 2], u32, [f32; 2])> {
+    let mut out: Vec<([f32; 2], u32, [f32; 2])> = Vec::new();
+    for seg in &net.segments {
+        for (e, other) in [(&seg.from, &seg.to), (&seg.to, &seg.from)] {
+            let diycpu::project::Endpoint::Port {
+                component_id,
+                port_name,
+            } = e
+            else {
+                continue;
+            };
+            let port = diycpu::project::PortRef {
+                component_id: component_id.clone(),
+                port_name: port_name.clone(),
+            };
+            let Some(layout::WireKind::Bundle(w)) = layout::wire_kind_any(
+                ctx.abstractions,
+                ctx.components,
+                ctx.interface,
+                &port,
+            ) else {
+                continue;
+            };
+            let Some(pos) = layout::resolve_endpoint(
+                ctx.abstractions,
+                ctx.components,
+                ctx.interface,
+                &net.junctions,
+                e,
+            ) else {
+                continue;
+            };
+            let inward = layout::resolve_endpoint(
+                ctx.abstractions,
+                ctx.components,
+                ctx.interface,
+                &net.junctions,
+                other,
+            )
+            .map(|o| {
+                let d = [o[0] - pos[0], o[1] - pos[1]];
+                let len = (d[0] * d[0] + d[1] * d[1]).sqrt().max(1e-6);
+                [d[0] / len, d[1] / len]
+            })
+            .unwrap_or([0.0, -1.0]);
+            if !out.iter().any(|(p, _, _)| *p == pos) {
+                out.push((pos, w, inward));
+            }
+        }
+    }
+    out
+}
+
 impl Renderer {
     /// The display color of a whole net. Bundles carry many values, so
     /// they stay neutral; a signal net wears its driver's value.
@@ -37,7 +97,7 @@ impl Renderer {
         let width = (2.0 * zoom).clamp(0.5, 4.0);
 
         for net in wire_nets {
-            let color = self.net_color(app, ctx, net);
+            let mut color = self.net_color(app, ctx, net);
             // Bundles draw as a wide rail with a light core: visibly "many
             // wires running together".
             let width = if net.bundle {
@@ -45,6 +105,24 @@ impl Renderer {
             } else {
                 width
             };
+
+            // A width mismatch (one end re-configured after connecting) is
+            // a warned state, not a destroyed one: the rail flashes red.
+            // Lanes still flow, matched from bit 0.
+            let ends = if net.bundle {
+                bundle_endpoints(ctx, net)
+            } else {
+                Vec::new()
+            };
+            let mismatched = ends
+                .first()
+                .is_some_and(|(_, w0, _)| ends.iter().any(|(_, w, _)| w != w0));
+            if mismatched {
+                self.animating.set(true);
+                if (app.anim_seconds * 4.0).fract() < 0.5 {
+                    color = theme::danger();
+                }
+            }
 
             for i in 0..net.segments.len() {
                 let Some(pts) =
@@ -82,41 +160,28 @@ impl Renderer {
                 }
             }
 
-            // The classic bus tick with the lane count, on the first segment.
+            // Each end of the bus wears its width — when the two ends
+            // disagree, the numbers say exactly how.
             if net.bundle && zoom >= 0.45 {
-                if let Some(pts) =
-                    layout::route_segment(abstractions, components, ctx.interface, net, 0)
-                {
-                    if let [a, b] = pts[..] {
-                        let m = ctx.view.to_screen([(a[0] + b[0]) / 2.0, (a[1] + b[1]) / 2.0]);
-                        let t = (9.0 * zoom).clamp(6.0, 13.0);
-                        let mut tick = Path::new();
-                        tick.move_to(m[0] - t * 0.4, m[1] + t * 0.6);
-                        tick.line_to(m[0] + t * 0.4, m[1] - t * 0.6);
-                        let mut tp = Paint::color(theme::wire());
-                        tp.set_line_width(1.5);
-                        canvas.stroke_path(&tick, &tp);
-                        let w = net
-                            .source
-                            .as_ref()
-                            .and_then(|s| app.port_lane(s))
-                            .and_then(|k| match k {
-                                layout::WireKind::Bundle(w) => Some(w),
-                                layout::WireKind::Signal => None,
-                            });
-                        if let Some(w) = w {
-                            self.text(
-                                canvas,
-                                m[0] + t * 0.7,
-                                m[1] - t * 0.6,
-                                &format!("{w}"),
-                                t,
-                                theme::text_dim(),
-                                Align::Left,
-                                Baseline::Middle,
-                            );
-                        }
-                    }
+                let size = (8.0 * zoom).clamp(6.0, 12.0);
+                let step = (14.0 * zoom).clamp(10.0, 20.0);
+                for (pos, w, inward) in &ends {
+                    let s = ctx.px(*pos);
+                    // A step along the wire, then lifted off it.
+                    let (x, y) = (
+                        s[0] + inward[0] * step - inward[1] * size * 0.8,
+                        s[1] + inward[1] * step + inward[0] * size * 0.8,
+                    );
+                    self.text(
+                        canvas,
+                        x,
+                        y,
+                        &format!("{w}"),
+                        size,
+                        if mismatched { theme::danger() } else { theme::text_dim() },
+                        Align::Center,
+                        Baseline::Middle,
+                    );
                 }
             }
 

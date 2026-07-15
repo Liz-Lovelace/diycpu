@@ -114,6 +114,12 @@ impl Editor {
                     },
                 );
             }
+            let grown_name = def.name.clone();
+            // The new pin may have grown the body: every placed instance
+            // must still fit.
+            if resized_instances_collide(project, &grown_name) {
+                return Err(EditError::Overlap);
+            }
 
             // Pins are free-floating objects: give the new one a concrete
             // home on the rail so it never drifts as content changes.
@@ -319,6 +325,10 @@ impl Editor {
                 },
             );
             ensure_interface_fits(def);
+            let grown_name = def.name.clone();
+            if resized_instances_collide(project, &grown_name) {
+                return Err(EditError::Overlap);
+            }
             Ok(())
         })
     }
@@ -332,6 +342,11 @@ impl Editor {
                 .ok_or(EditError::BadSheet)?;
             def.width = w.clamp(2.0, 40.0);
             def.height = h.clamp(1.5, 40.0);
+            let name = def.name.clone();
+            // Every instance everywhere must still fit where it stands.
+            if resized_instances_collide(project, &name) {
+                return Err(EditError::Overlap);
+            }
             Ok(())
         })
     }
@@ -577,6 +592,24 @@ impl Editor {
 
 /// Grow an abstraction's closed rectangle so every side has a half-grid
 /// slot for each of its ports (never shrinks).
+/// Would any placed instance of `type_name` now overlap a neighbour?
+/// Resizes must never push components into each other — on any sheet.
+pub(crate) fn resized_instances_collide(project: &Project, type_name: &str) -> bool {
+    let sheets = std::iter::once(&project.components)
+        .chain(project.abstractions.iter().map(|a| &a.components));
+    for components in sheets {
+        for inst in components.iter().filter(|c| c.component_type == type_name) {
+            let rect = layout::footprint(&project.abstractions, inst);
+            for other in components.iter().filter(|c| c.id != inst.id) {
+                if layout::footprint(&project.abstractions, other).intersects(&rect) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 pub(crate) fn ensure_interface_fits(def: &mut crate::project::ProjectAbstraction) {
     use crate::project::PortSide;
     let side_of = |name: &str, default: PortSide| -> PortSide {

@@ -345,6 +345,49 @@ pub(crate) fn attach_wire(
         }
     };
 
+    // Refuse joining two DIFFERENT widths: connecting is the moment the
+    // user can pick the right port, so mismatches never start here. (They
+    // can still ARISE later from config changes; those flash instead.)
+    let width_at = |wp: &WirePoint| -> Option<u32> {
+        match wp {
+            WirePoint::Port(p) => match ctx.wire_kind_of(components, p) {
+                Ok(layout::WireKind::Bundle(w)) => Some(w),
+                _ => None,
+            },
+            WirePoint::Junction { net_id, .. } => {
+                let net = wire_nets.iter().find(|n| &n.id == net_id)?;
+                if !net.bundle {
+                    return None;
+                }
+                net.segments
+                    .iter()
+                    .flat_map(|seg| [&seg.from, &seg.to])
+                    .find_map(|e| match e {
+                        Endpoint::Port {
+                            component_id,
+                            port_name,
+                        } => {
+                            let p = PortRef {
+                                component_id: component_id.clone(),
+                                port_name: port_name.clone(),
+                            };
+                            match ctx.wire_kind_of(components, &p) {
+                                Ok(layout::WireKind::Bundle(w)) => Some(w),
+                                _ => None,
+                            }
+                        }
+                        Endpoint::Junction { .. } => None,
+                    })
+            }
+            WirePoint::New(_) => None,
+        }
+    };
+    if let (Some(a), Some(b)) = (width_at(from), width_at(to)) {
+        if a != b {
+            return Err(EditError::BundleWidthMismatch(a, b));
+        }
+    }
+
     let net_from = resolve_net(wire_nets, from)?;
     let net_to = resolve_net(wire_nets, to)?;
 
@@ -550,7 +593,6 @@ pub(crate) fn sync_net_logic(
 ) -> Result<(), EditError> {
     let mut source: Option<PortRef> = None;
     let mut sinks: Vec<PortRef> = Vec::new();
-    let mut lane_width: Option<u32> = None;
     for seg in &net.segments {
         for e in [&seg.from, &seg.to] {
             let Endpoint::Port {
@@ -564,17 +606,15 @@ pub(crate) fn sync_net_logic(
                 component_id: component_id.clone(),
                 port_name: port_name.clone(),
             };
-            // Bundle nets take only bundle ports (of one width); signal
-            // nets take only signal ports. The two lanes never mix.
+            // Bundle nets take only bundle ports; signal nets take only
+            // signal ports. The two lanes never mix. Widths, though, MAY
+            // disagree here: a config change can shrink or grow one end of
+            // an existing connection, and that's a warned (flashing) state
+            // rather than a destroyed one. New mismatched joins are
+            // refused at attach time instead.
             match (net.bundle, ctx.wire_kind_of(components, &port)?) {
                 (false, layout::WireKind::Signal) => {}
-                (true, layout::WireKind::Bundle(w)) => match lane_width {
-                    None => lane_width = Some(w),
-                    Some(prev) if prev != w => {
-                        return Err(EditError::BundleWidthMismatch(prev, w))
-                    }
-                    _ => {}
-                },
+                (true, layout::WireKind::Bundle(_)) => {}
                 _ => return Err(EditError::MixedWireKinds),
             }
             match ctx.kind_of(components, &port)? {

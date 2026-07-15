@@ -9,8 +9,9 @@ use super::*;
 
 
 impl Editor {
-    /// Change a bundler/unbundler's lane count. Wires on removed lanes and
-    /// on the (re-sized) bundle port are disconnected.
+    /// Change a bundler/unbundler's lane count. Wires on removed lane
+    /// ports are disconnected (the ports are gone); the bundle wire stays
+    /// connected — if the other end no longer matches, it flashes.
     pub fn set_bundle_width(&mut self, id: &str, width: u32) -> Result<(), EditError> {
         let id = id.to_string();
         self.mutate(move |project, sheet| {
@@ -42,16 +43,13 @@ impl Editor {
                 }
             }
 
-            // Wires on lanes that no longer exist go away; the bundle port
-            // changed width, so its bundle wire goes too (reconnect it).
+            // Wires on lanes that no longer exist go away with their ports.
             for net in wire_nets.iter_mut() {
                 net.segments.retain(|seg| {
                     ![&seg.from, &seg.to].iter().any(|e| {
                         matches!(e, Endpoint::Port { component_id, port_name }
                             if *component_id == id
-                                && (*port_name == "bundle"
-                                    || port_name.parse::<u32>()
-                                        .is_ok_and(|k| k >= width)))
+                                && port_name.parse::<u32>().is_ok_and(|k| k >= width))
                     })
                 });
             }
@@ -94,6 +92,13 @@ impl Editor {
                 None => {
                     def.bundle_pins.remove(&name);
                 }
+            }
+            // A width-only change keeps every wire: the connection may now
+            // be mismatched, which renders as a flashing warning instead of
+            // a silent disconnect. Only a KIND change (signal ↔ bundle)
+            // scrubs, below — those wires are genuinely illegal now.
+            if before.is_some() && width.is_some() {
+                return Ok(());
             }
             // A passthrough output forwarding this pin can't survive a
             // kind change.

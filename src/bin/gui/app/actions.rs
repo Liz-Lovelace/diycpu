@@ -393,10 +393,14 @@ impl App {
                     Ok(()) => {
                         if let Some(width) = bundle {
                             match self.editor.set_pin_bundle_width(&pin_name, width) {
-                                Ok(()) => self.info(format!(
-                                    "Pin \"{pin_name}\" now carries {} lines — its wires were disconnected",
-                                    width.unwrap_or(0)
-                                )),
+                                Ok(()) => self.info(match width {
+                                    Some(w) => format!(
+                                        "Pin \"{pin_name}\" now carries {w} lines — mismatched wires flash until both ends agree"
+                                    ),
+                                    None => format!(
+                                        "Pin \"{pin_name}\" is a single wire again — its old bundle wiring was disconnected"
+                                    ),
+                                }),
                                 Err(e) => self.error(e.to_string()),
                             }
                         } else {
@@ -424,7 +428,7 @@ impl App {
                 };
                 match self.editor.set_bundle_width(&id, width) {
                     Ok(()) => self.info(format!(
-                        "{width} lines — wires on removed or resized ports were disconnected"
+                        "{width} lines — a mismatched bundle wire flashes until the other end agrees"
                     )),
                     Err(e) => retry(self, e, prompt),
                 }

@@ -139,7 +139,8 @@ impl Editor {
                 let id = generate_id(components, &original.component_type);
                 id_map.insert(original.id.clone(), id.clone());
                 components.push(ProjectComponent {
-                    bits: None,
+                    display: original.display.clone(),
+                    bits: original.bits,
                     id: id.clone(),
                     component_type: original.component_type.clone(),
                     init: original.init,

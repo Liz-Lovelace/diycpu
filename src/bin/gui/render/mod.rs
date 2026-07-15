@@ -31,7 +31,9 @@ use diycpu::project::{Note, ProjectAbstraction};
 
 mod chrome;
 mod dialogs;
+mod displays;
 mod media;
+mod segments;
 mod overlays;
 mod parts;
 mod pins;
@@ -119,6 +121,63 @@ impl SheetCtx<'_> {
         comp: &diycpu::project::ProjectComponent,
     ) -> bool {
         self.stored_bit(app, comp).or(comp.init).unwrap_or(false)
+    }
+
+    /// Every lane a display element shows, resolved to live values: one
+    /// entry per lane (a light has one), None where nothing drives it.
+    pub(crate) fn display_values(
+        &self,
+        app: &App,
+        comp: &diycpu::project::ProjectComponent,
+    ) -> Vec<Option<bool>> {
+        let Some(ports) = diycpu::layout::component_port_info(self.abstractions, comp)
+        else {
+            return Vec::new();
+        };
+        let Some(input) = ports.first() else {
+            return Vec::new();
+        };
+        match input.wire {
+            diycpu::layout::WireKind::Signal => {
+                let value = self
+                    .wire_nets
+                    .iter()
+                    .filter(|n| !n.bundle)
+                    .find(|n| {
+                        n.sinks
+                            .iter()
+                            .any(|s| s.component_id == comp.id && s.port_name == input.name)
+                    })
+                    .and_then(|n| n.source.clone())
+                    .and_then(|src| self.output_value(app, &src));
+                vec![value]
+            }
+            diycpu::layout::WireKind::Bundle(w) => {
+                let feed = self
+                    .wire_nets
+                    .iter()
+                    .filter(|n| n.bundle)
+                    .find(|n| {
+                        n.sinks
+                            .iter()
+                            .any(|s| s.component_id == comp.id && s.port_name == input.name)
+                    })
+                    .and_then(|n| n.source.clone());
+                (0..w)
+                    .map(|k| {
+                        let src = feed.as_ref()?;
+                        let lane = crate::app::resolve_bundle_lane(
+                            self.components,
+                            self.wire_nets,
+                            src,
+                            k,
+                            0,
+                        )?;
+                        self.output_value(app, &lane)
+                    })
+                    .collect()
+            }
+        }
     }
 
     /// The value behind an output port — unbundler lanes resolved to their
@@ -269,6 +328,7 @@ impl Renderer {
         self.draw_statusbar(canvas, app);
         self.draw_layout_dialog(canvas, app);
         self.draw_image_dialog(canvas, app);
+        self.draw_display_dialog(canvas, app);
         self.draw_prompt(canvas, app);
     }
 

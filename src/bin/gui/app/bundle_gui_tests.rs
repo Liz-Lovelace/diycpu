@@ -99,3 +99,87 @@ fn bundle_pins_come_from_the_name_colon_width_syntax() {
     assert!(d.app.prompt.is_some());
     d.app.handle_key(KeyInput::Escape);
 }
+
+
+#[test]
+fn display_cog_opens_settings_and_configures() {
+    let mut d = Driver::new();
+    d.place("light", [4.0, 4.0]);
+    d.move_to(center_of(&d.app, "light_1"));
+    let (rect, action) = d.app.cog().expect("displays have settings");
+    assert_eq!(
+        action,
+        CogAction::DisplaySettings {
+            id: "light_1".into()
+        }
+    );
+    d.app.mouse_moved([rect.x + rect.w / 2.0, rect.y + rect.h / 2.0]);
+    d.app.left_pressed();
+    assert!(d.app.display_dialog.is_some());
+
+    // Round shape via the variant button.
+    let geom = d.app.display_dialog_geometry().unwrap();
+    let round = geom.variants.iter().find(|(l, _, _)| l == "Round").unwrap().1;
+    d.app.cursor = [round.x + 4.0, round.y + 4.0];
+    d.app.display_dialog_pressed();
+    assert_eq!(
+        d.app.editor.project.components[0]
+            .display
+            .as_ref()
+            .and_then(|c| c.round),
+        Some(true)
+    );
+
+    // A color from the swatch row.
+    let geom = d.app.display_dialog_geometry().unwrap();
+    let swatch = geom.swatches[3].clone();
+    d.app.cursor = [swatch.1.x + 4.0, swatch.1.y + 4.0];
+    d.app.display_dialog_pressed();
+    assert_eq!(
+        d.app.editor.project.components[0]
+            .display
+            .as_ref()
+            .and_then(|c| c.color.clone()),
+        Some(swatch.0)
+    );
+
+    // Width slider dragged to the far end.
+    let geom = d.app.display_dialog_geometry().unwrap();
+    let track = geom.sliders[0].track;
+    d.app.cursor = [track.x + 4.0, track.y + track.h / 2.0];
+    d.app.display_dialog_pressed();
+    d.app.cursor = [track.x + track.w, track.y + track.h / 2.0];
+    d.app.display_dialog_moved();
+    d.app.display_dialog_released();
+    assert_eq!(
+        diycpu::layout::light_size(&d.app.editor.project.components[0])[0],
+        DISPLAY_SIZE_MAX
+    );
+
+    // Esc closes; modality held while open.
+    d.app.handle_key(KeyInput::Escape);
+    assert!(d.app.display_dialog.is_none());
+}
+
+#[test]
+fn seg_type_switch_via_dialog() {
+    let mut d = Driver::new();
+    d.place("seg", [6.0, 4.0]);
+    d.app.action_open_display_dialog("seg_1");
+    let geom = d.app.display_dialog_geometry().unwrap();
+    let eight = geom
+        .variants
+        .iter()
+        .find(|(l, _, _)| l.starts_with('8'))
+        .unwrap()
+        .1;
+    d.app.cursor = [eight.x + 4.0, eight.y + 4.0];
+    d.app.display_dialog_pressed();
+    assert_eq!(d.app.editor.project.components[0].bits, Some(8));
+    // The footprint follows the 8-segment aspect.
+    let r = diycpu::layout::footprint(
+        &d.app.editor.project.abstractions,
+        &d.app.editor.project.components[0],
+    );
+    assert!((r.w / r.h - diycpu::layout::SEG8_ASPECT).abs() < 1e-3);
+}

@@ -147,6 +147,7 @@ impl Renderer {
         }
         let valid = app.placement_is_valid(type_name);
         let ghost = ProjectComponent {
+            display: None,
             id: String::new(),
             component_type: type_name.clone(),
             init: None,

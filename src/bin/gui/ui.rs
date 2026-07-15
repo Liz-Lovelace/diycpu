@@ -78,9 +78,28 @@ pub fn ui_layout(app: &App) -> UiLayout {
         _ => None,
     };
 
-    let is_builtin =
-        |name: &str| matches!(name, "clk" | "nand" | "dff" | "const" | "note" | "image");
+    let is_builtin = |name: &str| {
+        matches!(
+            name,
+            "clk" | "nand"
+                | "dff"
+                | "const"
+                | "bundle"
+                | "unbundle"
+                | "note"
+                | "image"
+                | "light"
+                | "rgb"
+                | "seg"
+                | "face"
+        )
+    };
     for item in app.palette_items() {
+        if item == "light" {
+            y += 10.0;
+            section_headers.push(("DISPLAYS".to_string(), y + 12.0));
+            y += 24.0;
+        }
         let is_abstraction_start = !is_builtin(&item)
             && !palette_items
                 .iter()

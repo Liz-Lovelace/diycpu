@@ -51,6 +51,90 @@ pub fn is_bundle_component(component_type: &str) -> bool {
     matches!(component_type, "bundle" | "unbundle")
 }
 
+// ── Display elements ─────────────────────────────────────────────────────────
+//
+// Pure sinks that exist to be looked at: they take signals in and light
+// up. The engine never sees them (convert strips them before lowering).
+
+/// Is this a display element?
+pub fn is_display(component_type: &str) -> bool {
+    matches!(component_type, "light" | "rgb" | "seg" | "face")
+}
+
+/// Aspect ratios (w/h) of the aspect-locked display faces. The numbers
+/// come from the artwork view boxes in render/segments.rs.
+pub const SEG8_ASPECT: f32 = 267.0 / 319.0;
+pub const SEG16_ASPECT: f32 = 245.0 / 349.0;
+pub const FACE_ASPECT: f32 = 594.0 / 282.0;
+/// The face display's lane count (one per artwork color).
+pub const FACE_LANES: u32 = 10;
+
+/// A segment display is the 8- or 16-segment type (stored in `bits`).
+pub fn seg_lanes(comp: &ProjectComponent) -> u32 {
+    if comp.bits.unwrap_or(16) <= 8 {
+        8
+    } else {
+        16
+    }
+}
+
+/// A light's configured footprint, clamped sane.
+pub fn light_size(comp: &ProjectComponent) -> [f32; 2] {
+    let s = comp
+        .display
+        .as_ref()
+        .and_then(|d| d.size)
+        .unwrap_or([2.0, 2.0]);
+    [s[0].clamp(1.0, 40.0), s[1].clamp(1.0, 40.0)]
+}
+
+/// An aspect-locked display's configured height, clamped sane.
+pub fn display_scale(comp: &ProjectComponent) -> f32 {
+    comp.display
+        .as_ref()
+        .and_then(|d| d.scale)
+        .unwrap_or(match comp.component_type.as_str() {
+            "face" => 5.0,
+            _ => 6.0,
+        })
+        .clamp(2.0, 40.0)
+}
+
+/// Footprint of a display element, in grid units.
+fn display_size(comp: &ProjectComponent) -> [f32; 2] {
+    match comp.component_type.as_str() {
+        "light" | "rgb" => light_size(comp),
+        "seg" => {
+            let h = display_scale(comp);
+            let aspect = if seg_lanes(comp) == 8 {
+                SEG8_ASPECT
+            } else {
+                SEG16_ASPECT
+            };
+            [h * aspect, h]
+        }
+        _ => {
+            let h = display_scale(comp);
+            [h * FACE_ASPECT, h]
+        }
+    }
+}
+
+/// The ports of a display element: one input, signal or bundle.
+fn display_ports(comp: &ProjectComponent) -> Vec<PortInfo> {
+    let wire = match comp.component_type.as_str() {
+        "light" => WireKind::Signal,
+        "rgb" => WireKind::Bundle(3),
+        "seg" => WireKind::Bundle(seg_lanes(comp)),
+        _ => WireKind::Bundle(FACE_LANES),
+    };
+    vec![PortInfo {
+        name: "in".into(),
+        kind: PortKind::Input,
+        wire,
+    }]
+}
+
 /// Axis-aligned rectangle in grid units.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Rect {
@@ -94,10 +178,24 @@ pub fn type_ports(
         wire: WireKind::Signal,
     };
     match component_type {
-        // Bundlers need the per-component lane count; this type-level view
-        // assumes the default (callers with a component at hand use
+        // Bundlers and displays carry per-component state; this type-level
+        // view assumes the defaults (callers with a component at hand use
         // `component_port_info`).
         "bundle" | "unbundle" => Some(bundle_ports(component_type, 8)),
+        "light" => Some(vec![PortInfo {
+            name: "in".into(),
+            kind: PortKind::Input,
+            wire: WireKind::Signal,
+        }]),
+        "rgb" | "seg" | "face" => Some(vec![PortInfo {
+            name: "in".into(),
+            kind: PortKind::Input,
+            wire: WireKind::Bundle(match component_type {
+                "rgb" => 3,
+                "seg" => 16,
+                _ => FACE_LANES,
+            }),
+        }]),
         "clk" | "const" => Some(vec![port("out", PortKind::Output)]),
         "nand" => Some(vec![
             port("a", PortKind::Input),
@@ -170,6 +268,9 @@ pub fn component_port_info(
     if is_bundle_component(&comp.component_type) {
         return Some(bundle_ports(&comp.component_type, bits_of(comp)));
     }
+    if is_display(&comp.component_type) {
+        return Some(display_ports(comp));
+    }
     type_ports(abstractions, &comp.component_type)
 }
 
@@ -177,6 +278,9 @@ pub fn component_port_info(
 pub fn type_size(abstractions: &[ProjectAbstraction], component_type: &str) -> Option<[f32; 2]> {
     match component_type {
         "bundle" | "unbundle" => Some([2.0, 8.0]),
+        "light" | "rgb" => Some([2.0, 2.0]),
+        "seg" => Some([6.0 * SEG16_ASPECT, 6.0]),
+        "face" => Some([5.0 * FACE_ASPECT, 5.0]),
         "clk" | "const" => Some([2.0, 2.0]),
         "nand" | "dff" => Some([3.0, 2.0]),
         name => {
@@ -197,6 +301,8 @@ pub fn default_abstraction_size(name: &str, n_inputs: usize, n_outputs: usize) -
 pub fn footprint(abstractions: &[ProjectAbstraction], comp: &ProjectComponent) -> Rect {
     let [w, h] = if is_bundle_component(&comp.component_type) {
         [2.0, bits_of(comp) as f32]
+    } else if is_display(&comp.component_type) {
+        display_size(comp)
     } else {
         type_size(abstractions, &comp.component_type).unwrap_or([3.0, 2.0])
     };
@@ -354,6 +460,7 @@ pub fn current_port_spots(
     def: &ProjectAbstraction,
 ) -> Vec<(String, crate::project::PortSide, f32)> {
     let synthetic = ProjectComponent {
+        display: None,
         bits: None,
         id: String::new(),
         component_type: def.name.clone(),
@@ -1051,6 +1158,7 @@ mod tests {
 
     fn comp(id: &str, ty: &str, x: f32, y: f32) -> ProjectComponent {
         ProjectComponent {
+            display: None,
             bits: None,
             id: id.into(),
             component_type: ty.into(),

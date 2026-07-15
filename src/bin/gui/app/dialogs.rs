@@ -79,6 +79,7 @@ impl App {
         let mut abstractions = self.editor.project.abstractions.clone();
         abstractions[self.layout_dialog.as_ref()?.index] = def.clone();
         let synthetic = diycpu::project::ProjectComponent {
+            display: None,
             id: String::new(),
             component_type: def.name.clone(),
             init: None,
@@ -531,3 +532,313 @@ pub struct ImageDialogGeom {
 pub const IMG_SIZE_MIN: f32 = 1.0;
 
 pub const IMG_SIZE_MAX: f32 = 40.0;
+
+// ── Display settings dialog ──────────────────────────────────────────────────
+
+/// Preset lit colors offered in the dialog.
+pub const DISPLAY_COLORS: [&str; 8] = [
+    "#f4483a", "#ff9f1c", "#ffd93d", "#3ddc68", "#3ec6dd", "#4d7dff", "#b44dff",
+    "#f5f0e8",
+];
+
+/// The display settings dialog: shape/type, lit color, size.
+pub struct DisplayDialog {
+    pub id: String,
+    /// Index of the slider being dragged.
+    pub drag: Option<usize>,
+    pub pending: Option<[f32; 2]>,
+}
+
+pub struct DisplayDialogGeom {
+    pub panel: Rect,
+    /// Live preview of the display, fully lit.
+    pub preview: Rect,
+    /// Mutually exclusive looks: shape for lights, 8/16 for seg displays.
+    pub variants: Vec<(String, Rect, bool)>,
+    /// Lit-color swatches (empty for rgb and face — their colors are data).
+    pub swatches: Vec<(String, Rect, bool)>,
+    pub sliders: Vec<DialogSlider>,
+    pub close_rect: Rect,
+}
+
+pub const DISPLAY_SIZE_MIN: f32 = 1.0;
+pub const DISPLAY_SIZE_MAX: f32 = 24.0;
+
+impl App {
+    pub fn action_open_display_dialog(&mut self, id: &str) {
+        if !self.require_edit_mode() {
+            return;
+        }
+        self.gesture = Gesture::Idle;
+        self.display_dialog = Some(DisplayDialog {
+            id: id.to_string(),
+            drag: None,
+            pending: None,
+        });
+    }
+
+    /// The dialog's component with pending preview edits applied.
+    pub fn display_dialog_comp(&self) -> Option<diycpu::project::ProjectComponent> {
+        let dialog = self.display_dialog.as_ref()?;
+        let (components, _) = self.editor.sheet_data();
+        let mut comp = components.iter().find(|c| c.id == dialog.id)?.clone();
+        if let Some(p) = dialog.pending {
+            let mut cfg = comp.display.clone().unwrap_or_default();
+            if layout::is_bundle_component(&comp.component_type) {
+                // unreachable: bundlers use the width prompt
+            } else if matches!(comp.component_type.as_str(), "light" | "rgb") {
+                cfg.size = Some(p);
+            } else {
+                cfg.scale = Some(p[1]);
+            }
+            comp.display = Some(cfg);
+        }
+        Some(comp)
+    }
+
+    pub fn display_dialog_geometry(&self) -> Option<DisplayDialogGeom> {
+        let comp = self.display_dialog_comp()?;
+        let cfg = comp.display.clone().unwrap_or_default();
+        let kind = comp.component_type.as_str();
+        let is_light = matches!(kind, "light" | "rgb");
+
+        let panel_w = 440.0f32;
+        let panel_h = 430.0f32;
+        let panel = Rect {
+            x: (self.window_size[0] - panel_w) / 2.0,
+            y: (self.window_size[1] - panel_h) / 2.5,
+            w: panel_w,
+            h: panel_h,
+        };
+        // Aspect-fit preview of the element itself, fully lit.
+        let area = Rect {
+            x: panel.x + 30.0,
+            y: panel.y + 56.0,
+            w: panel.w - 60.0,
+            h: 160.0,
+        };
+        let fp = layout::footprint(&self.editor.project.abstractions, &comp);
+        let (gw, gh) = (fp.w.max(0.1), fp.h.max(0.1));
+        let scale = (area.w / gw).min(area.h / gh);
+        let preview = Rect {
+            x: area.x + (area.w - gw * scale) / 2.0,
+            y: area.y + (area.h - gh * scale) / 2.0,
+            w: gw * scale,
+            h: gh * scale,
+        };
+
+        // Variant row.
+        let mut variants = Vec::new();
+        let vy = panel.y + 236.0;
+        let options: &[(&str, bool)] = match kind {
+            "light" | "rgb" => &[
+                ("Square", !cfg.round.unwrap_or(false)),
+                ("Round", cfg.round.unwrap_or(false)),
+            ],
+            "seg" => &[
+                ("8 segments", layout::seg_lanes(&comp) == 8),
+                ("16 segments", layout::seg_lanes(&comp) == 16),
+            ],
+            _ => &[],
+        };
+        let bw = 120.0;
+        let total = options.len() as f32 * (bw + 10.0) - 10.0;
+        let mut bx = panel.x + (panel.w - total) / 2.0;
+        for (label, active) in options {
+            variants.push((
+                (*label).to_string(),
+                Rect { x: bx, y: vy, w: bw, h: 28.0 },
+                *active,
+            ));
+            bx += bw + 10.0;
+        }
+
+        // Color swatches (lights and seg displays).
+        let mut swatches = Vec::new();
+        if matches!(kind, "light" | "seg") {
+            let sw = 30.0;
+            let total = DISPLAY_COLORS.len() as f32 * (sw + 8.0) - 8.0;
+            let mut sx = panel.x + (panel.w - total) / 2.0;
+            let sy = panel.y + 280.0;
+            let current = cfg
+                .color
+                .clone()
+                .unwrap_or_else(|| DISPLAY_COLORS[0].to_string());
+            for c in DISPLAY_COLORS {
+                swatches.push((
+                    c.to_string(),
+                    Rect { x: sx, y: sy, w: sw, h: sw },
+                    current.eq_ignore_ascii_case(c),
+                ));
+                sx += sw + 8.0;
+            }
+        }
+
+        let slider_row = |row: usize, label: &'static str, value: f32| DialogSlider {
+            label,
+            track: Rect {
+                x: panel.x + 90.0,
+                y: panel.y + panel.h - 96.0 + row as f32 * 32.0,
+                w: panel.w - 220.0,
+                h: 14.0,
+            },
+            value_rect: Rect {
+                x: panel.x + panel.w - 110.0,
+                y: panel.y + panel.h - 102.0 + row as f32 * 32.0,
+                w: 84.0,
+                h: 24.0,
+            },
+            value,
+        };
+        let sliders = if is_light {
+            let size = layout::light_size(&comp);
+            vec![
+                slider_row(0, "Width", size[0]),
+                slider_row(1, "Height", size[1]),
+            ]
+        } else {
+            vec![slider_row(1, "Size", layout::display_scale(&comp))]
+        };
+
+        Some(DisplayDialogGeom {
+            panel,
+            preview,
+            variants,
+            swatches,
+            sliders,
+            close_rect: Rect {
+                x: panel.x + panel_w - 34.0,
+                y: panel.y + 10.0,
+                w: 24.0,
+                h: 24.0,
+            },
+        })
+    }
+
+    /// The current config of the dialog's component, for merging edits.
+    fn display_current(&self) -> Option<(String, diycpu::project::DisplayConfig, String)> {
+        let dialog = self.display_dialog.as_ref()?;
+        let (components, _) = self.editor.sheet_data();
+        let comp = components.iter().find(|c| c.id == dialog.id)?;
+        Some((
+            dialog.id.clone(),
+            comp.display.clone().unwrap_or_default(),
+            comp.component_type.clone(),
+        ))
+    }
+
+    pub fn display_dialog_pressed(&mut self) {
+        let Some(geom) = self.display_dialog_geometry() else {
+            self.display_dialog = None;
+            return;
+        };
+        if geom.close_rect.contains(self.cursor) || !geom.panel.contains(self.cursor) {
+            self.display_dialog = None;
+            return;
+        }
+        let Some((id, mut cfg, kind)) = self.display_current() else {
+            return;
+        };
+        for (i, (label, rect, _)) in geom.variants.iter().enumerate() {
+            if rect.contains(self.cursor) {
+                let result = if kind == "seg" {
+                    let bits = if i == 0 { 8 } else { 16 };
+                    self.editor.configure_display(&id, cfg, Some(bits))
+                } else {
+                    cfg.round = Some(label == "Round");
+                    self.editor.configure_display(&id, cfg, None)
+                };
+                if let Err(e) = result {
+                    self.error(e.to_string());
+                }
+                return;
+            }
+        }
+        for (color, rect, _) in &geom.swatches {
+            if rect.contains(self.cursor) {
+                cfg.color = Some(color.clone());
+                if let Err(e) = self.editor.configure_display(&id, cfg, None) {
+                    self.error(e.to_string());
+                }
+                return;
+            }
+        }
+        for (i, slider) in geom.sliders.iter().enumerate() {
+            let grab = Rect {
+                x: slider.track.x - 8.0,
+                y: slider.track.y - 8.0,
+                w: slider.track.w + 16.0,
+                h: slider.track.h + 16.0,
+            };
+            if grab.contains(self.cursor) {
+                if let Some(d) = &mut self.display_dialog {
+                    d.drag = Some(i);
+                }
+                self.display_dialog_moved();
+                return;
+            }
+            if slider.value_rect.contains(self.cursor) {
+                self.prompt = Some(Prompt {
+                    title: format!("{} in grid cells", slider.label),
+                    value: format!("{}", slider.value),
+                    action: PromptAction::SetDisplayDim { id, which: i },
+                    identifier: false,
+                });
+                return;
+            }
+        }
+    }
+
+    pub fn display_dialog_moved(&mut self) {
+        let Some(geom) = self.display_dialog_geometry() else {
+            return;
+        };
+        let cursor = self.cursor;
+        let two = geom.sliders.len() == 2;
+        let current: [f32; 2] = [
+            geom.sliders.first().map(|s| s.value).unwrap_or(2.0),
+            geom.sliders.last().map(|s| s.value).unwrap_or(2.0),
+        ];
+        let Some(dialog) = &mut self.display_dialog else {
+            return;
+        };
+        if let Some(i) = dialog.drag {
+            let track = &geom.sliders[i].track;
+            let f = ((cursor[0] - track.x) / track.w).clamp(0.0, 1.0);
+            let value =
+                ((DISPLAY_SIZE_MIN + f * (DISPLAY_SIZE_MAX - DISPLAY_SIZE_MIN)) * 2.0).round()
+                    / 2.0;
+            let mut p = current;
+            if two {
+                p[i] = value;
+            } else {
+                p = [value, value];
+            }
+            dialog.pending = Some(p);
+        }
+    }
+
+    pub fn display_dialog_released(&mut self) {
+        let Some(dialog) = &mut self.display_dialog else {
+            return;
+        };
+        let pending = dialog.pending.take();
+        let had_drag = dialog.drag.take().is_some();
+        if !had_drag {
+            return;
+        }
+        let Some((id, mut cfg, kind)) = self.display_current() else {
+            return;
+        };
+        if let Some(p) = pending {
+            if matches!(kind.as_str(), "light" | "rgb") {
+                cfg.size = Some(p);
+            } else {
+                cfg.scale = Some(p[1]);
+            }
+            if let Err(e) = self.editor.configure_display(&id, cfg, None) {
+                self.error(e.to_string());
+            }
+        }
+    }
+}

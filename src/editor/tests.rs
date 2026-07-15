@@ -306,6 +306,7 @@ fn project_with_not_abstraction() -> Editor {
         width: 4.0,
         height: 2.0,
         components: vec![ProjectComponent {
+            display: None,
             bits: None,
             id: "gate".into(),
             component_type: "nand".into(),
@@ -1081,6 +1082,7 @@ fn first_port_placement_freezes_the_rest_and_new_pins_find_slots() {
 
     // Positions before the first manual placement...
     let synth = ProjectComponent {
+        display: None,
         bits: None,
         id: String::new(),
         component_type: "box".into(),
@@ -1197,6 +1199,7 @@ fn cyclic_abstractions_in_json_do_not_crash() {
     e.create_abstraction("b").unwrap();
     e.create_abstraction("c").unwrap();
     e.project.abstractions[0].components.push(ProjectComponent {
+        display: None,
         bits: None,
         id: "x".into(),
         component_type: "b".into(),
@@ -1204,6 +1207,7 @@ fn cyclic_abstractions_in_json_do_not_crash() {
         pos: [0.0, 0.0],
     });
     e.project.abstractions[1].components.push(ProjectComponent {
+        display: None,
         bits: None,
         id: "y".into(),
         component_type: "a".into(),

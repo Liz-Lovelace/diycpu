@@ -58,7 +58,7 @@ pub fn project_to_circuit(project: &Project) -> Result<CircuitDef, ConvertError>
     // Bundles are a purely visual grouping: lower them to their individual
     // lanes first, so the engine only ever sees plain wires.
     let lowered;
-    let project = if project_has_bundles(project) {
+    let project = if project_needs_lowering(project) {
         lowered = lower_bundles(project)?;
         &lowered
     } else {
@@ -102,9 +102,14 @@ fn lane_name(pin: &str, k: u32) -> String {
     format!("{pin}__b{k}")
 }
 
-fn project_has_bundles(p: &Project) -> bool {
+fn is_display_comp(c: &ProjectComponent) -> bool {
+    matches!(c.component_type.as_str(), "light" | "rgb" | "seg" | "face")
+}
+
+fn project_needs_lowering(p: &Project) -> bool {
     let sheet_has = |comps: &[ProjectComponent], nets: &[WireNet]| {
-        comps.iter().any(is_bundle_comp) || nets.iter().any(|n| n.bundle)
+        comps.iter().any(|c| is_bundle_comp(c) || is_display_comp(c))
+            || nets.iter().any(|n| n.bundle)
     };
     sheet_has(&p.components, &p.wire_nets)
         || p.abstractions
@@ -112,8 +117,37 @@ fn project_has_bundles(p: &Project) -> bool {
             .any(|a| sheet_has(&a.components, &a.wire_nets) || !a.bundle_pins.is_empty())
 }
 
+/// Displays are pure sinks that exist to be looked at: delete them and
+/// every wire reference to them before the bundle lowering runs, so the
+/// rest of the pipeline never has to know they exist.
+fn strip_displays(components: &mut Vec<ProjectComponent>, wire_nets: &mut [WireNet]) {
+    let ids: Vec<String> = components
+        .iter()
+        .filter(|c| is_display_comp(c))
+        .map(|c| c.id.clone())
+        .collect();
+    if ids.is_empty() {
+        return;
+    }
+    components.retain(|c| !is_display_comp(c));
+    for net in wire_nets.iter_mut() {
+        net.segments.retain(|seg| {
+            ![&seg.from, &seg.to].iter().any(|e| {
+                matches!(e, crate::project::Endpoint::Port { component_id, .. }
+                    if ids.contains(component_id))
+            })
+        });
+        net.sinks.retain(|s| !ids.contains(&s.component_id));
+    }
+}
+
 fn lower_bundles(original: &Project) -> Result<Project, ConvertError> {
     let mut p = original.clone();
+
+    strip_displays(&mut p.components, &mut p.wire_nets);
+    for a in &mut p.abstractions {
+        strip_displays(&mut a.components, &mut a.wire_nets);
+    }
 
     // Bundle interface pins become per-lane pins. (`bundle_pins` itself is
     // kept as reference data; the engine conversion ignores it.)
@@ -167,6 +201,7 @@ fn lower_bundles(original: &Project) -> Result<Project, ConvertError> {
                 if a.outputs.get(&lane).is_none_or(|t| t.is_empty()) {
                     let zero = format!("__zero_{lane}");
                     a.components.push(ProjectComponent {
+                        display: None,
                         id: zero.clone(),
                         component_type: "dff".into(),
                         init: Some(false),
@@ -556,6 +591,7 @@ mod tests {
 
     fn make_component(id: &str, comp_type: &str) -> ProjectComponent {
         ProjectComponent {
+            display: None,
             bits: None,
             id: id.into(),
             component_type: comp_type.into(),

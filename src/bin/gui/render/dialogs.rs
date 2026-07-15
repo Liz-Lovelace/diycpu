@@ -384,3 +384,128 @@ impl Renderer {
         );
     }
 }
+
+impl Renderer {
+    /// The display settings dialog: a fully-lit preview, the variant and
+    /// color choices, and the size sliders.
+    pub(super) fn draw_display_dialog(&self, canvas: &mut Canvas<OpenGl>, app: &App) {
+        let Some(geom) = app.display_dialog_geometry() else {
+            return;
+        };
+        let Some(comp) = app.display_dialog_comp() else {
+            return;
+        };
+        let [w, h] = app.window_size;
+
+        let mut dim = Path::new();
+        dim.rect(0.0, 0.0, w, h);
+        canvas.fill_path(&dim, &Paint::color(femtovg::Color::rgba(30, 33, 40, 70)));
+
+        let p = &geom.panel;
+        let mut panel = Path::new();
+        panel.rounded_rect(p.x, p.y, p.w, p.h, 10.0);
+        canvas.fill_path(&panel, &Paint::color(theme::canvas_bg()));
+        let mut border = Paint::color(theme::button_border());
+        border.set_line_width(1.5);
+        canvas.stroke_path(&panel, &border);
+
+        self.text(
+            canvas,
+            p.x + 16.0,
+            p.y + 24.0,
+            "Display settings",
+            15.0,
+            theme::text(),
+            Align::Left,
+            Baseline::Middle,
+        );
+        self.text(
+            canvas,
+            geom.close_rect.x + geom.close_rect.w / 2.0,
+            geom.close_rect.y + geom.close_rect.h / 2.0,
+            "✕",
+            14.0,
+            if geom.close_rect.contains(app.cursor) {
+                theme::danger()
+            } else {
+                theme::text_dim()
+            },
+            Align::Center,
+            Baseline::Middle,
+        );
+
+        // The element itself, everything lit.
+        let lanes = diycpu::layout::component_port_info(
+            &app.editor.project.abstractions,
+            &comp,
+        )
+        .and_then(|ports| ports.first().map(|p| match p.wire {
+            diycpu::layout::WireKind::Bundle(w) => w as usize,
+            diycpu::layout::WireKind::Signal => 1,
+        }))
+        .unwrap_or(1);
+        let values: Vec<Option<bool>> = vec![Some(true); lanes];
+        self.display_visual(canvas, &comp, geom.preview, &values, 1.0);
+
+        for (label, rect, active) in &geom.variants {
+            let hovered = rect.contains(app.cursor);
+            let mut b = Path::new();
+            b.rounded_rect(rect.x, rect.y, rect.w, rect.h, 6.0);
+            canvas.fill_path(
+                &b,
+                &Paint::color(if *active {
+                    theme::panel_item_armed()
+                } else if hovered {
+                    theme::button_hover_bg()
+                } else {
+                    theme::button_bg()
+                }),
+            );
+            let mut bb = Paint::color(if *active {
+                theme::accent()
+            } else {
+                theme::button_border()
+            });
+            bb.set_line_width(if *active { 1.6 } else { 1.2 });
+            canvas.stroke_path(&b, &bb);
+            self.text(
+                canvas,
+                rect.x + rect.w / 2.0,
+                rect.y + rect.h / 2.0,
+                label,
+                12.5,
+                theme::text(),
+                Align::Center,
+                Baseline::Middle,
+            );
+        }
+
+        for (color, rect, active) in &geom.swatches {
+            let mut b = Path::new();
+            b.rounded_rect(rect.x, rect.y, rect.w, rect.h, 6.0);
+            let c = color
+                .strip_prefix('#')
+                .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+                .map(|v| femtovg::Color::rgb((v >> 16) as u8, (v >> 8) as u8, v as u8))
+                .unwrap_or_else(theme::accent);
+            canvas.fill_path(&b, &Paint::color(c));
+            let mut bb = Paint::color(if *active {
+                theme::text()
+            } else {
+                theme::button_border()
+            });
+            bb.set_line_width(if *active { 2.5 } else { 1.0 });
+            canvas.stroke_path(&b, &bb);
+        }
+
+        for slider in &geom.sliders {
+            self.draw_slider(
+                canvas,
+                app,
+                slider,
+                crate::app::DISPLAY_SIZE_MIN,
+                crate::app::DISPLAY_SIZE_MAX,
+            );
+        }
+    }
+}

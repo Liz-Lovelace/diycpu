@@ -57,11 +57,33 @@ pub struct ProjectComponent {
     pub component_type: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub init: Option<bool>,
-    /// Lane count for bundlers/unbundlers (None = the default 8).
+    /// Lane count for bundlers/unbundlers (None = the default 8), and the
+    /// 8/16 type of a segment display.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bits: Option<u32>,
+    /// How a display element looks. None = all defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<DisplayConfig>,
     #[serde(default)]
     pub pos: [f32; 2],
+}
+
+/// Appearance settings for display elements (lights and segment
+/// displays). Every field optional: absent means the default.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct DisplayConfig {
+    /// Lit color, "#rrggbb".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    /// Lights: a round face instead of a square one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round: Option<bool>,
+    /// Lights: footprint in grid cells.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<[f32; 2]>,
+    /// Aspect-locked displays (seg, face): height in grid cells.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scale: Option<f32>,
 }
 
 /// An abstraction definition within a project, including visual data.
@@ -218,6 +240,7 @@ mod tests {
             abstractions: vec![],
             components: vec![
                 ProjectComponent {
+                    display: None,
                     bits: None,
                     id: "clk_1".into(),
                     component_type: "clk".into(),
@@ -225,6 +248,7 @@ mod tests {
                     pos: [0.0, 0.0],
                 },
                 ProjectComponent {
+                    display: None,
                     bits: None,
                     id: "dff_1".into(),
                     component_type: "dff".into(),
@@ -309,6 +333,7 @@ mod tests {
                 width: 140.0,
                 height: 70.0,
                 components: vec![ProjectComponent {
+                    display: None,
                     bits: None,
                     id: "gate_1".into(),
                     component_type: "nand".into(),

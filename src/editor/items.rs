@@ -51,6 +51,7 @@ impl Editor {
 
             let id = generate_id(components, &type_name);
             components.push(ProjectComponent {
+                display: None,
                 bits: None,
                 id: id.clone(),
                 component_type: type_name.clone(),
@@ -333,6 +334,55 @@ impl Editor {
                 .find(|i| i.id == id)
                 .ok_or_else(|| EditError::UnknownImage(id.clone()))?;
             img.size = clamp_image_size([w, h]);
+            Ok(())
+        })
+    }
+
+    /// Configure a display element's look — and, for segment displays,
+    /// the 8/16 type. One undo step. Resizes respect neighbours; a type
+    /// change that leaves a mismatched bundle wire is kept and flashes.
+    pub fn configure_display(
+        &mut self,
+        id: &str,
+        config: crate::project::DisplayConfig,
+        seg_bits: Option<u32>,
+    ) -> Result<(), EditError> {
+        let id = id.to_string();
+        self.mutate(move |project, sheet| {
+            let abstractions = project.abstractions.clone();
+            let (components, _) = sheet_mut(project, sheet).ok_or(EditError::BadSheet)?;
+            let index = components
+                .iter()
+                .position(|c| c.id == id)
+                .ok_or_else(|| EditError::UnknownComponent(id.clone()))?;
+            if !layout::is_display(&components[index].component_type) {
+                return Err(EditError::UnknownComponent(id.clone()));
+            }
+            if let Some(bits) = seg_bits {
+                if bits != 8 && bits != 16 {
+                    return Err(EditError::BadBundleWidth);
+                }
+                components[index].bits = Some(bits);
+            }
+            let mut config = config;
+            if let Some(size) = &mut config.size {
+                size[0] = size[0].clamp(1.0, 40.0);
+                size[1] = size[1].clamp(1.0, 40.0);
+            }
+            if let Some(scale) = &mut config.scale {
+                *scale = scale.clamp(2.0, 40.0);
+            }
+            components[index].display = Some(config);
+
+            // The new footprint must still fit where it stands.
+            let rect = layout::footprint(&abstractions, &components[index]);
+            for (k, other) in components.iter().enumerate() {
+                if k != index
+                    && layout::footprint(&abstractions, other).intersects(&rect)
+                {
+                    return Err(EditError::Overlap);
+                }
+            }
             Ok(())
         })
     }

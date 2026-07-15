@@ -31,8 +31,8 @@ mod gestures;
 mod view;
 
 pub use dialogs::{
-    DialogSlider, ImageDialog, LayoutDialog,
-    DIALOG_SIZE_MAX, DIALOG_SIZE_MIN, IMG_SIZE_MAX, IMG_SIZE_MIN,
+    DialogSlider, DisplayDialog, ImageDialog, LayoutDialog, DIALOG_SIZE_MAX, DIALOG_SIZE_MIN,
+    DISPLAY_SIZE_MAX, DISPLAY_SIZE_MIN, IMG_SIZE_MAX, IMG_SIZE_MIN,
 };
 pub use files::{
     create_project_dir, default_project_path, load_project, projects_base_dir, MAX_MEDIA_BYTES,
@@ -43,7 +43,7 @@ pub use cog::CogAction;
 #[allow(unused_imports)]
 pub use files::starter_project;
 pub use gestures::WireTarget;
-pub use view::{resolve_lane_display, PathSeg};
+pub use view::{resolve_bundle_lane, resolve_lane_display, PathSeg};
 
 pub(crate) use files::DiscardIntent;
 pub(crate) use view::DESCEND_AT;
@@ -209,6 +209,8 @@ pub enum PromptAction {
     SetImageDim { id: String, which: usize },
     /// Lane count for a bundler/unbundler.
     SetBundleWidth { id: String },
+    /// Type a size into the display dialog.
+    SetDisplayDim { id: String, which: usize },
     /// Name for a fresh project directory in the projects folder.
     NewProject,
     /// Name for a copy of the current project in the projects folder.
@@ -265,6 +267,7 @@ pub struct App {
     pub prompt: Option<Prompt>,
     pub layout_dialog: Option<LayoutDialog>,
     pub image_dialog: Option<ImageDialog>,
+    pub display_dialog: Option<DisplayDialog>,
     pub clipboard: Option<Fragment>,
     /// Run mode advances the clock on a timer.
     pub playing: bool,
@@ -329,6 +332,7 @@ impl App {
             prompt: None,
             layout_dialog: None,
             image_dialog: None,
+            display_dialog: None,
             clipboard: None,
             playing: false,
             palette_scroll: 0.0,
@@ -366,7 +370,10 @@ impl App {
 
     /// Any modal layer open? Prompts and dialogs freeze the canvas.
     pub fn any_modal(&self) -> bool {
-        self.prompt.is_some() || self.layout_dialog.is_some() || self.image_dialog.is_some()
+        self.prompt.is_some()
+            || self.layout_dialog.is_some()
+            || self.image_dialog.is_some()
+            || self.display_dialog.is_some()
     }
 
     pub fn canvas_rect(&self) -> Rect {
@@ -411,6 +418,10 @@ impl App {
             "const".to_string(),
             "bundle".to_string(),
             "unbundle".to_string(),
+            "light".to_string(),
+            "rgb".to_string(),
+            "seg".to_string(),
+            "face".to_string(),
             "note".to_string(),
             "image".to_string(),
         ];

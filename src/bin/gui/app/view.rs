@@ -423,7 +423,7 @@ pub fn resolve_lane_display(
     if comp.component_type != "unbundle" {
         return Some(port.clone());
     }
-    let lane = &port.port_name;
+    let lane: u32 = port.port_name.parse().ok()?;
     let feed = wire_nets
         .iter()
         .filter(|n| n.bundle)
@@ -433,24 +433,40 @@ pub fn resolve_lane_display(
                 .any(|s| s.component_id == comp.id && s.port_name == "bundle")
         })
         .and_then(|n| n.source.clone())?;
-    match components.iter().find(|c| c.id == feed.component_id) {
-        Some(c) if c.component_type == "bundle" => {
-            let src = wire_nets
-                .iter()
-                .filter(|n| !n.bundle)
-                .find(|n| {
-                    n.sinks
-                        .iter()
-                        .any(|s| s.component_id == c.id && &s.port_name == lane)
-                })
-                .and_then(|n| n.source.clone())?;
-            resolve_lane_display(components, wire_nets, &src, depth + 1)
-        }
+    resolve_bundle_lane(components, wire_nets, &feed, lane, depth + 1)
+}
+
+/// The driver of lane `k` behind a bundle SOURCE port (a bundler's output,
+/// an instance's bundle output, or nothing resolvable). The other half of
+/// [`resolve_lane_display`] — displays fed by bundles read through this.
+pub fn resolve_bundle_lane(
+    components: &[diycpu::project::ProjectComponent],
+    wire_nets: &[diycpu::project::WireNet],
+    src: &PortRef,
+    k: u32,
+    depth: usize,
+) -> Option<PortRef> {
+    if depth > 16 {
+        return None;
+    }
+    let comp = components.iter().find(|c| c.id == src.component_id)?;
+    if comp.component_type == "bundle" {
+        let lane = k.to_string();
+        let feed = wire_nets
+            .iter()
+            .filter(|n| !n.bundle)
+            .find(|n| {
+                n.sinks
+                    .iter()
+                    .any(|s| s.component_id == comp.id && s.port_name == lane)
+            })
+            .and_then(|n| n.source.clone())?;
+        resolve_lane_display(components, wire_nets, &feed, depth + 1)
+    } else {
         // An instance's bundle output: its per-lane engine port.
-        Some(_) => Some(PortRef {
-            component_id: feed.component_id.clone(),
-            port_name: format!("{}__b{lane}", feed.port_name),
-        }),
-        None => None, // fed by an interface pin: no unique value here
+        Some(PortRef {
+            component_id: src.component_id.clone(),
+            port_name: format!("{}__b{k}", src.port_name),
+        })
     }
 }

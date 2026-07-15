@@ -28,6 +28,7 @@ pub(crate) fn guard_no_combinational_loop(project: &Project, sheet: SheetRef) ->
                 steps: 1,
                 abstractions: project.abstractions.clone(),
                 components: vec![ProjectComponent {
+                    display: None,
                     bits: None,
                     id: "__probe_instance".into(),
                     component_type: def.name.clone(),

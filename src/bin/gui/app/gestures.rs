@@ -455,8 +455,8 @@ impl App {
             self.dismiss_prompt();
             return;
         }
-        if self.image_dialog.is_some() {
-            return; // the shell routes these to img_dialog_pressed
+        if self.image_dialog.is_some() || self.display_dialog.is_some() {
+            return; // the shell routes these to the dialog handlers
         }
 
         // UI chrome clicks are resolved by the shell (main.rs) before this
@@ -1192,6 +1192,12 @@ impl App {
         if self.image_dialog.is_some() {
             if matches!(key, KeyInput::Escape | KeyInput::Enter) {
                 self.image_dialog = None;
+            }
+            return;
+        }
+        if self.display_dialog.is_some() {
+            if matches!(key, KeyInput::Escape | KeyInput::Enter) {
+                self.display_dialog = None;
             }
             return;
         }

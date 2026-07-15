@@ -40,6 +40,8 @@ struct CliArgs {
     dialog: bool,
     /// Open the image-settings dialog for the sheet's first image.
     image_dialog: bool,
+    /// Open the display-settings dialog for the sheet's first display.
+    display_dialog: bool,
     camera: Option<(f32, f32, f32)>,
     /// Park the cursor at a grid point before the screenshot (hover states).
     cursor: Option<(f32, f32)>,
@@ -56,6 +58,7 @@ fn parse_args() -> CliArgs {
         sheet: None,
         dialog: false,
         image_dialog: false,
+        display_dialog: false,
         camera: None,
         cursor: None,
         anim_t: None,
@@ -69,6 +72,7 @@ fn parse_args() -> CliArgs {
             "--sheet" => args.sheet = it.next(),
             "--dialog" => args.dialog = true,
             "--image-dialog" => args.image_dialog = true,
+            "--display-dialog" => args.display_dialog = true,
             "--anim-t" => args.anim_t = it.next().and_then(|s| s.parse().ok()),
             "--cursor" => {
                 if let Some(s) = it.next() {
@@ -228,6 +232,18 @@ impl Shell {
                 app.action_open_image_dialog(&id);
             }
         }
+        if args.display_dialog {
+            let first = app
+                .editor
+                .sheet_data()
+                .0
+                .iter()
+                .find(|c| diycpu::layout::is_display(&c.component_type))
+                .map(|c| c.id.clone());
+            if let Some(id) = first {
+                app.action_open_display_dialog(&id);
+            }
+        }
         if let Some((zoom, x, y)) = args.camera {
             app.camera.zoom = zoom;
             app.camera.offset = [x, y];
@@ -346,6 +362,10 @@ impl Shell {
         // clicking outside any dialog), the layout dialog handles its own.
         if self.app.prompt.is_some() {
             self.app.dismiss_prompt();
+            return;
+        }
+        if self.app.display_dialog.is_some() {
+            self.app.display_dialog_pressed();
             return;
         }
         if self.app.image_dialog.is_some() {
@@ -513,7 +533,10 @@ impl ApplicationHandler for AppState {
             }
             WindowEvent::RedrawRequested => shell.render(event_loop),
             WindowEvent::CursorMoved { position, .. } => {
-                if shell.app.image_dialog.is_some() {
+                if shell.app.display_dialog.is_some() {
+                    shell.app.cursor = [position.x as f32, position.y as f32];
+                    shell.app.display_dialog_moved();
+                } else if shell.app.image_dialog.is_some() {
                     shell.app.cursor = [position.x as f32, position.y as f32];
                     shell.app.img_dialog_moved();
                 } else if shell.app.layout_dialog.is_some() {
@@ -531,7 +554,9 @@ impl ApplicationHandler for AppState {
                 match (button, state) {
                     (MouseButton::Left, ElementState::Pressed) => shell.left_pressed(),
                     (MouseButton::Left, ElementState::Released) => {
-                        if shell.app.image_dialog.is_some() {
+                        if shell.app.display_dialog.is_some() {
+                            shell.app.display_dialog_released();
+                        } else if shell.app.image_dialog.is_some() {
                             shell.app.img_dialog_released();
                         } else if shell.app.layout_dialog.is_some() {
                             shell.app.dialog_mouse_released();

@@ -109,6 +109,13 @@ impl Renderer {
     ) {
         let shape = ComponentShape::measure(app, ctx, comp, depth);
 
+        // A display's body IS its visual — no chip chrome, just its ports.
+        if layout::is_display(&comp.component_type) {
+            self.draw_display(canvas, app, ctx, comp, &shape);
+            self.draw_component_ports(canvas, app, ctx, comp, &shape, ctx.alpha);
+            return;
+        }
+
         self.draw_component_body(canvas, app, ctx, comp, &shape);
         if shape.open_frac > 0.0 && shape.on_screen(app) {
             self.draw_open_contents(
@@ -332,7 +339,8 @@ impl Renderer {
         let show_labels = shape.zoom >= 0.5
             && (comp.component_type == "dff" || !is_primitive(&comp.component_type));
         let skip_label = |port: &layout::PortGeom| {
-            layout::is_bundle_component(&comp.component_type) && port.info.name == "bundle"
+            (layout::is_bundle_component(&comp.component_type) && port.info.name == "bundle")
+                || layout::is_display(&comp.component_type)
         };
 
         for port in &layout::component_ports(ctx.abstractions, comp) {

@@ -433,6 +433,30 @@ impl App {
                     Err(e) => retry(self, e, prompt),
                 }
             }
+            PromptAction::SetDisplayDim { id, which } => {
+                let Ok(value) = name.parse::<f32>() else {
+                    self.error("Enter a number of grid cells");
+                    self.prompt = Some(prompt);
+                    return;
+                };
+                let value = value.clamp(DISPLAY_SIZE_MIN, DISPLAY_SIZE_MAX);
+                let (components, _) = self.editor.sheet_data();
+                let Some(comp) = components.iter().find(|c| c.id == id) else {
+                    return;
+                };
+                let mut cfg = comp.display.clone().unwrap_or_default();
+                if matches!(comp.component_type.as_str(), "light" | "rgb") {
+                    let mut size = layout::light_size(comp);
+                    size[which.min(1)] = value;
+                    cfg.size = Some(size);
+                } else {
+                    cfg.scale = Some(value);
+                }
+                match self.editor.configure_display(&id, cfg, None) {
+                    Ok(()) => self.info("Resized"),
+                    Err(e) => retry(self, e, prompt),
+                }
+            }
             PromptAction::NewProject => {
                 let create = || -> Result<PathBuf, String> {
                     let base = projects_base_dir().ok_or("No home folder found")?;

@@ -36,6 +36,9 @@ impl App {
                     "bundle" | "unbundle" => CogAction::BundleWidth {
                         id: comp.id.clone(),
                     },
+                    t if layout::is_display(t) => CogAction::DisplaySettings {
+                        id: comp.id.clone(),
+                    },
                     "nand" | "clk" => return None, // nothing to configure
                     _ => CogAction::Layout {
                         index: self
@@ -138,6 +141,7 @@ impl App {
                     identifier: false,
                 });
             }
+            CogAction::DisplaySettings { id } => self.action_open_display_dialog(&id),
             CogAction::ToggleInit { id } => match self.editor.toggle_dff_init(&id) {
                 Ok(v) => self.info(format!(
                     "Starts at {} now",
@@ -162,6 +166,8 @@ pub enum CogAction {
     ToggleInit { id: String },
     /// Prompt for a bundler/unbundler's lane count.
     BundleWidth { id: String },
+    /// Open the display settings dialog.
+    DisplaySettings { id: String },
 }
 
 /// The gear button's screen-space size.

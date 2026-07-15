@@ -635,13 +635,14 @@ impl App {
                 ("Square", !cfg.round.unwrap_or(false)),
                 ("Round", cfg.round.unwrap_or(false)),
             ],
-            "seg" => &[
+            "segment" => &[
                 ("8 segments", layout::seg_lanes(&comp) == 8),
                 ("16 segments", layout::seg_lanes(&comp) == 16),
+                ("Face", layout::seg_lanes(&comp) == 10),
             ],
             _ => &[],
         };
-        let bw = 120.0;
+        let bw = 110.0;
         let total = options.len() as f32 * (bw + 10.0) - 10.0;
         let mut bx = panel.x + (panel.w - total) / 2.0;
         for (label, active) in options {
@@ -655,7 +656,7 @@ impl App {
 
         // Color swatches (lights and seg displays).
         let mut swatches = Vec::new();
-        if matches!(kind, "light" | "seg" | "face") {
+        if matches!(kind, "light" | "segment") {
             let sw = 30.0;
             let total = DISPLAY_COLORS.len() as f32 * (sw + 8.0) - 8.0;
             let mut sx = panel.x + (panel.w - total) / 2.0;
@@ -741,8 +742,8 @@ impl App {
         };
         for (i, (label, rect, _)) in geom.variants.iter().enumerate() {
             if rect.contains(self.cursor) {
-                let result = if kind == "seg" {
-                    let bits = if i == 0 { 8 } else { 16 };
+                let result = if kind == "segment" {
+                    let bits = [8, 16, 10][i.min(2)];
                     self.editor.configure_display(&id, cfg, Some(bits))
                 } else {
                     cfg.round = Some(label == "Round");
@@ -805,9 +806,14 @@ impl App {
         if let Some(i) = dialog.drag {
             let track = &geom.sliders[i].track;
             let f = ((cursor[0] - track.x) / track.w).clamp(0.0, 1.0);
-            let value =
-                ((DISPLAY_SIZE_MIN + f * (DISPLAY_SIZE_MAX - DISPLAY_SIZE_MIN)) * 2.0).round()
-                    / 2.0;
+            // Lights size in half cells; segment displays in whole cells,
+            // so their aspect-locked slabs keep tiling the grid.
+            let raw = DISPLAY_SIZE_MIN + f * (DISPLAY_SIZE_MAX - DISPLAY_SIZE_MIN);
+            let value = if two {
+                (raw * 2.0).round() / 2.0
+            } else {
+                raw.round()
+            };
             let mut p = current;
             if two {
                 p[i] = value;

@@ -391,8 +391,12 @@ pub(crate) fn attach_wire(
     let net_from = resolve_net(wire_nets, from)?;
     let net_to = resolve_net(wire_nets, to)?;
 
-    // Junction ids can be renamed if a merge collides; track that.
+    // Junction ids can be renamed if a merge collides; track WHICH net's
+    // junctions were renamed — ids are only unique per net, and applying a
+    // rename to the kept net's same-named junction would silently reroute
+    // the new wire onto the wrong node.
     let mut renames: Vec<(String, String)> = Vec::new();
+    let mut renamed_net: Option<String> = None;
     let net_index = match (net_from, net_to) {
         (Some(a), Some(b)) if a != b => {
             if wire_nets[a].bundle != wire_nets[b].bundle {
@@ -409,6 +413,7 @@ pub(crate) fn attach_wire(
             }
             let absorbed = wire_nets.remove(b);
             let a = if b < a { a - 1 } else { a };
+            renamed_net = Some(absorbed.id.clone());
             renames = merge_net(&mut wire_nets[a], absorbed);
             a
         }
@@ -444,12 +449,19 @@ pub(crate) fn attach_wire(
     let mut endpoint_of = |wp: &WirePoint, net: &mut WireNet| -> Result<Endpoint, EditError> {
         match wp {
             WirePoint::Port(p) => Ok(port_endpoint(p)),
-            WirePoint::Junction { junction_id, .. } => {
-                let id = renames
-                    .iter()
-                    .find(|(old, _)| old == junction_id)
-                    .map(|(_, new)| new.clone())
-                    .unwrap_or_else(|| junction_id.clone());
+            WirePoint::Junction { net_id, junction_id } => {
+                // Renames only apply to points that lived in the ABSORBED
+                // net; the kept net's identically-named junctions stay.
+                let was_absorbed = renamed_net.as_deref() == Some(net_id.as_str());
+                let id = if was_absorbed {
+                    renames
+                        .iter()
+                        .find(|(old, _)| old == junction_id)
+                        .map(|(_, new)| new.clone())
+                        .unwrap_or_else(|| junction_id.clone())
+                } else {
+                    junction_id.clone()
+                };
                 if !net.junctions.iter().any(|j| j.id == id) {
                     return Err(EditError::UnknownJunction(id));
                 }
@@ -470,6 +482,7 @@ pub(crate) fn attach_wire(
     let net = &mut wire_nets[net_index];
     let from_ep = endpoint_of(from, net)?;
     let to_ep = endpoint_of(to, net)?;
+    let (find_from, find_to) = (from_ep.clone(), to_ep.clone());
 
     let duplicate = net.segments.iter().any(|seg| {
         (seg.from == from_ep && seg.to == to_ep) || (seg.from == to_ep && seg.to == from_ep)
@@ -483,13 +496,27 @@ pub(crate) fn attach_wire(
     });
 
     let net_id = net.id.clone();
-    // Re-derive logic; this is also where two-sources and doubly-wired
-    // inputs are rejected (the whole step rolls back on error).
-    for net in wire_nets.iter_mut() {
-        sync_net_logic(net, components, &ctx)?;
-        drop_orphan_junctions(net);
-    }
-    gc_nets(wire_nets);
+    let ids_before: Vec<String> = wire_nets.iter().map(|n| n.id.clone()).collect();
+    // Settle the graph the same way EVERY edit does — orphan drop, island
+    // split, derived logic, empty-net collection. No edit path may leave a
+    // net whose disconnected islands share derived state ("this stub
+    // thinks it's driven by a component it's no longer attached to").
+    repair_nets(wire_nets, components, &ctx)?;
+    // Settling may have moved the fresh segment into a split-off net.
+    // Report the net it actually lives in, so continued drawing follows.
+    // (Junction ids are only unique per net — key on the segment itself,
+    // scoped to the original net and anything born in this settle.)
+    let net_id = wire_nets
+        .iter()
+        .filter(|n| n.id == net_id || !ids_before.contains(&n.id))
+        .find(|n| {
+            n.segments.iter().any(|s| {
+                (s.from == find_from && s.to == find_to)
+                    || (s.from == find_to && s.to == find_from)
+            })
+        })
+        .map(|n| n.id.clone())
+        .unwrap_or(net_id);
 
     Ok(WireAttach {
         net_id,

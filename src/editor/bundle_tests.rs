@@ -343,18 +343,18 @@ fn displays_are_invisible_to_the_engine() {
     e.place_component("dff", [0, 0]).unwrap();
     e.place_component("light", [6, 0]).unwrap();
     e.place_component("bundle", [0, 4]).unwrap();
-    e.place_component("seg", [6, 4]).unwrap();
+    e.place_component("segment", [6, 4]).unwrap();
     e.place_component("nand", [16, 0]).unwrap();
     e.connect(port("dff_1", "out"), port("light_1", "in"), &[]).unwrap();
     e.connect(port("dff_1", "out"), port("nand_1", "a"), &[]).unwrap();
     e.set_bundle_width("bundle_1", 16).unwrap();
-    e.connect(port("bundle_1", "bundle"), port("seg_1", "in"), &[]).unwrap();
+    e.connect(port("bundle_1", "bundle"), port("segment_1", "in"), &[]).unwrap();
 
     // The engine sees the nand wired, and no trace of the displays.
     let def = crate::convert::project_to_circuit(&e.project).unwrap();
     let ex = crate::expander::expand(&def).unwrap();
     crate::compiler::compile(&ex.def).unwrap();
-    assert!(ex.def.components.iter().all(|c| c.name != "light_1" && c.name != "seg_1"));
+    assert!(ex.def.components.iter().all(|c| c.name != "light_1" && c.name != "segment_1"));
     assert_eq!(
         ex.def.components.iter().find(|c| c.name == "nand_1").unwrap().inputs.get("a"),
         Some(&"dff_1".to_string())
@@ -388,12 +388,12 @@ fn display_configuration_is_validated_and_respects_neighbours() {
     assert!(e.project.components[0].display.is_none());
 
     // Segment type: only 8 or 16.
-    e.place_component("seg", [8, 0]).unwrap();
+    e.place_component("segment", [8, 0]).unwrap();
     assert_eq!(
-        e.configure_display("seg_1", Default::default(), Some(12)).unwrap_err(),
+        e.configure_display("segment_1", Default::default(), Some(12)).unwrap_err(),
         EditError::BadBundleWidth
     );
-    e.configure_display("seg_1", Default::default(), Some(8)).unwrap();
+    e.configure_display("segment_1", Default::default(), Some(8)).unwrap();
     assert_eq!(crate::layout::seg_lanes(&e.project.components[2]), 8);
 }
 
@@ -402,11 +402,11 @@ fn switching_a_seg_display_type_keeps_its_wire_as_a_mismatch() {
     let mut e = Editor::empty();
     e.place_component("bundle", [0, 0]).unwrap();
     e.set_bundle_width("bundle_1", 16).unwrap();
-    e.place_component("seg", [6, 0]).unwrap();
-    e.connect(port("bundle_1", "bundle"), port("seg_1", "in"), &[]).unwrap();
+    e.place_component("segment", [6, 0]).unwrap();
+    e.connect(port("bundle_1", "bundle"), port("segment_1", "in"), &[]).unwrap();
 
     // 16 → 8: the wire stays (a flashing mismatch), nothing breaks.
-    e.configure_display("seg_1", Default::default(), Some(8)).unwrap();
+    e.configure_display("segment_1", Default::default(), Some(8)).unwrap();
     assert!(e.project.wire_nets.iter().any(|n| n.bundle && !n.segments.is_empty()));
     crate::convert::project_to_circuit(&e.project).unwrap();
 }

@@ -64,10 +64,8 @@ impl Renderer {
             canvas.stroke_path(&p, &border);
 
             let label_size = (12.0 * zoom).clamp(4.0, 16.0);
-            let label = match pin.bundle {
-                Some(w) => format!("{} ×{w}", pin.name),
-                None => pin.name.clone(),
-            };
+            // The lane count lives in the pin's socket, not the plate.
+            let label = pin.name.clone();
             self.text(
                 canvas,
                 tl[0] + plate.w * cell / 2.0,
@@ -82,7 +80,11 @@ impl Renderer {
             // Port circle (wire attachment point) — square when the pin
             // carries a bundle. Input pins drive wires, so they get the
             // filled "source" look.
-            let r = (4.0 * zoom).clamp(2.0, 6.5);
+            let r = if pin.bundle.is_some() {
+                (6.0 * zoom).clamp(2.5, 10.0)
+            } else {
+                (4.0 * zoom).clamp(2.0, 6.5)
+            };
             let mut c = Path::new();
             if pin.bundle.is_some() {
                 c.rounded_rect(s[0] - r, s[1] - r, r * 2.0, r * 2.0, r * 0.3);
@@ -103,6 +105,24 @@ impl Renderer {
             });
             ring.set_line_width(if hovered_port { 2.5 } else { 1.5 });
             canvas.stroke_path(&c, &ring);
+            if let Some(w) = pin.bundle {
+                if r >= 4.5 {
+                    let digit_color = match pin.io {
+                        PortKind::Input => femtovg::Color::white(),
+                        PortKind::Output => theme::text(),
+                    };
+                    self.text(
+                        canvas,
+                        s[0],
+                        s[1],
+                        &format!("{w}"),
+                        (r * 1.25).min(12.0),
+                        digit_color,
+                        Align::Center,
+                        Baseline::Middle,
+                    );
+                }
+            }
 
             // Tie plate and circle together with a short leader.
             let mut leader = Path::new();

@@ -90,8 +90,7 @@ pub fn ui_layout(app: &App) -> UiLayout {
                 | "image"
                 | "light"
                 | "rgb"
-                | "seg"
-                | "face"
+                | "segment"
         )
     };
     for item in app.palette_items() {

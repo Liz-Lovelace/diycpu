@@ -118,7 +118,7 @@ impl Renderer {
                     dot.circle(glyph_x + 5.0 + i as f32 * 4.0, glyph_y, 1.6);
                     canvas.fill_path(&dot, &Paint::color(femtovg::Color::rgb(c.0, c.1, c.2)));
                 }
-            } else if item.type_name == "seg" {
+            } else if item.type_name == "segment" {
                 // A tiny "8": two stacked boxes of bars.
                 let mut segs = Path::new();
                 for (x0, y0, x1, y1) in [
@@ -132,22 +132,6 @@ impl Renderer {
                     segs.line_to(glyph_x + x1, glyph_y + y1);
                 }
                 canvas.stroke_path(&segs, &cp);
-            } else if item.type_name == "face" {
-                let mut f = Path::new();
-                f.circle(glyph_x + 5.5, glyph_y - 3.0, 1.7);
-                f.circle(glyph_x + 12.5, glyph_y - 3.0, 1.7);
-                canvas.fill_path(&f, &cp);
-                let mut smile = Path::new();
-                smile.move_to(glyph_x + 4.0, glyph_y + 3.0);
-                smile.bezier_to(
-                    glyph_x + 6.5,
-                    glyph_y + 6.5,
-                    glyph_x + 11.5,
-                    glyph_y + 6.5,
-                    glyph_x + 14.0,
-                    glyph_y + 3.0,
-                );
-                canvas.stroke_path(&smile, &cp);
             } else if item.type_name == "image" {
                 // A tiny landscape: frame, sun, mountains.
                 let mut frame = Path::new();

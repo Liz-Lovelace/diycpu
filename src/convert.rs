@@ -103,7 +103,7 @@ fn lane_name(pin: &str, k: u32) -> String {
 }
 
 fn is_display_comp(c: &ProjectComponent) -> bool {
-    matches!(c.component_type.as_str(), "light" | "rgb" | "seg" | "face")
+    matches!(c.component_type.as_str(), "light" | "rgb" | "segment")
 }
 
 fn project_needs_lowering(p: &Project) -> bool {

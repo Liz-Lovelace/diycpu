@@ -164,8 +164,8 @@ fn display_cog_opens_settings_and_configures() {
 #[test]
 fn seg_type_switch_via_dialog() {
     let mut d = Driver::new();
-    d.place("seg", [6.0, 4.0]);
-    d.app.action_open_display_dialog("seg_1");
+    d.place("segment", [6.0, 4.0]);
+    d.app.action_open_display_dialog("segment_1");
     let geom = d.app.display_dialog_geometry().unwrap();
     let eight = geom
         .variants
@@ -176,10 +176,11 @@ fn seg_type_switch_via_dialog() {
     d.app.cursor = [eight.x + 4.0, eight.y + 4.0];
     d.app.display_dialog_pressed();
     assert_eq!(d.app.editor.project.components[0].bits, Some(8));
-    // The footprint follows the 8-segment aspect.
+    // The footprint stays on whole cells so displays tile the grid.
     let r = diycpu::layout::footprint(
         &d.app.editor.project.abstractions,
         &d.app.editor.project.components[0],
     );
-    assert!((r.w / r.h - diycpu::layout::SEG8_ASPECT).abs() < 1e-3);
+    assert_eq!(r.w.fract(), 0.0);
+    assert_eq!(r.h.fract(), 0.0);
 }

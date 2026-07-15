@@ -359,7 +359,7 @@ impl Editor {
                 return Err(EditError::UnknownComponent(id.clone()));
             }
             if let Some(bits) = seg_bits {
-                if bits != 8 && bits != 16 {
+                if bits != 8 && bits != 16 && bits != 10 {
                     return Err(EditError::BadBundleWidth);
                 }
                 components[index].bits = Some(bits);

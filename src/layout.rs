@@ -58,23 +58,24 @@ pub fn is_bundle_component(component_type: &str) -> bool {
 
 /// Is this a display element?
 pub fn is_display(component_type: &str) -> bool {
-    matches!(component_type, "light" | "rgb" | "seg" | "face")
+    matches!(component_type, "light" | "rgb" | "segment")
 }
 
-/// Aspect ratios (w/h) of the aspect-locked display faces. The numbers
-/// come from the artwork view boxes in render/segments.rs.
-pub const SEG8_ASPECT: f32 = 267.0 / 319.0;
-pub const SEG16_ASPECT: f32 = 245.0 / 349.0;
+/// Aspect ratios (w/h) the display footprints aim for. Glyphs aspect-fit
+/// INSIDE the slab, so the slab itself can stick to whole grid cells and
+/// tile without gaps.
+pub const SEG_ASPECT: f32 = 0.75;
 pub const FACE_ASPECT: f32 = 594.0 / 282.0;
-/// The face display's lane count (one per artwork color).
+/// The face variant's lane count (one per artwork segment).
 pub const FACE_LANES: u32 = 10;
 
-/// A segment display is the 8- or 16-segment type (stored in `bits`).
+/// A segment display's variant, as its lane count: 8, 16, or 10 (the
+/// face). Stored in `bits`; anything else snaps to the default 16.
 pub fn seg_lanes(comp: &ProjectComponent) -> u32 {
-    if comp.bits.unwrap_or(16) <= 8 {
-        8
-    } else {
-        16
+    match comp.bits {
+        Some(8) => 8,
+        Some(10) => 10,
+        _ => 16,
     }
 }
 
@@ -93,29 +94,24 @@ pub fn display_scale(comp: &ProjectComponent) -> f32 {
     comp.display
         .as_ref()
         .and_then(|d| d.scale)
-        .unwrap_or(match comp.component_type.as_str() {
-            "face" => 5.0,
-            _ => 6.0,
-        })
+        .unwrap_or(6.0)
         .clamp(2.0, 40.0)
 }
 
-/// Footprint of a display element, in grid units.
+/// Footprint of a display element, in grid units. Segment displays snap
+/// to WHOLE cells (height from the size setting, width from the aspect),
+/// so rows and columns of them tile the grid without gaps.
 fn display_size(comp: &ProjectComponent) -> [f32; 2] {
     match comp.component_type.as_str() {
         "light" | "rgb" => light_size(comp),
-        "seg" => {
-            let h = display_scale(comp);
-            let aspect = if seg_lanes(comp) == 8 {
-                SEG8_ASPECT
-            } else {
-                SEG16_ASPECT
-            };
-            [h * aspect, h]
-        }
         _ => {
-            let h = display_scale(comp);
-            [h * FACE_ASPECT, h]
+            let h = display_scale(comp).round().max(2.0);
+            let aspect = if seg_lanes(comp) == 10 {
+                FACE_ASPECT
+            } else {
+                SEG_ASPECT
+            };
+            [(h * aspect).round().max(2.0), h]
         }
     }
 }
@@ -125,8 +121,7 @@ fn display_ports(comp: &ProjectComponent) -> Vec<PortInfo> {
     let wire = match comp.component_type.as_str() {
         "light" => WireKind::Signal,
         "rgb" => WireKind::Bundle(3),
-        "seg" => WireKind::Bundle(seg_lanes(comp)),
-        _ => WireKind::Bundle(FACE_LANES),
+        _ => WireKind::Bundle(seg_lanes(comp)),
     };
     vec![PortInfo {
         name: "in".into(),
@@ -187,14 +182,10 @@ pub fn type_ports(
             kind: PortKind::Input,
             wire: WireKind::Signal,
         }]),
-        "rgb" | "seg" | "face" => Some(vec![PortInfo {
+        "rgb" | "segment" => Some(vec![PortInfo {
             name: "in".into(),
             kind: PortKind::Input,
-            wire: WireKind::Bundle(match component_type {
-                "rgb" => 3,
-                "seg" => 16,
-                _ => FACE_LANES,
-            }),
+            wire: WireKind::Bundle(if component_type == "rgb" { 3 } else { 16 }),
         }]),
         "clk" | "const" => Some(vec![port("out", PortKind::Output)]),
         "nand" => Some(vec![
@@ -279,8 +270,7 @@ pub fn type_size(abstractions: &[ProjectAbstraction], component_type: &str) -> O
     match component_type {
         "bundle" | "unbundle" => Some([2.0, 8.0]),
         "light" | "rgb" => Some([2.0, 2.0]),
-        "seg" => Some([6.0 * SEG16_ASPECT, 6.0]),
-        "face" => Some([5.0 * FACE_ASPECT, 5.0]),
+        "segment" => Some([5.0, 6.0]),
         "clk" | "const" => Some([2.0, 2.0]),
         "nand" | "dff" => Some([3.0, 2.0]),
         name => {

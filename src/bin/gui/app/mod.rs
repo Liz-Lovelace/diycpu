@@ -420,8 +420,7 @@ impl App {
             "unbundle".to_string(),
             "light".to_string(),
             "rgb".to_string(),
-            "seg".to_string(),
-            "face".to_string(),
+            "segment".to_string(),
             "note".to_string(),
             "image".to_string(),
         ];

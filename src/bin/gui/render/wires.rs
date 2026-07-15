@@ -1,7 +1,7 @@
 //! Wires: committed nets (signal and bundle), the drawing preview, and
 //! the derived wires that feed output pins.
 
-use femtovg::{renderer::OpenGl, Align, Baseline, Canvas, Color, Paint, Path};
+use femtovg::{renderer::OpenGl, Canvas, Color, Paint, Path};
 
 use diycpu::layout::{self, PortKind};
 use diycpu::project::WireNet;
@@ -160,30 +160,8 @@ impl Renderer {
                 }
             }
 
-            // Each end of the bus wears its width — when the two ends
-            // disagree, the numbers say exactly how.
-            if net.bundle && zoom >= 0.45 {
-                let size = (8.0 * zoom).clamp(6.0, 12.0);
-                let step = (14.0 * zoom).clamp(10.0, 20.0);
-                for (pos, w, inward) in &ends {
-                    let s = ctx.px(*pos);
-                    // A step along the wire, then lifted off it.
-                    let (x, y) = (
-                        s[0] + inward[0] * step - inward[1] * size * 0.8,
-                        s[1] + inward[1] * step + inward[0] * size * 0.8,
-                    );
-                    self.text(
-                        canvas,
-                        x,
-                        y,
-                        &format!("{w}"),
-                        size,
-                        if mismatched { theme::danger() } else { theme::text_dim() },
-                        Align::Center,
-                        Baseline::Middle,
-                    );
-                }
-            }
+            // The sockets at each end wear the widths (see parts/pins);
+            // a mismatch already announces itself with the flash.
 
             for junction in &net.junctions {
                 let hovered = ctx.focus

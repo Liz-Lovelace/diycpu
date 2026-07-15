@@ -181,7 +181,7 @@ pub const PALETTE_WIDTH: f32 = 190.0;
 pub const TOPBAR_HEIGHT: f32 = 42.0;
 pub const STATUSBAR_HEIGHT: f32 = 26.0;
 
-/// Unlit segments of the segment displays: a whisper on the paper.
+/// Unlit segments of the segment displays: barely-there on the paper.
 pub fn segment_off() -> Color {
-    Color::rgb(229, 224, 217)
+    Color::rgb(242, 240, 236)
 }

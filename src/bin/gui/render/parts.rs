@@ -345,7 +345,16 @@ impl Renderer {
 
         for port in &layout::component_ports(ctx.abstractions, comp) {
             let s = ctx.px(port.pos);
-            let r = (3.5 * shape.zoom).clamp(1.0, 6.0);
+            // Bundle sockets are bigger squares wearing their lane count.
+            let bundle_width = match port.info.wire {
+                layout::WireKind::Bundle(w) => Some(w),
+                layout::WireKind::Signal => None,
+            };
+            let r = if bundle_width.is_some() {
+                (6.0 * shape.zoom).clamp(2.0, 10.0)
+            } else {
+                (3.5 * shape.zoom).clamp(1.0, 6.0)
+            };
             let hovered = hovered_port.as_deref() == Some(port.info.name.as_str());
 
             let fill = match port.info.kind {
@@ -379,6 +388,26 @@ impl Renderer {
             });
             ring.set_line_width(if hovered { 2.5 } else { 1.5 });
             canvas.stroke_path(&p, &ring);
+
+            // The lane count lives right in the socket.
+            if let Some(w) = bundle_width {
+                if r >= 4.5 {
+                    let digit_color = match port.info.kind {
+                        PortKind::Output => femtovg::Color::white(),
+                        PortKind::Input => theme::text(),
+                    };
+                    self.text(
+                        canvas,
+                        s[0],
+                        s[1],
+                        &format!("{w}"),
+                        (r * 1.25).min(12.0),
+                        digit_color,
+                        Align::Center,
+                        Baseline::Middle,
+                    );
+                }
+            }
 
             // Port names belong to the closed look.
             if show_labels && chrome_alpha > 0.01 && !skip_label(port) {

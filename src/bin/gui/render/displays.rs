@@ -86,11 +86,11 @@ impl Renderer {
         match comp.component_type.as_str() {
             "light" => self.draw_light(canvas, comp, px, values, zoom, false),
             "rgb" => self.draw_light(canvas, comp, px, values, zoom, true),
-            "seg" => {
-                let design = if layout::seg_lanes(comp) == 8 { &SEG8 } else { &SEG16 };
-                self.draw_seg(canvas, comp, px, values, zoom, design);
-            }
-            _ => self.draw_face(canvas, comp, px, values, zoom),
+            _ => match layout::seg_lanes(comp) {
+                8 => self.draw_seg(canvas, comp, px, values, zoom, &SEG8),
+                10 => self.draw_face(canvas, comp, px, values, zoom),
+                _ => self.draw_seg(canvas, comp, px, values, zoom, &SEG16),
+            },
         }
     }
 

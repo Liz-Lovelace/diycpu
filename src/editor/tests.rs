@@ -423,6 +423,10 @@ fn merging_two_stub_nets_via_wire() {
     assert_eq!(net.source, Some(port("nand_1", "out")));
     assert_eq!(net.sinks, vec![port("nand_2", "a")]);
     assert_eq!(net.segments.len(), 3);
+    // Both stubs carried a junction named "j_1": the collision rename must
+    // only touch the absorbed net's point, never fold the new wire into a
+    // self-loop on the renamed one.
+    assert!(net.segments.iter().all(|s| s.from != s.to));
 }
 
 #[test]
@@ -1345,4 +1349,64 @@ fn normalize_accepts_example_files() {
             }
         }
     }
+}
+
+
+#[test]
+fn replacing_a_wired_input_leaves_no_haunted_stub() {
+    let port = |c: &str, p: &str| PortRef {
+        component_id: c.into(),
+        port_name: p.into(),
+    };
+    let mut e = Editor::empty();
+    e.place_component("nand", [0, 0]).unwrap();
+    e.place_component("nand", [8, 0]).unwrap();
+    // nand_1.out → node → nand_2.a
+    e.connect(port("nand_1", "out"), port("nand_2", "a"), &[[6.0, 1.0]]).unwrap();
+
+    // Drawing from the already-wired input replaces its old feed. The
+    // old feed's tail must become its OWN net again — not a haunted
+    // island still claiming nand_1 as the driver of the new stub.
+    let attach = e
+        .add_wire(
+            WirePoint::Port(port("nand_2", "a")),
+            WirePoint::New([10.0, 4.0]),
+        )
+        .unwrap();
+    let stub = e
+        .project
+        .wire_nets
+        .iter()
+        .find(|n| n.id == attach.net_id)
+        .unwrap();
+    assert!(
+        stub.source.is_none(),
+        "the fresh stub has no driver: {:?}",
+        stub.source
+    );
+    assert_eq!(stub.sinks, vec![port("nand_2", "a")]);
+    // The old feed survives as a separate stub with its true source.
+    assert!(e
+        .project
+        .wire_nets
+        .iter()
+        .any(|n| n.id != attach.net_id && n.source == Some(port("nand_1", "out"))));
+
+    // And a new driver connects to the stub without a phantom conflict.
+    e.place_component("nand", [0, 6]).unwrap();
+    e.add_wire(
+        WirePoint::Port(port("nand_3", "out")),
+        WirePoint::Junction {
+            net_id: attach.net_id.clone(),
+            junction_id: attach.new_junction.clone().unwrap(),
+        },
+    )
+    .unwrap();
+    let net = e
+        .project
+        .wire_nets
+        .iter()
+        .find(|n| n.sinks.contains(&port("nand_2", "a")))
+        .unwrap();
+    assert_eq!(net.source, Some(port("nand_3", "out")));
 }

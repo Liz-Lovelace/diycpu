@@ -138,6 +138,32 @@ pub fn normalize(project: &mut Project) -> Vec<String> {
         }
     }
 
+    // Early display components were separate "seg"/"face" types; they are
+    // one "segment" type with a variant now.
+    {
+        let sheets = std::iter::once(&mut project.components)
+            .chain(project.abstractions.iter_mut().map(|a| &mut a.components));
+        for components in sheets {
+            for c in components.iter_mut() {
+                match c.component_type.as_str() {
+                    "seg" => {
+                        c.component_type = "segment".into();
+                        notes.push(format!("\"{}\" updated to the segment type", c.id));
+                    }
+                    "face" => {
+                        c.component_type = "segment".into();
+                        c.bits = Some(10);
+                        notes.push(format!(
+                            "\"{}\" updated to the segment type (face variant)",
+                            c.id
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
     // Bundle pins must name a real pin and carry a sane lane count.
     for a in &mut project.abstractions {
         let inputs = a.inputs.clone();

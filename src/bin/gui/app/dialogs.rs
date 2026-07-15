@@ -655,7 +655,7 @@ impl App {
 
         // Color swatches (lights and seg displays).
         let mut swatches = Vec::new();
-        if matches!(kind, "light" | "seg") {
+        if matches!(kind, "light" | "seg" | "face") {
             let sw = 30.0;
             let total = DISPLAY_COLORS.len() as f32 * (sw + 8.0) - 8.0;
             let mut sx = panel.x + (panel.w - total) / 2.0;

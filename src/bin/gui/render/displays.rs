@@ -13,7 +13,7 @@ use diycpu::project::ProjectComponent;
 use crate::app::App;
 use crate::theme;
 
-use super::segments::{SegDesign, FACE, FACE_COLORS, FACE_VIEW, SEG16, SEG8};
+use super::segments::{SegDesign, FACE, FACE_VIEW, SEG16, SEG8};
 use super::*;
 
 /// Parse a lit color ("#rrggbb"), falling back to the classic LED red.
@@ -90,7 +90,7 @@ impl Renderer {
                 let design = if layout::seg_lanes(comp) == 8 { &SEG8 } else { &SEG16 };
                 self.draw_seg(canvas, comp, px, values, zoom, design);
             }
-            _ => self.draw_face(canvas, px, values, zoom),
+            _ => self.draw_face(canvas, comp, px, values, zoom),
         }
     }
 
@@ -173,8 +173,9 @@ impl Renderer {
         zoom: f32,
         design: &SegDesign,
     ) {
-        let slab = Color::rgb(38, 41, 47);
-        fill_rounded(canvas, px, (3.0 * zoom).clamp(1.0, 5.0), slab);
+        // Same paper as every other component — displays belong to the
+        // light theme like everything else.
+        fill_rounded(canvas, px, (3.0 * zoom).clamp(1.0, 5.0), theme::chip_fill());
         stroke_rounded(
             canvas,
             px,
@@ -191,7 +192,7 @@ impl Renderer {
         let oy = px.y + (px.h - vh * s) / 2.0 - vy * s;
 
         let on = lit_color(comp);
-        let off = Color::rgb(55, 59, 66);
+        let off = theme::segment_off();
         for (k, d) in design.paths.iter().enumerate() {
             let lit = values.get(k).copied().flatten().unwrap_or(false);
             let path = svg_path(d, s, ox, oy);
@@ -199,16 +200,18 @@ impl Renderer {
         }
     }
 
-    /// The face: cream card, each artwork segment lit in its own color.
+    /// The face: the same paper as everything else, all segments in the
+    /// one configured color (the artwork's colors only marked which
+    /// pixels belong to which segment).
     fn draw_face(
         &self,
         canvas: &mut Canvas<OpenGl>,
+        comp: &ProjectComponent,
         px: Rect,
         values: &[Option<bool>],
         zoom: f32,
     ) {
-        let card = Color::rgb(255, 241, 232);
-        fill_rounded(canvas, px, (3.0 * zoom).clamp(1.0, 5.0), card);
+        fill_rounded(canvas, px, (3.0 * zoom).clamp(1.0, 5.0), theme::chip_fill());
         stroke_rounded(
             canvas,
             px,
@@ -220,11 +223,11 @@ impl Renderer {
         let s = (px.w / FACE_VIEW[0]).min(px.h / FACE_VIEW[1]);
         let ox = px.x + (px.w - FACE_VIEW[0] * s) / 2.0;
         let oy = px.y + (px.h - FACE_VIEW[1] * s) / 2.0;
-        let off = Color::rgb(246, 231, 221);
+        let on = lit_color(comp);
+        let off = theme::segment_off();
         for (k, rects) in FACE.iter().enumerate() {
             let color = if values.get(k).copied().flatten().unwrap_or(false) {
-                let [r, g, b] = FACE_COLORS[k];
-                Color::rgb(r, g, b)
+                on
             } else {
                 off
             };

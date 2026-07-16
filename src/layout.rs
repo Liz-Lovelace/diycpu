@@ -271,8 +271,10 @@ pub fn type_size(abstractions: &[ProjectAbstraction], component_type: &str) -> O
         "bundle" | "unbundle" => Some([2.0, 8.0]),
         "light" | "rgb" => Some([2.0, 2.0]),
         "segment" => Some([5.0, 6.0]),
-        "clk" | "const" => Some([2.0, 2.0]),
-        "nand" | "dff" => Some([3.0, 2.0]),
+        "clk" => Some([2.0, 2.0]),
+        "const" => Some([1.0, 1.0]),
+        "nand" => Some([2.0, 2.0]),
+        "dff" => Some([3.0, 2.0]),
         name => {
             let def = abstractions.iter().find(|a| a.name == name)?;
             Some([def.width, def.height])
@@ -1201,7 +1203,7 @@ mod tests {
         let out = ports.iter().find(|p| p.info.name == "out").unwrap();
         assert_eq!(a.pos, [10.0, 20.5]);
         assert_eq!(b.pos, [10.0, 21.5]);
-        assert_eq!(out.pos, [13.0, 20.5], "outputs sit on half-grid slots too");
+        assert_eq!(out.pos, [12.0, 20.5], "outputs sit on half-grid slots too");
         assert_eq!(out.side, Side::Right);
     }
 

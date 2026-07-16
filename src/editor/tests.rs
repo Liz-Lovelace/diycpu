@@ -35,11 +35,11 @@ fn place_rejects_overlap_and_unknown_type() {
     let mut e = Editor::empty();
     e.place_component("nand", [0, 0]).unwrap();
     assert_eq!(
-        e.place_component("nand", [2, 1]).unwrap_err(),
+        e.place_component("nand", [1, 1]).unwrap_err(),
         EditError::Overlap
     );
     // Touching edge-to-edge is allowed.
-    e.place_component("nand", [3, 0]).unwrap();
+    e.place_component("nand", [2, 0]).unwrap();
     assert!(matches!(
         e.place_component("bogus", [20, 20]).unwrap_err(),
         EditError::UnknownComponentType(_)

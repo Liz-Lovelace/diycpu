@@ -15,30 +15,44 @@ use super::*;
 /// may not be placed anywhere yet. Pipeline failures for OTHER reasons are
 /// ignored: unfinished circuits are legal editing states, and Run reports
 /// its own errors.
-pub(crate) fn guard_no_combinational_loop(project: &Project, sheet: SheetRef) -> Result<(), EditError> {
+/// The synthesized instance id used when an abstraction is checked or
+/// simulated standalone (not placed anywhere).
+pub const STANDALONE_INSTANCE: &str = "__standalone";
+
+/// A minimal project that places one instance of abstraction `index` —
+/// how an unplaced abstraction gets compiled, simulated, or checked.
+pub fn standalone_probe(project: &Project, index: usize) -> Option<Project> {
+    let def = project.abstractions.get(index)?;
+    Some(Project {
+        name: "__probe".into(),
+        steps: project.steps,
+        abstractions: project.abstractions.clone(),
+        components: vec![ProjectComponent {
+            display: None,
+            bits: None,
+            id: STANDALONE_INSTANCE.into(),
+            component_type: def.name.clone(),
+            init: None,
+            pos: [0.0, 0.0],
+        }],
+        wire_nets: vec![],
+        notes: vec![],
+        images: vec![],
+    })
+}
+
+pub(crate) fn guard_no_combinational_loop(
+    project: &Project,
+    sheet: SheetRef,
+) -> Result<(), EditError> {
     let probe;
     let checked: &Project = match sheet {
         SheetRef::Top => project,
         SheetRef::Abstraction(i) => {
-            let Some(def) = project.abstractions.get(i) else {
+            let Some(p) = standalone_probe(project, i) else {
                 return Ok(());
             };
-            probe = Project {
-                name: "__probe".into(),
-                steps: 1,
-                abstractions: project.abstractions.clone(),
-                components: vec![ProjectComponent {
-                    display: None,
-                    bits: None,
-                    id: "__probe_instance".into(),
-                    component_type: def.name.clone(),
-                    init: None,
-                    pos: [0.0, 0.0],
-                }],
-                wire_nets: vec![],
-                notes: vec![],
-                images: vec![],
-            };
+            probe = p;
             &probe
         }
     };

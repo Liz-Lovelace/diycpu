@@ -150,6 +150,21 @@ pub fn expand(circuit_def: &CircuitDef) -> Result<ExpandedCircuit, ExpandError> 
         }
     }
 
+    // Alias values themselves may be dotted references (a top-level
+    // instance's input binding is taken verbatim): chase them through the
+    // map the same way, so every alias lands on a flat component.
+    let snapshot = aliases.clone();
+    for value in aliases.values_mut() {
+        let mut hops = 0;
+        while let Some(resolved) = snapshot.get(value.as_str()) {
+            if resolved == value || hops > 64 {
+                break;
+            }
+            *value = resolved.clone();
+            hops += 1;
+        }
+    }
+
     Ok(ExpandedCircuit {
         def: CircuitDef {
             name: circuit_def.name.clone(),
@@ -352,6 +367,15 @@ fn expand_instance(
     flat_components: &mut Vec<ComponentDef>,
     aliases: &mut HashMap<String, String>,
 ) -> Result<HashMap<String, String>, ExpandError> {
+    // Phase 0: publish where this instance's input pins point, so the GUI
+    // can light the wires an INPUT:x pseudo-port drives inside the sheet.
+    for (input_name, binding) in input_bindings {
+        aliases.insert(
+            format!("{name_prefix}/INPUT:{input_name}"),
+            binding.clone(),
+        );
+    }
+
     // Phase 1: Register all internal component flat names.
     let mut internal_name_map: HashMap<String, String> = HashMap::new();
     for component in &abstraction.components {

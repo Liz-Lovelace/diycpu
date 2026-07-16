@@ -63,16 +63,12 @@ impl Renderer {
         });
 
         // While running, sheets are keyed into the flattened simulation by
-        // their instance path from the top.
-        // A view rooted at an abstraction (sidebar ↗) has no unique instance
-        // path, so its values render neutral.
-        let root_sim_path = if app.is_running() && app.view_root == SheetRef::Top {
-            Some(
-                app.path[..start]
-                    .iter()
-                    .map(|seg| seg.instance_id.clone())
-                    .collect::<Vec<_>>(),
-            )
+        // their instance path from the top. Rooted views carry a base path
+        // (a placed instance's, or the standalone probe's).
+        let root_sim_path = if app.is_running() {
+            let mut p = app.run_base_path.clone();
+            p.extend(app.path[..start].iter().map(|seg| seg.instance_id.clone()));
+            Some(p)
         } else {
             None
         };

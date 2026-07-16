@@ -275,6 +275,10 @@ pub struct App {
     pub palette_scroll: f32,
     /// Wall-clock seconds since launch; drives animated images.
     pub anim_seconds: f32,
+    /// While running: the instance path (from the flattened top) that the
+    /// VIEW ROOT sheet's values are keyed under. Empty when the view is
+    /// rooted at the top circuit.
+    pub run_base_path: Vec<String>,
     /// Set when an action would discard unsaved changes; repeating the
     /// action confirms it. Any other click clears it.
     pending_discard: Option<DiscardIntent>,
@@ -337,6 +341,7 @@ impl App {
             playing: false,
             palette_scroll: 0.0,
             anim_seconds: 0.0,
+            run_base_path: Vec::new(),
             pending_discard: None,
             pending_fit: true,
         }

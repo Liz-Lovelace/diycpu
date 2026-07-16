@@ -91,7 +91,10 @@ level. The title bar shows where you are (`project ▸ alu ▸ adder`).
 
 “▶ Run” (or Space) compiles and starts the simulation without moving your
 view — if you're zoomed three levels deep, you watch the signals right
-there. Problems show in the status bar and you stay in edit mode. While running: ←/→ step the
+there. A view rooted at an abstraction (sidebar ↗) runs too: it shows
+the values of the abstraction's first placed instance, or — if it isn't
+placed anywhere — simulates it standalone, with unconnected inputs
+reading 0 (drop consts inside to poke at it). Problems show in the status bar and you stay in edit mode. While running: ←/→ step the
 clock back and forward (Home rewinds), or press **P** (or “Play”) to let
 it run on its own — stepping by hand pauses it. `P` from edit mode starts
 running and playing in one go. Wires glow amber when high, flip-flops fill

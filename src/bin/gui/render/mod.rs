@@ -181,7 +181,8 @@ impl SheetCtx<'_> {
     }
 
     /// The value behind an output port — unbundler lanes resolved to their
-    /// true driver, interface-pin pseudo-ports answering None.
+    /// true driver; `INPUT:x` pseudo-ports read the alias the expander
+    /// publishes for the instance's binding.
     pub(crate) fn output_value(
         &self,
         app: &App,
@@ -191,7 +192,14 @@ impl SheetCtx<'_> {
             (Some(path), Mode::Run(session)) => (path, session),
             _ => return None,
         };
+        if port.component_id.starts_with(diycpu::convert::INPUT_PREFIX) {
+            // Keyed like a primitive: "{path}/INPUT:{name}".
+            return session.port_value_at(path, true, port);
+        }
         let src = crate::app::resolve_lane_display(self.components, self.wire_nets, port, 0)?;
+        if src.component_id.starts_with(diycpu::convert::INPUT_PREFIX) {
+            return session.port_value_at(path, true, &src);
+        }
         let is_prim = self
             .components
             .iter()

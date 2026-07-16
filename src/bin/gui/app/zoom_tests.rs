@@ -125,3 +125,50 @@ fn undo_across_sheets_resets_the_view() {
     d.app.undo();
     assert_eq!(d.app.editor.sheet, d.app.focus_sheet());
 }
+
+
+#[test]
+fn running_a_rooted_unplaced_abstraction_simulates_it_standalone() {
+    let mut d = Driver::new();
+    d.app.action_new_abstraction();
+    d.type_text("lab");
+    d.app.handle_key(KeyInput::Enter);
+    d.place("const", [2.0, 2.0]);
+    d.app.double_clicked(); // const_1 starts at 1
+
+    // "lab" is placed nowhere; running the rooted view probes standalone.
+    d.app.action_run_toggle();
+    assert!(d.app.is_running(), "{}", d.app.status.text);
+    assert_eq!(
+        d.app.run_base_path,
+        vec![diycpu::editor::STANDALONE_INSTANCE.to_string()]
+    );
+    let Mode::Run(session) = &d.app.mode else { unreachable!() };
+    assert_eq!(
+        session.component_value_at(&d.app.run_base_path, "const_1"),
+        Some(true),
+        "the standalone instance computes"
+    );
+}
+
+#[test]
+fn running_a_rooted_placed_abstraction_shows_its_first_instance() {
+    let mut d = Driver::new();
+    d.app.action_new_abstraction();
+    d.type_text("lab");
+    d.app.handle_key(KeyInput::Enter);
+    d.place("const", [2.0, 2.0]);
+    d.app.action_back_to_top();
+    d.place("lab", [4.0, 4.0]);
+
+    d.app.open_as_root(0);
+    d.app.action_run_toggle();
+    assert!(d.app.is_running(), "{}", d.app.status.text);
+    assert_eq!(d.app.run_base_path, vec!["lab_1".to_string()]);
+    assert!(d.app.status.text.contains("lab_1"), "{}", d.app.status.text);
+    let Mode::Run(session) = &d.app.mode else { unreachable!() };
+    assert_eq!(
+        session.component_value_at(&d.app.run_base_path, "const_1"),
+        Some(false)
+    );
+}

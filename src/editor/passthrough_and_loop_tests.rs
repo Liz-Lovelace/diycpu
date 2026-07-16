@@ -164,3 +164,43 @@ fn normalize_keeps_valid_passthroughs_and_clears_ghosts() {
     assert_eq!(project.abstractions[0].outputs.get("r"), Some(&String::new()));
     assert!(notes.iter().any(|n| n.contains("ghost")));
 }
+
+
+#[test]
+fn instance_input_bindings_are_published_as_aliases() {
+    let mut e = Editor::empty();
+    make_buf(&mut e);
+    e.place_component("dff", [0, 0]).unwrap();
+    e.place_component("buf", [6, 0]).unwrap();
+    e.connect(port("dff_1", "out"), port("buf_1", "x"), &[]).unwrap();
+
+    let def = crate::convert::project_to_circuit(&e.project).unwrap();
+    let expanded = crate::expander::expand(&def).unwrap();
+    // The wire inside buf_1 that INPUT:x drives can be valued directly.
+    assert_eq!(
+        expanded.aliases.get("buf_1/INPUT:x"),
+        Some(&"dff_1".to_string())
+    );
+}
+
+#[test]
+fn input_aliases_resolve_through_instance_outputs() {
+    let mut e = Editor::empty();
+    make_buf(&mut e);
+    // buf_2 is fed by buf_1's output — a dotted, alias-only reference at
+    // the top level. The published input alias must still land on a flat
+    // component.
+    e.place_component("dff", [0, 0]).unwrap();
+    e.place_component("buf", [6, 0]).unwrap();
+    e.place_component("buf", [12, 0]).unwrap();
+    e.connect(port("dff_1", "out"), port("buf_1", "x"), &[]).unwrap();
+    e.connect(port("buf_1", "q"), port("buf_2", "x"), &[]).unwrap();
+
+    let def = crate::convert::project_to_circuit(&e.project).unwrap();
+    let expanded = crate::expander::expand(&def).unwrap();
+    assert_eq!(
+        expanded.aliases.get("buf_2/INPUT:x"),
+        Some(&"dff_1".to_string()),
+        "alias values chase through other aliases to a flat name"
+    );
+}

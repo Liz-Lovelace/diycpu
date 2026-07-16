@@ -259,17 +259,18 @@ impl Renderer {
             "nand" => self.draw_nand_glyph(canvas, shape),
             "const" => {
                 // A constant signal's face is the value it feeds out, with
-                // a ring saying "this is a source".
+                // a ring saying "this is a source". Sized from the body so
+                // the tiny 1×1 square wears it comfortably.
                 let value = ctx.face_bit(app, comp);
-                let digit_size = (14.0 * shape.zoom).clamp(6.0, 24.0);
+                let digit_size = (shape.px.h * 0.52).clamp(5.0, 24.0);
                 let color = value_digit_color(value);
-                let center = [shape.px.x + shape.px.w * 0.45, cy];
+                let center = [cx, cy];
                 stroke_circle(
                     canvas,
                     center,
-                    digit_size * 0.75,
+                    digit_size * 0.72,
                     color,
-                    (1.6 * shape.zoom).clamp(0.6, 2.5),
+                    (1.4 * shape.zoom).clamp(0.6, 2.2),
                 );
                 self.draw_bit_digit(canvas, center, value, digit_size);
             }

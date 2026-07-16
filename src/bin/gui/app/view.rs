@@ -406,6 +406,36 @@ pub(crate) const DESCEND_AT: f32 = 1.25;
 
 pub(crate) const ASCEND_AT: f32 = 1.10;
 
+/// The shortest instance-id path from the flattened top circuit to an
+/// instance of abstraction `index` — how a rooted view finds live values
+/// when the abstraction is placed somewhere.
+pub fn instance_path_to(project: &Project, index: usize) -> Option<Vec<String>> {
+    let target = &project.abstractions.get(index)?.name;
+    let mut queue: std::collections::VecDeque<(SheetRef, Vec<String>)> =
+        std::collections::VecDeque::new();
+    queue.push_back((SheetRef::Top, Vec::new()));
+    while let Some((sheet, path)) = queue.pop_front() {
+        let Some((components, _)) = diycpu::editor::sheet_of(project, sheet) else {
+            continue;
+        };
+        for comp in components {
+            let mut next = path.clone();
+            next.push(comp.id.clone());
+            if &comp.component_type == target {
+                return Some(next);
+            }
+            if let Some(j) = project
+                .abstractions
+                .iter()
+                .position(|a| a.name == comp.component_type)
+            {
+                queue.push_back((SheetRef::Abstraction(j), next));
+            }
+        }
+    }
+    None
+}
+
 /// The true driver behind a port, for run-mode display: an unbundler's
 /// lane output resolves through the sheet's bundle wiring to whatever
 /// feeds that lane (chains included). Ordinary ports return themselves.
@@ -448,6 +478,15 @@ pub fn resolve_bundle_lane(
 ) -> Option<PortRef> {
     if depth > 16 {
         return None;
+    }
+    // A bundle interface pin: lane k is its mangled per-lane pseudo-port
+    // (the expander publishes "INPUT:x__bk" aliases for it).
+    if let Some(name) = src.component_id.strip_prefix(diycpu::convert::INPUT_PREFIX) {
+        let lane = format!("{name}__b{k}");
+        return Some(PortRef {
+            component_id: format!("{}{lane}", diycpu::convert::INPUT_PREFIX),
+            port_name: lane,
+        });
     }
     let comp = components.iter().find(|c| c.id == src.component_id)?;
     if comp.component_type == "bundle" {

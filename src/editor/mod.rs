@@ -38,13 +38,14 @@ mod sheets;
 mod wires;
 
 pub use clipboard::{Fragment, PastedIds};
+pub use guard::{standalone_probe, STANDALONE_INSTANCE};
 pub use normalize::normalize;
 pub use sheets::{abstraction_uses, sheet_images, sheet_notes, sheet_of};
 pub use wires::{WireAttach, WirePoint};
 
 // The op modules share their internals with each other through these
 // crate-visible re-exports.
-pub(crate) use guard::*;
+pub(crate) use guard::guard_no_combinational_loop;
 pub(crate) use sheets::{
     generate_id, generate_image_id, generate_junction_id, generate_net_id,
     generate_note_id, sheet_images_mut, sheet_mut, sheet_notes_mut, PortResolver,

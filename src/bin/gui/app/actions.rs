@@ -23,11 +23,49 @@ impl App {
             Mode::Edit => {
                 // The whole project simulates, but the view stays exactly
                 // where the user is — zoomed into an abstraction included.
-                match SimSession::new(&self.editor.project) {
+                // A view rooted at an abstraction shows the values of its
+                // first placed instance; an UNPLACED abstraction simulates
+                // standalone (unconnected inputs read 0 — feed it consts).
+                let (project, base_path, context) = match self.view_root {
+                    SheetRef::Top => (
+                        std::borrow::Cow::Borrowed(&self.editor.project),
+                        Vec::new(),
+                        String::new(),
+                    ),
+                    SheetRef::Abstraction(i) => {
+                        if let Some(path) =
+                            view::instance_path_to(&self.editor.project, i)
+                        {
+                            let context =
+                                format!(" — values from instance \"{}\"", path.join(" ▸ "));
+                            (
+                                std::borrow::Cow::Borrowed(&self.editor.project),
+                                path,
+                                context,
+                            )
+                        } else {
+                            let Some(probe) =
+                                diycpu::editor::standalone_probe(&self.editor.project, i)
+                            else {
+                                self.error("This sheet no longer exists");
+                                return;
+                            };
+                            (
+                                std::borrow::Cow::Owned(probe),
+                                vec![diycpu::editor::STANDALONE_INSTANCE.to_string()],
+                                " — standalone (unconnected inputs read 0)".to_string(),
+                            )
+                        }
+                    }
+                };
+                match SimSession::new(&project) {
                     Ok(session) => {
                         self.gesture = Gesture::Idle;
                         self.mode = Mode::Run(session);
-                        self.info("Running — ←/→ step the clock, Esc to stop");
+                        self.run_base_path = base_path;
+                        self.info(format!(
+                            "Running — ←/→ step the clock, Esc to stop{context}"
+                        ));
                     }
                     Err(e) => self.error(e),
                 }

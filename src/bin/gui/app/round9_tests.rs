@@ -58,15 +58,16 @@ fn pins_wire_to_pins_and_refuse_lying_drops() {
         d.app.status.text
     );
 
-    // The derived pin-to-pin wire is a real object: hovering its middle
-    // finds it.
+    // The pin-to-pin wire is a REAL net now: hovering its middle finds an
+    // ordinary segment.
     d.move_to([(x[0] + q[0]) / 2.0, (x[1] + q[1]) / 2.0]);
-    assert_eq!(
-        d.app.hover,
-        diycpu::layout::Hit::OutputWire { pin: "q".into() }
+    assert!(
+        matches!(d.app.hover, diycpu::layout::Hit::Wire { .. }),
+        "{:?}",
+        d.app.hover
     );
 
-    // Dropping the input pin ON the derived wire is refused: it would
+    // Dropping the input pin ON the wire is refused: it would
     // look connected without being a connection.
     let x_pin = pin_geom(&d.app, "x");
     let plate_center = [

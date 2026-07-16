@@ -50,6 +50,12 @@ impl std::error::Error for ConvertError {}
 /// Prefix for pseudo-component IDs representing abstraction input pins in wire nets.
 pub const INPUT_PREFIX: &str = "INPUT:";
 
+/// Prefix for pseudo-component IDs representing abstraction OUTPUT pins in
+/// wire nets. A net may sink into an output pin; the engine consumes that
+/// connection through the abstraction's (derived) `outputs` map instead,
+/// so these sinks are skipped here.
+pub const OUTPUT_PREFIX: &str = "OUTPUT:";
+
 /// Convert a Project to an engine CircuitDef.
 ///
 /// This extracts logical connections from wire nets (source→sink pairs)
@@ -483,6 +489,10 @@ fn build_engine_components(
             build_source_reference(source, &known_ids, &net.id)?;
 
         for sink in &net.sinks {
+            // Output-pin sinks are realized through the outputs map.
+            if sink.component_id.starts_with(OUTPUT_PREFIX) {
+                continue;
+            }
             // Validate sink component exists (unless it's an INPUT: pseudo-component).
             if !sink.component_id.starts_with(INPUT_PREFIX)
                 && !known_ids.contains_key(sink.component_id.as_str())

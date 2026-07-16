@@ -167,8 +167,6 @@ pub struct Selection {
     pub images: Vec<String>,
     /// Individual wire segments, by (net id, segment index).
     pub segments: Vec<(String, usize)>,
-    /// Derived output-pin wires, by pin name.
-    pub pin_wires: Vec<String>,
     /// A selected interface pin (kind, name) inside an abstraction sheet.
     pub pin: Option<(PortKind, String)>,
 }
@@ -179,7 +177,6 @@ impl Selection {
         self.notes.clear();
         self.images.clear();
         self.segments.clear();
-        self.pin_wires.clear();
         self.pin = None;
     }
     pub fn is_empty(&self) -> bool {
@@ -187,7 +184,6 @@ impl Selection {
             && self.notes.is_empty()
             && self.images.is_empty()
             && self.segments.is_empty()
-            && self.pin_wires.is_empty()
             && self.pin.is_none()
     }
 }

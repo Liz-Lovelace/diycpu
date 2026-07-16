@@ -573,16 +573,20 @@ fn output_pin_wired_from_a_node() {
         Some(&"nand_1".to_string())
     );
 
-    // A sourceless node can't feed an output pin.
+    // A sourceless node CAN feed an output pin now — the connection is a
+    // real net, and the pin simply derives as unwired until a source
+    // arrives (at which point the map updates by itself).
     let b = e
         .add_wire(WirePoint::Port(port("nand_1", "a")), WirePoint::New([2.0, 6.0]))
         .unwrap();
     // (nand_1.a was replaced-off the INPUT:x net onto a fresh stub.)
     let m = b.new_junction.unwrap();
+    e.add_wire(node(&b.net_id, &m), WirePoint::Port(pin("OUTPUT:", "q")))
+        .unwrap();
     assert_eq!(
-        e.add_wire(node(&b.net_id, &m), WirePoint::Port(pin("OUTPUT:", "q")))
-            .unwrap_err(),
-        EditError::OutputPinNeedsSource
+        e.project.abstractions[0].outputs.get("q"),
+        Some(&String::new()),
+        "rewired to a sourceless net: derives unwired"
     );
 }
 
@@ -1048,6 +1052,25 @@ fn fragment_excludes_wiring_to_uncopied_components() {
 }
 
 #[test]
+fn fragment_excludes_free_wiring_it_is_not_connected_to() {
+    let mut e = editor_with_two_nands();
+    // A wire routed through two nodes has a junction-junction segment; it
+    // belongs to nand_1's net, not to whatever else gets copied later.
+    e.connect(
+        port("nand_1", "out"),
+        port("nand_2", "a"),
+        &[[6.0, 8.0], [7.0, 8.0]],
+    )
+    .unwrap();
+    e.place_component("dff", [12, 12]).unwrap();
+    let frag = e.fragment(&["dff_1".into()], &[], &[]);
+    assert!(
+        frag.wire_nets.is_empty(),
+        "an unrelated component copy must not stow away other nets' wiring"
+    );
+}
+
+#[test]
 fn paste_searches_for_free_space_and_rejects_recursion() {
     let mut e = editor_with_two_nands();
     let frag = e.fragment(&["nand_1".into()], &[], &[]);
@@ -1270,8 +1293,10 @@ fn normalize_canonicalizes_output_targets() {
     let mut p = e.project.clone();
     p.abstractions[i].outputs.insert("q".into(), "nand_1.out".into());
     let notes = normalize(&mut p);
+    // The map is derived from the synthesized net now, so hand-written
+    // variants canonicalize silently — no repair note needed.
     assert_eq!(p.abstractions[i].outputs["q"], "nand_1");
-    assert!(!notes.is_empty());
+    let _ = notes;
 }
 
 // ── Normalization ────────────────────────────────────────────────────

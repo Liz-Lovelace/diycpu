@@ -116,7 +116,6 @@ impl Renderer {
         self.draw_images(canvas, app, &ctx);
         self.draw_notes(canvas, app, &ctx);
         self.draw_wires(canvas, app, &ctx);
-        self.draw_derived_output_wires(canvas, app, &ctx);
         for comp in ctx.components {
             self.draw_component_tree(
                 canvas, app, project, &ctx, comp, slice, on_path, depth, grid_clip,

@@ -1,7 +1,7 @@
 //! Copyable sheet fragments: what Ctrl+C carries and Ctrl+V plants.
 
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::layout::{self, Rect};
 use crate::project::{Endpoint, ProjectComponent, WireNet};
@@ -40,7 +40,10 @@ impl Editor {
         // Keep only wiring fully inside the copied set: segments whose port
         // endpoints all reference copied components. Interface pins are NOT
         // part of the selection, so wires to them are cut like any other
-        // outside connection (junction endpoints come along when used).
+        // outside connection. Junction-junction segments come along only
+        // when they connect (through the kept wiring) to a copied
+        // component — otherwise every free node wire anywhere on the sheet
+        // would stow away in each copy.
         let mut nets = Vec::new();
         for net in wire_nets {
             let mut kept = net.clone();
@@ -50,6 +53,39 @@ impl Editor {
                         component_ids.contains(component_id)
                     }
                     Endpoint::Junction { .. } => true,
+                })
+            });
+            // Flood out from the port endpoints to find anchored junctions.
+            let mut anchored: HashSet<&str> = HashSet::new();
+            loop {
+                let mut grew = false;
+                for seg in &kept.segments {
+                    let ends = [&seg.from, &seg.to];
+                    let reached = ends.iter().any(|e| match e {
+                        Endpoint::Port { .. } => true,
+                        Endpoint::Junction { junction_id } => {
+                            anchored.contains(junction_id.as_str())
+                        }
+                    });
+                    if !reached {
+                        continue;
+                    }
+                    for e in ends {
+                        if let Endpoint::Junction { junction_id } = e {
+                            grew |= anchored.insert(junction_id);
+                        }
+                    }
+                }
+                if !grew {
+                    break;
+                }
+            }
+            let anchored: HashSet<String> =
+                anchored.into_iter().map(str::to_string).collect();
+            kept.segments.retain(|seg| {
+                [&seg.from, &seg.to].iter().all(|e| match e {
+                    Endpoint::Port { .. } => true,
+                    Endpoint::Junction { junction_id } => anchored.contains(junction_id),
                 })
             });
             drop_orphan_junctions(&mut kept);

@@ -47,13 +47,14 @@ pub use wires::{WireAttach, WirePoint};
 // crate-visible re-exports.
 pub(crate) use guard::guard_no_combinational_loop;
 pub(crate) use sheets::{
-    generate_id, generate_image_id, generate_junction_id, generate_net_id,
-    generate_note_id, sheet_images_mut, sheet_mut, sheet_notes_mut, PortResolver,
+    check_invariants, derive_outputs, generate_id, generate_image_id, generate_junction_id,
+    generate_net_id, generate_note_id, settle_project, sheet_images_mut,
+    sheet_mut, sheet_notes_mut, PortResolver,
 };
 pub(crate) use wires::{
     drop_orphan_junctions, endpoint_is_port, gc_nets,
     merge_net, port_endpoint, repair_nets, split_all_nets,
-    sync_net_logic,
+    sync_net_logic, split_off_islands,
 };
 
 #[cfg(test)]
@@ -62,6 +63,8 @@ mod bundle_tests;
 mod image_tests;
 #[cfg(test)]
 mod passthrough_and_loop_tests;
+#[cfg(test)]
+mod stress_tests;
 #[cfg(test)]
 mod tests;
 
@@ -246,8 +249,18 @@ impl Editor {
         op: impl FnOnce(&mut Project, SheetRef) -> Result<R, EditError>,
     ) -> Result<R, EditError> {
         let before = self.project.clone();
-        match op(&mut self.project, self.sheet) {
+        let outcome = op(&mut self.project, self.sheet)
+            // THE choke point: after every successful operation the whole
+            // graph settles and every derived field is recomputed — no
+            // operation can leave stale "memory" behind, by construction.
+            .and_then(|result| settle_project(&mut self.project).map(|()| result));
+        match outcome {
             Ok(result) => {
+                debug_assert!(
+                    check_invariants(&self.project).is_ok(),
+                    "op left the document inconsistent: {:?}",
+                    check_invariants(&self.project)
+                );
                 self.undo_stack.push((before, self.sheet));
                 if self.undo_stack.len() > UNDO_LIMIT {
                     self.undo_stack.remove(0);

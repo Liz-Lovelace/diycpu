@@ -196,6 +196,16 @@ impl Editor {
                             layout::OUTPUT_PREFIX
                         )));
                     }
+                    // The pin's pseudo-port takes its wires along.
+                    let pseudo_id = format!("{}{name}", layout::OUTPUT_PREFIX);
+                    for net in def.wire_nets.iter_mut() {
+                        net.segments.retain(|seg| {
+                            ![&seg.from, &seg.to].iter().any(|e| {
+                                matches!(e, Endpoint::Port { component_id, .. }
+                                    if *component_id == pseudo_id)
+                            })
+                        });
+                    }
                 }
             }
             let def = project.abstractions.get_mut(i).ok_or(EditError::BadSheet)?;
@@ -437,6 +447,35 @@ impl Editor {
                         .remove(&old)
                         .ok_or_else(|| EditError::UnknownComponent(old.clone()))?;
                     def.outputs.insert(new.clone(), target);
+                    // The pin's pseudo-port inside its own sheet.
+                    let old_id = format!("{}{old}", layout::OUTPUT_PREFIX);
+                    let new_id = format!("{}{new}", layout::OUTPUT_PREFIX);
+                    let rewrite = |p: &mut PortRef| {
+                        if p.component_id == old_id {
+                            p.component_id = new_id.clone();
+                            p.port_name = new.clone();
+                        }
+                    };
+                    for net in def.wire_nets.iter_mut() {
+                        if let Some(s) = &mut net.source {
+                            rewrite(s);
+                        }
+                        net.sinks.iter_mut().for_each(&rewrite);
+                        for seg in &mut net.segments {
+                            for e in [&mut seg.from, &mut seg.to] {
+                                if let Endpoint::Port {
+                                    component_id,
+                                    port_name,
+                                } = e
+                                {
+                                    if *component_id == old_id {
+                                        *component_id = new_id.clone();
+                                        *port_name = new.clone();
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
 

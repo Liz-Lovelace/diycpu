@@ -28,23 +28,30 @@ pub fn normalize(project: &mut Project) -> Vec<String> {
 
     let sheet_count = project.abstractions.len() + 1;
     for sheet_index in 0..sheet_count {
-        let (label, interface_inputs, components, wire_nets): (String, Option<Vec<String>>, _, _) =
-            if sheet_index == 0 {
-                (
-                    "main circuit".to_string(),
-                    None,
-                    &mut project.components,
-                    &mut project.wire_nets,
-                )
-            } else {
-                let a = &mut project.abstractions[sheet_index - 1];
-                (
-                    format!("abstraction \"{}\"", a.name),
-                    Some(a.inputs.clone()),
-                    &mut a.components,
-                    &mut a.wire_nets,
-                )
-            };
+        let (label, interface_inputs, interface_outputs, components, wire_nets): (
+            String,
+            Option<Vec<String>>,
+            Option<Vec<String>>,
+            _,
+            _,
+        ) = if sheet_index == 0 {
+            (
+                "main circuit".to_string(),
+                None,
+                None,
+                &mut project.components,
+                &mut project.wire_nets,
+            )
+        } else {
+            let a = &mut project.abstractions[sheet_index - 1];
+            (
+                format!("abstraction \"{}\"", a.name),
+                Some(a.inputs.clone()),
+                Some(a.outputs.keys().cloned().collect()),
+                &mut a.components,
+                &mut a.wire_nets,
+            )
+        };
         let interface_bundles = if sheet_index == 0 {
             HashMap::new()
         } else {
@@ -55,6 +62,7 @@ pub fn normalize(project: &mut Project) -> Vec<String> {
             components,
             wire_nets,
             interface_inputs,
+            interface_outputs,
             interface_bundles,
             &label,
             &mut notes,
@@ -85,58 +93,71 @@ pub fn normalize(project: &mut Project) -> Vec<String> {
         }
     }
 
-    // Output pin targets must reference an existing output port.
+    // The outputs map is DERIVED from the nets that sink into output
+    // pins. Files from before that change (or hand-written ones) carry
+    // targets with no corresponding net: synthesize one per target — the
+    // per-sheet pass above already gave every net segments, so these run
+    // through a second, quieter settle below.
     for a in &mut project.abstractions {
-        let comps = a.components.clone();
-        for (pin, target) in a.outputs.iter_mut() {
-            if target.is_empty() {
-                continue; // unwired pin — legal while editing
+        for (pin, target) in a.outputs.clone() {
+            if target.is_empty() || a.bundle_pins.contains_key(&pin) {
+                continue;
             }
-            // A passthrough: the output forwards a declared input pin.
-            if let Some(input_name) = target.strip_prefix(crate::convert::INPUT_PREFIX) {
-                if a.inputs.iter().any(|i| i == input_name) {
-                    continue;
+            let pin_id = format!("{}{pin}", crate::convert::OUTPUT_PREFIX);
+            let already_wired = a.wire_nets.iter().any(|n| {
+                n.segments.iter().any(|seg| {
+                    [&seg.from, &seg.to].iter().any(|e| {
+                        matches!(e, Endpoint::Port { component_id, .. }
+                            if *component_id == pin_id)
+                    })
+                })
+            });
+            if already_wired {
+                continue;
+            }
+            let source = if let Some(name) = target.strip_prefix(crate::convert::INPUT_PREFIX)
+            {
+                PortRef {
+                    component_id: target.clone(),
+                    port_name: name.to_string(),
                 }
-                notes.push(format!(
-                    "abstraction \"{}\": output \"{pin}\" forwarded missing input \"{input_name}\"; unwired it",
-                    a.name
-                ));
-                target.clear();
-                continue;
-            }
-            let port = layout::output_target_port(target);
-            let comp = comps.iter().find(|c| c.id == port.component_id);
-            let ok = comp
-                .and_then(|c| layout::type_ports(&abstractions, &c.component_type))
-                .is_some_and(|ports| {
-                    ports
-                        .iter()
-                        .any(|p| p.name == port.port_name && p.kind == PortKind::Output)
-                });
-            if !ok {
-                notes.push(format!(
-                    "abstraction \"{}\": output \"{pin}\" pointed at missing \"{target}\"; unwired it",
-                    a.name
-                ));
-                target.clear();
-                continue;
-            }
-            // The engine wants primitives bare and instance outputs dotted;
-            // canonicalize hand-written variants like "gate.out" or "inst".
-            let canonical = if crate::types::is_primitive(&comp.unwrap().component_type) {
-                port.component_id.clone()
             } else {
-                format!("{}.{}", port.component_id, port.port_name)
+                layout::output_target_port(&target)
             };
-            if *target != canonical {
-                notes.push(format!(
-                    "abstraction \"{}\": output \"{pin}\" target rewritten to \"{canonical}\"",
-                    a.name
-                ));
-                *target = canonical;
-            }
+            let id = generate_net_id(&a.wire_nets);
+            a.wire_nets.push(WireNet {
+                bundle: false,
+                id,
+                source: Some(source),
+                sinks: vec![PortRef {
+                    component_id: pin_id,
+                    port_name: pin.clone(),
+                }],
+                junctions: vec![],
+                segments: vec![],
+            });
         }
     }
+    // Settle the synthesized nets (and report targets that don't resolve).
+    for i in 0..project.abstractions.len() {
+        let a = &mut project.abstractions[i];
+        let label = format!("abstraction \"{}\"", a.name);
+        let inputs = Some(a.inputs.clone());
+        let outputs = Some(a.outputs.keys().cloned().collect());
+        let bundles = a.bundle_pins.clone();
+        let (components, wire_nets) = (&mut a.components, &mut a.wire_nets);
+        normalize_sheet(
+            &abstractions,
+            components,
+            wire_nets,
+            inputs,
+            outputs,
+            bundles,
+            &label,
+            &mut notes,
+        );
+    }
+    derive_outputs(project);
 
     // Early display components were separate "seg"/"face" types; they are
     // one "segment" type with a variant now.
@@ -236,6 +257,7 @@ pub(crate) fn normalize_sheet(
     components: &mut [ProjectComponent],
     wire_nets: &mut Vec<WireNet>,
     interface_inputs: Option<Vec<String>>,
+    interface_outputs: Option<Vec<String>>,
     interface_bundles: HashMap<String, u32>,
     label: &str,
     notes: &mut Vec<String>,
@@ -246,6 +268,13 @@ pub(crate) fn normalize_sheet(
         if let Some(name) = port.component_id.strip_prefix(crate::convert::INPUT_PREFIX) {
             return match &interface_inputs {
                 Some(inputs) if inputs.iter().any(|i| i == name) => Some(PortKind::Output),
+                _ => None,
+            };
+        }
+        // OUTPUT:q pseudo-ports (output pins) are sinks of their sheet.
+        if let Some(name) = port.component_id.strip_prefix(crate::convert::OUTPUT_PREFIX) {
+            return match &interface_outputs {
+                Some(outputs) if outputs.iter().any(|o| o == name) => Some(PortKind::Input),
                 _ => None,
             };
         }
@@ -450,7 +479,7 @@ pub(crate) fn normalize_sheet(
     split_all_nets(wire_nets);
     let ctx = PortResolver {
         abstractions: abstractions.to_vec(),
-        interface_outputs: interface_inputs.as_ref().map(|_| vec![]),
+        interface_outputs,
         interface_inputs,
         interface_bundles,
     };

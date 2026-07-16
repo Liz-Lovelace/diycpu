@@ -248,9 +248,6 @@ impl App {
                     at: snap_half(self.cursor_grid()),
                 }
             }
-            // The derived wire feeding an output pin has no segments to
-            // join; refusing beats a node that only LOOKS attached.
-            Hit::OutputWire { .. } => WireTarget::Incompatible,
             _ => self.free_target(anchor),
         }
     }
@@ -700,18 +697,6 @@ impl App {
                     ctrl: self.ctrl,
                 };
             }
-            Hit::OutputWire { pin } => {
-                if self.ctrl {
-                    if let Some(i) = self.selection.pin_wires.iter().position(|p| p == &pin) {
-                        self.selection.pin_wires.remove(i);
-                    } else {
-                        self.selection.pin_wires.push(pin);
-                    }
-                } else {
-                    self.selection.clear();
-                    self.selection.pin_wires = vec![pin];
-                }
-            }
             Hit::Empty => {
                 self.gesture = Gesture::PressedEmpty {
                     press_screen: self.cursor,
@@ -888,19 +873,19 @@ impl App {
                 let band = rect_between(start_grid, g);
                 let abstractions = &self.editor.project.abstractions;
                 let (components, _) = self.editor.sheet_data();
-                let components: Vec<String> = components
+                let component_ids: Vec<String> = components
                     .iter()
                     .filter(|c| layout::footprint(abstractions, c).intersects(&band))
                     .map(|c| c.id.clone())
                     .collect();
-                let notes: Vec<String> = self
+                let note_ids: Vec<String> = self
                     .editor
                     .sheet_notes()
                     .iter()
                     .filter(|n| layout::note_bounds(n).intersects(&band))
                     .map(|n| n.id.clone())
                     .collect();
-                let images: Vec<String> = self
+                let image_ids: Vec<String> = self
                     .editor
                     .sheet_images()
                     .iter()
@@ -929,40 +914,11 @@ impl App {
                         }
                     }
                 }
-                // Derived output-pin wires sweep up the same way.
-                let mut pin_wires: Vec<String> = Vec::new();
-                if let Some(def) = self.interface() {
-                    let pins = layout::interface_pins(abstractions, def);
-                    for (name, target) in &def.outputs {
-                        if target.is_empty() {
-                            continue;
-                        }
-                        let Some(pin) = pins
-                            .iter()
-                            .find(|p| p.io == PortKind::Output && &p.name == name)
-                        else {
-                            continue;
-                        };
-                        let port = layout::output_target_port(target);
-                        let Some((from, _)) = layout::port_geom_any(
-                            abstractions,
-                            sheet_components,
-                            self.interface(),
-                            &port,
-                        ) else {
-                            continue;
-                        };
-                        if layout::segment_intersects_rect(from, pin.pos, &band) {
-                            pin_wires.push(name.clone());
-                        }
-                    }
-                }
                 self.selection.clear();
-                self.selection.components = components;
-                self.selection.notes = notes;
-                self.selection.images = images;
+                self.selection.components = component_ids;
+                self.selection.notes = note_ids;
+                self.selection.images = image_ids;
                 self.selection.segments = segments;
-                self.selection.pin_wires = pin_wires;
             }
             gesture @ Gesture::DrawingWire { .. } => {
                 // Drag-style wiring: releasing over a port or node commits.
@@ -1240,12 +1196,10 @@ impl App {
             let note_ids = self.selection.notes.clone();
             let image_ids = self.selection.images.clone();
             let segments = self.selection.segments.clone();
-            let pin_wires = self.selection.pin_wires.clone();
-            let n =
-                ids.len() + note_ids.len() + image_ids.len() + segments.len() + pin_wires.len();
+            let n = ids.len() + note_ids.len() + image_ids.len() + segments.len();
             match self
                 .editor
-                .delete_mixed(&ids, &note_ids, &image_ids, &segments, &pin_wires)
+                .delete_mixed(&ids, &note_ids, &image_ids, &segments)
             {
                 Ok(()) => {
                     self.selection.clear();

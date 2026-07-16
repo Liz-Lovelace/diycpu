@@ -216,13 +216,9 @@ impl Editor {
     /// Delete several wire segments (one undo step). Nets that fall apart
     /// split into their live pieces.
     pub fn delete_segments(&mut self, items: &[(String, usize)]) -> Result<(), EditError> {
-        self.delete_mixed(&[], &[], &[], items, &[])
+        self.delete_mixed(&[], &[], &[], items)
     }
 
-    /// Unwire output pins (their derived wires disappear; the pins stay).
-    pub fn unwire_output_pins(&mut self, names: &[String]) -> Result<(), EditError> {
-        self.delete_mixed(&[], &[], &[], &[], names)
-    }
 }
 
 /// A point a wire-drawing step can start or end on.
@@ -273,18 +269,8 @@ pub(crate) fn attach_wire(
     to: &WirePoint,
 ) -> Result<WireAttach, EditError> {
     let ctx = PortResolver::new(project, sheet)?;
-
-    // Output-pin connections are outputs-map writes, not net edits —
-    // except BUNDLE output pins, which take real bundle nets (the lowering
-    // pass reads their connectivity from the net graph).
-    let is_output_pin = |wp: &WirePoint| {
-        matches!(wp, WirePoint::Port(p)
-            if p.component_id.strip_prefix(layout::OUTPUT_PREFIX)
-                .is_some_and(|name| !ctx.interface_bundles.contains_key(name)))
-    };
-    if is_output_pin(from) || is_output_pin(to) {
-        return attach_to_output_pin(project, sheet, &ctx, from, to);
-    }
+    // Output pins are ordinary sinks: their nets ARE the connection, and
+    // the abstraction's outputs map is derived from them after every op.
 
     if from == to {
         return Err(EditError::NoopWire);
@@ -304,10 +290,18 @@ pub(crate) fn attach_wire(
         }
     };
     if let (Some(a), Some(b)) = (existing_endpoint(from), existing_endpoint(to)) {
+        // Junction ids are only unique per net: a candidate net may only
+        // match if it IS the net each junction endpoint belongs to.
+        let scoped = |n: &WireNet, wp: &WirePoint| match wp {
+            WirePoint::Junction { net_id, .. } => n.id == *net_id,
+            _ => true,
+        };
         let already_there = wire_nets.iter().any(|n| {
-            n.segments
-                .iter()
-                .any(|seg| (seg.from == a && seg.to == b) || (seg.from == b && seg.to == a))
+            scoped(n, from)
+                && scoped(n, to)
+                && n.segments
+                    .iter()
+                    .any(|seg| (seg.from == a && seg.to == b) || (seg.from == b && seg.to == a))
         });
         if already_there {
             return Err(EditError::NoopWire);
@@ -525,83 +519,6 @@ pub(crate) fn attach_wire(
     })
 }
 
-/// Wiring into an `OUTPUT:` pin records the driving port in the
-/// abstraction's outputs map (the wire itself is drawn derived from it).
-pub(crate) fn attach_to_output_pin(
-    project: &mut Project,
-    sheet: SheetRef,
-    ctx: &PortResolver,
-    from: &WirePoint,
-    to: &WirePoint,
-) -> Result<WireAttach, EditError> {
-    let SheetRef::Abstraction(index) = sheet else {
-        return Err(EditError::NotAnAbstractionSheet);
-    };
-    let is_pin = |wp: &WirePoint| {
-        matches!(wp, WirePoint::Port(p) if p.component_id.starts_with(layout::OUTPUT_PREFIX))
-    };
-    let (pin, other) = if is_pin(from) { (from, to) } else { (to, from) };
-    let WirePoint::Port(pin_port) = pin else {
-        unreachable!("is_pin checked")
-    };
-    let pin_name = pin_port
-        .component_id
-        .strip_prefix(layout::OUTPUT_PREFIX)
-        .expect("checked prefix")
-        .to_string();
-
-    let (components, wire_nets) = sheet_mut(project, sheet).ok_or(EditError::BadSheet)?;
-    if !ctx
-        .interface_outputs
-        .as_ref()
-        .is_some_and(|outs| outs.contains(&pin_name))
-    {
-        return Err(EditError::UnknownComponent(pin_port.component_id.clone()));
-    }
-
-    // Find the port that will drive this pin.
-    let source_port: PortRef = match other {
-        WirePoint::Port(p) => {
-            // kind_of also validates that an INPUT: pseudo-port names a
-            // declared input pin.
-            if ctx.kind_of(components, p)? != PortKind::Output {
-                return Err(EditError::NotAnInputAndOutput);
-            }
-            p.clone()
-        }
-        WirePoint::Junction { net_id, .. } => {
-            let net = wire_nets
-                .iter()
-                .find(|n| &n.id == net_id)
-                .ok_or_else(|| EditError::UnknownJunction(net_id.clone()))?;
-            net.source
-                .clone()
-                .ok_or(EditError::OutputPinNeedsSource)?
-        }
-        WirePoint::New(_) => return Err(EditError::OutputPinNeedsSource),
-    };
-
-    // An input pin wired straight into an output pin is a passthrough:
-    // the output simply forwards that input.
-    let target = if source_port.component_id.starts_with(crate::convert::INPUT_PREFIX) {
-        source_port.component_id.clone()
-    } else {
-        let source_comp = components
-            .iter()
-            .find(|c| c.id == source_port.component_id)
-            .ok_or_else(|| EditError::UnknownComponent(source_port.component_id.clone()))?;
-        if crate::types::is_primitive(&source_comp.component_type) {
-            source_comp.id.clone()
-        } else {
-            format!("{}.{}", source_port.component_id, source_port.port_name)
-        }
-    };
-    project.abstractions[index].outputs.insert(pin_name, target);
-    Ok(WireAttach {
-        net_id: String::new(),
-        new_junction: None,
-    })
-}
 
 /// Split one segment of a net at `pos` with a fresh node, returning the
 /// node's id. The single implementation behind double-purpose gestures:

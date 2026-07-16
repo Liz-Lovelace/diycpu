@@ -29,12 +29,20 @@ layers, that's the design telling you to stop and split it.
 ## The rules that hold it together
 
 - **The document is the only truth.** `project.rs` is what's on disk;
-  wire segments are the truth of a net (`source`/`sinks` are derived);
-  everything visual is recomputed from the document every frame.
+  wire segments are the truth of a net (`source`/`sinks` are derived,
+  and so is each abstraction's `outputs` map — output pins are ordinary
+  net sinks behind `OUTPUT:name` pseudo-ports, mirroring `INPUT:x`
+  sources); everything visual is recomputed from the document every
+  frame.
 - **All mutation goes through `Editor::mutate`**: snapshot before,
-  rollback on error, one op = one undo step. An operation can never
-  leave the document half-mutated, so the GUI can fire ops speculatively
-  and just show the error.
+  rollback on error, one op = one undo step. After every op it runs
+  `settle_project` (repair every sheet's nets, re-derive every outputs
+  map) and debug-asserts `check_invariants`, so derived state can never
+  go stale — the "wires remember an old connection" class of bug is
+  structurally gone. An operation can never leave the document
+  half-mutated, so the GUI can fire ops speculatively and just show the
+  error. `editor/stress_tests.rs` hammers random op sequences against
+  the invariants; when you add an op family, add it to the battery.
 - **Gestures never touch the document until they commit.** A gesture is
   ephemeral state in `app/gestures.rs`; dropping it is always safe.
   Mid-drag rendering uses `App::display_project()` — a temporary copy

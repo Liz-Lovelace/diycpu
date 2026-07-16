@@ -328,8 +328,10 @@ fn build_abstraction_end_to_end_through_gestures() {
     d.drag(port_at(&d.app, "nand_1", "out"), out_pin);
 
     let def = &d.app.editor.project.abstractions[0];
-    assert_eq!(def.wire_nets.len(), 1);
-    assert_eq!(def.wire_nets[0].sinks.len(), 2);
+    // Two real nets now: the input fan-out, and the output-pin wire (a
+    // first-class net whose sink is the pin; the map derives from it).
+    assert_eq!(def.wire_nets.len(), 2);
+    assert!(def.wire_nets.iter().any(|n| n.sinks.len() == 2));
     assert_eq!(def.outputs.get("q"), Some(&"nand_1".to_string()));
 
     // Back to top (first Esc clears the selection, second navigates),

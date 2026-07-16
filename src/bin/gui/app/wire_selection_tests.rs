@@ -82,12 +82,13 @@ fn output_pin_wire_selects_and_unwires() {
         Some(&"nand_1".to_string())
     );
 
-    // Click the derived wire midway and delete it.
+    // The pin wire is an ordinary segment: click it midway, delete it,
+    // and the outputs map derives back to unwired all by itself.
     let from = port_at(&d.app, "nand_1", "out");
     let mid = [(from[0] + pin_pos[0]) / 2.0, (from[1] + pin_pos[1]) / 2.0];
     d.app.handle_key(KeyInput::Escape);
     d.click(mid);
-    assert_eq!(d.app.selection.pin_wires, vec!["q".to_string()]);
+    assert_eq!(d.app.selection.segments.len(), 1, "{:?}", d.app.hover);
     d.move_to([0.0, -6.0]);
     d.app.handle_key(KeyInput::Delete);
     assert_eq!(

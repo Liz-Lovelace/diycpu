@@ -3,7 +3,7 @@
 
 use femtovg::{renderer::OpenGl, Canvas, Color, Paint, Path};
 
-use diycpu::layout::{self, PortKind};
+use diycpu::layout::{self};
 use diycpu::project::WireNet;
 
 use crate::app::{App, Gesture, WireTarget};
@@ -299,66 +299,5 @@ impl Renderer {
         }
     }
 
-    /// Output pin connections are stored in the abstraction's `outputs` map,
-    /// so their wires are derived: routed fresh every frame from the target
-    /// port to the pin. No stored geometry to go stale.
-    pub(super) fn draw_derived_output_wires(
-        &self,
-        canvas: &mut Canvas<OpenGl>,
-        app: &App,
-        ctx: &SheetCtx,
-    ) {
-        let Some(def) = ctx.interface else {
-            return;
-        };
-        let abstractions = ctx.abstractions;
-        let zoom = ctx.zoom();
 
-        let pins = layout::interface_pins(abstractions, def);
-        for (name, target) in &def.outputs {
-            if target.is_empty() {
-                continue;
-            }
-            let Some(pin) = pins
-                .iter()
-                .find(|p| p.io == PortKind::Output && &p.name == name)
-            else {
-                continue;
-            };
-            let port = layout::output_target_port(target);
-            let Some((from, _side)) =
-                layout::port_geom_any(abstractions, ctx.components, Some(def), &port)
-            else {
-                continue;
-            };
-            let pts = layout::route(from, pin.pos);
-            let mut p = Path::new();
-            for (k, pt) in pts.iter().enumerate() {
-                let s = ctx.view.to_screen(*pt);
-                if k == 0 {
-                    p.move_to(s[0], s[1]);
-                } else {
-                    p.line_to(s[0], s[1]);
-                }
-            }
-            // Live value of the driving port while simulating; selection
-            // highlight while editing.
-            let color = if app.is_running() {
-                match ctx.output_value(app, &port) {
-                    Some(true) => theme::wire_on(),
-                    Some(false) => theme::wire_off(),
-                    None => theme::wire(),
-                }
-            } else if ctx.focus && app.selection.pin_wires.contains(name) {
-                theme::wire_selected()
-            } else {
-                theme::wire()
-            };
-            let mut paint = Paint::color(color);
-            paint.set_line_width((2.5 * zoom).clamp(0.5, 4.5));
-            paint.set_line_join(femtovg::LineJoin::Round);
-            paint.set_line_cap(femtovg::LineCap::Round);
-            canvas.stroke_path(&p, &paint);
-        }
-    }
 }

@@ -149,7 +149,7 @@ impl Editor {
         note_ids: &[String],
         image_ids: &[String],
     ) -> Result<(), EditError> {
-        self.delete_mixed(component_ids, note_ids, image_ids, &[], &[])
+        self.delete_mixed(component_ids, note_ids, image_ids, &[])
     }
 
     /// Delete any mix of selected things — components, notes, images, wire
@@ -160,13 +160,11 @@ impl Editor {
         note_ids: &[String],
         image_ids: &[String],
         segments: &[(String, usize)],
-        pin_wires: &[String],
     ) -> Result<(), EditError> {
         if component_ids.is_empty()
             && note_ids.is_empty()
             && image_ids.is_empty()
             && segments.is_empty()
-            && pin_wires.is_empty()
         {
             return Ok(());
         }
@@ -174,7 +172,6 @@ impl Editor {
         let note_ids = note_ids.to_vec();
         let image_ids = image_ids.to_vec();
         let segments = segments.to_vec();
-        let pin_wires = pin_wires.to_vec();
         self.mutate(move |project, sheet| {
             let ctx = PortResolver::new(project, sheet)?;
             let (components, wire_nets) =
@@ -212,30 +209,8 @@ impl Editor {
                 });
             }
             repair_nets(wire_nets, components, &ctx)?;
-
-            if !pin_wires.is_empty() {
-                let SheetRef::Abstraction(i) = sheet else {
-                    return Err(EditError::NotAnAbstractionSheet);
-                };
-                let def = project.abstractions.get_mut(i).ok_or(EditError::BadSheet)?;
-                for name in &pin_wires {
-                    if let Some(target) = def.outputs.get_mut(name) {
-                        target.clear();
-                    }
-                }
-            }
-
-            // Output pins that pointed at a deleted component become unwired.
-            if let SheetRef::Abstraction(i) = sheet {
-                let def = project.abstractions.get_mut(i).ok_or(EditError::BadSheet)?;
-                for target in def.outputs.values_mut() {
-                    if !target.is_empty()
-                        && ids.contains(&layout::output_target_port(target).component_id)
-                    {
-                        target.clear();
-                    }
-                }
-            }
+            // (Output-pin connections live in the nets and the outputs map
+            // is re-derived after every op — no bookkeeping needed here.)
 
             let notes = sheet_notes_mut(project, sheet).ok_or(EditError::BadSheet)?;
             notes.retain(|n| !note_ids.contains(&n.id));

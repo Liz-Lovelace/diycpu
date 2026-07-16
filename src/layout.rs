@@ -504,7 +504,7 @@ pub fn route(a: [f32; 2], b: [f32; 2]) -> Vec<[f32; 2]> {
 // GUI-only: connecting to it writes the abstraction's `outputs` map.
 
 /// GUI-only pseudo-component prefix for abstraction output pins.
-pub const OUTPUT_PREFIX: &str = "OUTPUT:";
+pub use crate::convert::OUTPUT_PREFIX;
 
 #[derive(Debug, Clone)]
 pub struct PinGeom {
@@ -938,11 +938,6 @@ pub enum Hit {
         net_id: String,
         junction_id: String,
     },
-    /// The derived wire feeding an output pin (click selects, Delete
-    /// unwires the pin).
-    OutputWire {
-        pin: String,
-    },
     Component {
         component_id: String,
     },
@@ -1031,30 +1026,6 @@ pub fn hit_test(
                         segment_index: i,
                     };
                 }
-            }
-        }
-    }
-
-    // Derived output-pin wires.
-    if let Some(def) = interface {
-        let pins = interface_pins(abstractions, def);
-        for (name, target) in &def.outputs {
-            if target.is_empty() {
-                continue;
-            }
-            let Some(pin) = pins
-                .iter()
-                .find(|pg| pg.io == PortKind::Output && &pg.name == name)
-            else {
-                continue;
-            };
-            let port = output_target_port(target);
-            let Some((from, _)) = port_geom_any(abstractions, components, interface, &port)
-            else {
-                continue;
-            };
-            if polyline_dist(&route(from, pin.pos), p) <= WIRE_HIT_RADIUS {
-                return Hit::OutputWire { pin: name.clone() };
             }
         }
     }

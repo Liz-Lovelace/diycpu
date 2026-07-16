@@ -241,6 +241,7 @@ impl Renderer {
                     None => return,
                 }
             }
+            WireTarget::Segment { at, .. } => (*at, theme::wire_preview()),
             WireTarget::Incompatible => (app.cursor_grid(), theme::wire_invalid()),
             WireTarget::Free(p) => (*p, theme::wire_preview()),
         };
@@ -287,7 +288,7 @@ impl Renderer {
                 dot.circle(s[0], s[1], (3.5 * zoom).clamp(2.0, 5.5));
                 canvas.fill_path(&dot, &Paint::color(color));
             }
-            WireTarget::Port(_) | WireTarget::Node { .. } => {
+            WireTarget::Port(_) | WireTarget::Node { .. } | WireTarget::Segment { .. } => {
                 let mut ring_path = Path::new();
                 ring_path.circle(s[0], s[1], (7.0 * zoom).clamp(5.0, 10.0));
                 let mut ring = Paint::color(theme::accent());

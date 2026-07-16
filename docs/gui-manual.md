@@ -23,7 +23,7 @@ point), `--image-dialog`, `--anim-t seconds`.
 | Move | Drag a component. Multi-selections move together. |
 | Select | Click a component; Ctrl-click to add/remove; drag on empty canvas for a box select — anything the box touches is selected, wires included. |
 | Wire | Click or drag from any port. Click a compatible port to connect; click empty canvas to drop a **node** and keep drawing from it; right-click or Esc to stop (everything placed stays). Wires are straight lines (diagonals welcome) — route them your way by placing nodes. Wiring an already-connected input replaces its old connection. A wire that would loop a signal combinationally back into itself (no flip-flop in the loop) is refused on the spot instead of failing later at Run. |
-| Wire nodes | Click a node to draw a new branch from it (fan-out). Drag a node to move it. Drag anywhere on a wire to tear a new node out of it and place it in the same motion. Stubs are fine: wires don't need to connect anything to exist. |
+| Wire nodes | Click a node to draw a new branch from it (fan-out). Drag a node to move it. Drag anywhere on a wire to tear a new node out of it and place it in the same motion. While **drawing**, clicking anywhere on an existing wire tees straight into it — and a drawn wire can never leave a node sitting *on* other wiring without joining it: it connects or it refuses. Stubs are fine: wires don't need to connect anything to exist. |
 | Wire selection | Wires select like components: click a segment (Ctrl-click adds more), box-select sweeps them up alongside parts, Delete removes exactly what's selected — the wire splits where it was cut. The wire feeding an output pin selects and deletes the same way. |
 | Delete | Select, then Delete/Backspace. Deleting a component cleans up its connections but leaves your routed wires as stubs. |
 | Flip a DFF's start value | Double-click it — the big digit on its face is the stored bit. |
@@ -106,7 +106,8 @@ with live values too.
 Hotkeys are printed right on the toolbar buttons.
 
 The clock starts at 0 and toggles once per step; flip-flops latch on the
-rising edge. State comes from DFF `init` values — set them in edit mode by
+rising edge — of **whatever drives their clk input**: another flip-flop's
+output works just like a clock element, so ripple counters count. State comes from DFF `init` values — set them in edit mode by
 double-clicking.
 
 Clock components are all one shared signal: place as many as you like,

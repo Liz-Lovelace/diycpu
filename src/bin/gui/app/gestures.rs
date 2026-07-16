@@ -179,6 +179,11 @@ impl App {
 
     /// Where the wire being drawn currently ends: a hovered port or node
     /// (snapped), or the half-grid-snapped cursor.
+    /// Where the wire being drawn would land, resolved GEOMETRICALLY: a
+    /// port, an existing node, a point on an existing wire (a tee), or
+    /// truly open canvas. The rule that keeps drawings honest: a click can
+    /// never create a node ON or NEXT TO existing wiring without
+    /// connecting to it — it either joins or refuses.
     pub fn wire_target(&self) -> WireTarget {
         let Gesture::DrawingWire { anchor } = &self.gesture else {
             return WireTarget::Free(snap_half(self.cursor_grid()));
@@ -221,44 +226,106 @@ impl App {
                 {
                     return WireTarget::Free(snap_half(self.cursor_grid()));
                 }
-                // Merging two driven nets is invalid (unless same source),
-                // and bundles never join signal wires.
-                let (_, wire_nets) = self.editor.sheet_data();
-                let target_bundle = wire_nets
-                    .iter()
-                    .find(|n| &n.id == net_id)
-                    .map(|n| n.bundle)
-                    .unwrap_or(false);
-                let anchor_bundle =
-                    matches!(self.anchor_lane(anchor), layout::WireKind::Bundle(_));
-                if target_bundle != anchor_bundle {
+                if !self.can_join_net(anchor, net_id) {
                     return WireTarget::Incompatible;
                 }
-                let target_source = wire_nets
-                    .iter()
-                    .find(|n| &n.id == net_id)
-                    .and_then(|n| n.source.clone());
-                let anchor_source = match anchor {
-                    WirePoint::Port(p)
-                        if self.port_wire_kind(p) == Some(PortKind::Output) =>
-                    {
-                        Some(p.clone())
-                    }
-                    WirePoint::Junction { net_id: a_net, .. } => wire_nets
-                        .iter()
-                        .find(|n| &n.id == a_net)
-                        .and_then(|n| n.source.clone()),
-                    _ => None,
-                };
-                match (anchor_source, target_source) {
-                    (Some(a), Some(b)) if a != b => WireTarget::Incompatible,
-                    _ => WireTarget::Node {
-                        net_id: net_id.clone(),
-                        junction_id: junction_id.clone(),
-                    },
+                WireTarget::Node {
+                    net_id: net_id.clone(),
+                    junction_id: junction_id.clone(),
                 }
             }
-            _ => WireTarget::Free(snap_half(self.cursor_grid())),
+            // Mid-wire: connect right there (a tee), like a node.
+            Hit::Wire {
+                net_id,
+                segment_index,
+            } => {
+                if !self.can_join_net(anchor, net_id) {
+                    return WireTarget::Incompatible;
+                }
+                WireTarget::Segment {
+                    net_id: net_id.clone(),
+                    segment_index: *segment_index,
+                    at: snap_half(self.cursor_grid()),
+                }
+            }
+            // The derived wire feeding an output pin has no segments to
+            // join; refusing beats a node that only LOOKS attached.
+            Hit::OutputWire { .. } => WireTarget::Incompatible,
+            _ => self.free_target(anchor),
+        }
+    }
+
+    /// A free point — unless SNAPPING lands it on existing wiring the
+    /// hover missed, in which case it targets that wiring instead. Two
+    /// nodes must never stack: that reads as connected and isn't.
+    fn free_target(&self, anchor: &WirePoint) -> WireTarget {
+        let p = snap_half(self.cursor_grid());
+        let (components, wire_nets) = self.editor.sheet_data();
+        let abstractions = &self.editor.project.abstractions;
+        for net in wire_nets {
+            for junction in &net.junctions {
+                if dist(junction.pos, p) < 0.45 {
+                    if matches!(anchor, WirePoint::Junction { junction_id, .. } if *junction_id == junction.id)
+                    {
+                        continue;
+                    }
+                    if !self.can_join_net(anchor, &net.id) {
+                        return WireTarget::Incompatible;
+                    }
+                    return WireTarget::Node {
+                        net_id: net.id.clone(),
+                        junction_id: junction.id.clone(),
+                    };
+                }
+            }
+        }
+        for net in wire_nets {
+            for i in 0..net.segments.len() {
+                let Some(pts) =
+                    layout::route_segment(abstractions, components, self.interface(), net, i)
+                else {
+                    continue;
+                };
+                if layout::polyline_dist(&pts, p) < 0.35 {
+                    if !self.can_join_net(anchor, &net.id) {
+                        return WireTarget::Incompatible;
+                    }
+                    return WireTarget::Segment {
+                        net_id: net.id.clone(),
+                        segment_index: i,
+                        at: p,
+                    };
+                }
+            }
+        }
+        WireTarget::Free(p)
+    }
+
+    /// May the wire being drawn from `anchor` join net `net_id`? One rule
+    /// for nodes, segments and geometric snaps alike: lanes must match,
+    /// and two different drivers can never share a net.
+    fn can_join_net(&self, anchor: &WirePoint, net_id: &str) -> bool {
+        let (_, wire_nets) = self.editor.sheet_data();
+        let Some(net) = wire_nets.iter().find(|n| n.id == net_id) else {
+            return false;
+        };
+        let anchor_bundle = matches!(self.anchor_lane(anchor), layout::WireKind::Bundle(_));
+        if net.bundle != anchor_bundle {
+            return false;
+        }
+        let anchor_source = match anchor {
+            WirePoint::Port(p) if self.port_wire_kind(p) == Some(PortKind::Output) => {
+                Some(p.clone())
+            }
+            WirePoint::Junction { net_id: a_net, .. } => wire_nets
+                .iter()
+                .find(|n| &n.id == a_net)
+                .and_then(|n| n.source.clone()),
+            _ => None,
+        };
+        match (anchor_source, &net.source) {
+            (Some(a), Some(b)) => a == *b,
+            _ => true,
         }
     }
 
@@ -695,8 +762,25 @@ impl App {
                     Err(e) => self.error(e.to_string()),
                 }
             }
+            WireTarget::Segment {
+                net_id,
+                segment_index,
+                at,
+            } => {
+                match self
+                    .editor
+                    .add_wire_at_segment(anchor, &net_id, segment_index, at)
+                {
+                    Ok(_) => {
+                        self.gesture = Gesture::Idle;
+                        self.info("Joined the wires");
+                    }
+                    Err(EditError::NoopWire) => {}
+                    Err(e) => self.error(e.to_string()),
+                }
+            }
             WireTarget::Incompatible => {
-                self.error("This wire already has an output driving it");
+                self.error("These can't join — different driver, or bundle meets wire");
             }
             WireTarget::Free(point) => {
                 match self.editor.add_wire(anchor, WirePoint::New(point)) {
@@ -885,7 +969,7 @@ impl App {
                 self.gesture = gesture;
                 if matches!(
                     self.wire_target(),
-                    WireTarget::Port(_) | WireTarget::Node { .. }
+                    WireTarget::Port(_) | WireTarget::Node { .. } | WireTarget::Segment { .. }
                 ) {
                     self.wire_click();
                 }
@@ -1273,11 +1357,18 @@ impl App {
 /// Pixels the cursor must travel before a press becomes a drag.
 pub(crate) const DRAG_THRESHOLD_PX: f32 = 5.0;
 
+#[derive(Debug)]
 pub enum WireTarget {
     /// A compatible port to commit to.
     Port(PortRef),
     /// An existing wire node to join.
     Node { net_id: String, junction_id: String },
+    /// A point on an existing wire segment to tee into.
+    Segment {
+        net_id: String,
+        segment_index: usize,
+        at: [f32; 2],
+    },
     /// Hovering a port or node that can't take this wire.
     Incompatible,
     /// Free space (snapped to half-grid) — a node would go here.

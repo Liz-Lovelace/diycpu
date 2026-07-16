@@ -171,31 +171,32 @@ impl Editor {
         let net_id = net_id.to_string();
         self.mutate(move |project, sheet| {
             let (_, wire_nets) = sheet_mut(project, sheet).ok_or(EditError::BadSheet)?;
-            let net = wire_nets
-                .iter_mut()
-                .find(|n| n.id == net_id)
-                .ok_or_else(|| EditError::UnknownNet(net_id.clone()))?;
-            if segment_index >= net.segments.len() {
-                return Err(EditError::NoopWire);
-            }
-            let seg = net.segments.remove(segment_index);
-            let junction_id = generate_junction_id(net);
-            net.junctions.push(Junction {
-                id: junction_id.clone(),
-                pos,
-            });
-            let mid = Endpoint::Junction {
-                junction_id: junction_id.clone(),
+            split_segment_at(wire_nets, &net_id, segment_index, pos)
+        })
+    }
+
+    /// Join `from` to a POINT on an existing wire segment: a new node
+    /// splits the segment there and the wire attaches to it — one undo
+    /// step, exactly what clicking mid-wire while drawing means.
+    pub fn add_wire_at_segment(
+        &mut self,
+        from: WirePoint,
+        net_id: &str,
+        segment_index: usize,
+        at: [f32; 2],
+    ) -> Result<WireAttach, EditError> {
+        let net_id = net_id.to_string();
+        self.mutate(move |project, sheet| {
+            let junction_id = {
+                let (_, wire_nets) = sheet_mut(project, sheet).ok_or(EditError::BadSheet)?;
+                split_segment_at(wire_nets, &net_id, segment_index, at)?
             };
-            net.segments.push(crate::project::Segment {
-                from: seg.from,
-                to: mid.clone(),
-            });
-            net.segments.push(crate::project::Segment {
-                from: mid,
-                to: seg.to,
-            });
-            Ok(junction_id)
+            // The attach settles the whole graph (merge/sync/split).
+            let to = WirePoint::Junction {
+                net_id: net_id.clone(),
+                junction_id,
+            };
+            attach_wire(project, sheet, &from, &to)
         })
     }
 
@@ -600,6 +601,42 @@ pub(crate) fn attach_to_output_pin(
         net_id: String::new(),
         new_junction: None,
     })
+}
+
+/// Split one segment of a net at `pos` with a fresh node, returning the
+/// node's id. The single implementation behind double-purpose gestures:
+/// tearing a node out by dragging, and teeing a drawn wire into a segment.
+pub(crate) fn split_segment_at(
+    wire_nets: &mut [WireNet],
+    net_id: &str,
+    segment_index: usize,
+    pos: [f32; 2],
+) -> Result<String, EditError> {
+    let net = wire_nets
+        .iter_mut()
+        .find(|n| n.id == net_id)
+        .ok_or_else(|| EditError::UnknownNet(net_id.to_string()))?;
+    if segment_index >= net.segments.len() {
+        return Err(EditError::NoopWire);
+    }
+    let seg = net.segments.remove(segment_index);
+    let junction_id = generate_junction_id(net);
+    net.junctions.push(Junction {
+        id: junction_id.clone(),
+        pos,
+    });
+    let mid = Endpoint::Junction {
+        junction_id: junction_id.clone(),
+    };
+    net.segments.push(crate::project::Segment {
+        from: seg.from,
+        to: mid.clone(),
+    });
+    net.segments.push(crate::project::Segment {
+        from: mid,
+        to: seg.to,
+    });
+    Ok(junction_id)
 }
 
 /// Remove every segment touching `port`, across all nets. Orphaned nodes and

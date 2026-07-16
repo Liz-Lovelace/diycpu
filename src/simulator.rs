@@ -39,16 +39,32 @@ impl<'a> Simulator<'a> {
     pub fn step(&mut self) {
         self.toggle_clock();
 
-        // Pass 1: evaluate combinational logic with old DFF values.
+        // Evaluate combinational logic with old DFF values.
         evaluate_combinational_logic(self.circuit, &mut self.component_values);
 
-        // Detect rising edges and latch DFF data inputs.
-        let any_dff_latched =
-            self.latch_dffs_on_rising_edges();
-
-        // Pass 2: re-evaluate with new DFF values so the display is consistent.
-        if any_dff_latched {
+        // Latch in WAVES. A latch can raise another DFF's clock input —
+        // that's a ripple counter — and that edge belongs to THIS step:
+        // without the loop it would fall between the latch phase and the
+        // snapshot and never be seen at all. Each wave latches
+        // simultaneously (a chain sharing one clock stays a shift
+        // register); the next wave reacts only to edges the previous one
+        // caused. Bounded: each wave latches at least one DFF that then
+        // holds, so dff-count iterations always suffice.
+        let mut waves = 0;
+        loop {
+            // The NEXT wave's edges are measured against what every clock
+            // input read BEFORE this wave committed — snapshotting after
+            // would hide the very edge the wave produced.
+            let baseline = snapshot_dff_clock_inputs(self.circuit, &self.component_values);
+            if !self.latch_dffs_on_rising_edges() {
+                break;
+            }
             evaluate_combinational_logic(self.circuit, &mut self.component_values);
+            self.previous_dff_clock_values = baseline;
+            waves += 1;
+            if waves > self.circuit.dff_indices.len() {
+                break;
+            }
         }
 
         // Record clock inputs for next step's edge detection.
@@ -756,4 +772,26 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn dff_output_clocks_another_dff() {
+        // A ripple divider: A toggles on the clock; B is CLOCKED BY A's
+        // output and toggles at half A's rate. The edge that clocks B is
+        // produced by A's latch inside the same step — it must count.
+        let def = CircuitBuilder::new("ripple", 8)
+            .clk("clk")
+            .nand("not_a", "a", "a")
+            .nand("not_b", "b", "b")
+            .dff("a").init(false).d("not_a").clk("clk").done()
+            .dff("b").init(false).d("not_b").clk("a").done()
+            .build();
+        let results = simulate(&compile(&def).unwrap());
+
+        // clk rises on odd steps → A toggles there: 1,1,0,0,1,1,0,0…
+        let a: Vec<bool> = (1..=8).map(|k| results[k]["a"]).collect();
+        assert_eq!(a, [true, true, false, false, true, true, false, false]);
+        // A rises at steps 1 and 5 → B toggles there: half the rate.
+        let b: Vec<bool> = (1..=8).map(|k| results[k]["b"]).collect();
+        assert_eq!(b, [true, true, true, true, false, false, false, false]);
+    }
+
 }

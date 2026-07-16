@@ -95,3 +95,81 @@ fn output_pin_wire_selects_and_unwires() {
         Some(&String::new())
     );
 }
+
+
+#[test]
+fn drawing_onto_a_wire_tees_in_as_one_step() {
+    let mut d = Driver::new();
+    d.place("dff", [3.0, 2.0]);
+    d.place("nand", [12.0, 2.0]);
+    d.place("nand", [12.0, 7.0]);
+    let from = port_at(&d.app, "dff_1", "out");
+    let to = port_at(&d.app, "nand_1", "a");
+    d.drag(from, to);
+    assert_eq!(d.app.editor.project.wire_nets.len(), 1);
+
+    // Draw from the second gate's input and click MID-WIRE: that's a tee —
+    // a node splits the segment and the wire joins it, one undo step.
+    let mid = [(from[0] + to[0]) / 2.0, from[1]];
+    d.click(port_at(&d.app, "nand_2", "a"));
+    assert!(matches!(d.app.gesture, Gesture::DrawingWire { .. }));
+    d.click(mid);
+    assert!(matches!(d.app.gesture, Gesture::Idle), "{}", d.app.status.text);
+    let net = &d.app.editor.project.wire_nets[0];
+    assert_eq!(d.app.editor.project.wire_nets.len(), 1);
+    assert_eq!(net.junctions.len(), 1);
+    assert_eq!(net.sinks.len(), 2);
+
+    d.app.undo();
+    let net = &d.app.editor.project.wire_nets[0];
+    assert_eq!(net.sinks.len(), 1, "the whole tee was one step");
+    assert!(net.junctions.is_empty());
+}
+
+#[test]
+fn mid_wire_click_with_a_second_driver_refuses_and_stacks_nothing() {
+    let mut d = Driver::new();
+    d.place("dff", [3.0, 2.0]);
+    d.place("nand", [12.0, 2.0]);
+    d.place("clk", [3.0, 7.0]);
+    let from = port_at(&d.app, "dff_1", "out");
+    let to = port_at(&d.app, "nand_1", "a");
+    d.drag(from, to);
+
+    // The user's trap: trying to drive an already-driven net from the
+    // clock. It must refuse — and it must NOT leave a node sitting on the
+    // wire pretending to be connected.
+    let mid = [(from[0] + to[0]) / 2.0, from[1]];
+    d.click(port_at(&d.app, "clk_1", "out"));
+    d.click(mid);
+    assert!(d.app.status.is_error, "refused: {}", d.app.status.text);
+    assert!(matches!(d.app.gesture, Gesture::DrawingWire { .. }));
+    let net = &d.app.editor.project.wire_nets[0];
+    assert!(net.junctions.is_empty(), "no phantom node on the wire");
+    assert_eq!(d.app.editor.project.wire_nets.len(), 1, "no stub net either");
+    d.app.handle_key(KeyInput::Escape);
+}
+
+#[test]
+fn snapped_free_points_join_wiring_instead_of_stacking() {
+    let mut d = Driver::new();
+    d.place("dff", [3.0, 2.0]);
+    d.place("nand", [12.0, 2.0]);
+    d.place("nand", [3.0, 7.0]);
+    let from = port_at(&d.app, "dff_1", "out");
+    let to = port_at(&d.app, "nand_1", "a");
+    d.drag(from, to);
+
+    // Start a wire, then park the cursor over the FIRST gate's body right
+    // where the wire passes underneath-ish: hover says Component, but the
+    // snapped point lands on the wire — the target must be the wire, not
+    // a free node stacked on top of it.
+    d.click(port_at(&d.app, "nand_2", "a"));
+    let over_wire = [(from[0] + to[0]) / 2.0, from[1] + 0.1];
+    d.move_to(over_wire);
+    match d.app.wire_target() {
+        WireTarget::Segment { .. } | WireTarget::Node { .. } => {}
+        other => panic!("expected a join target, got {other:?}"),
+    }
+    d.app.handle_key(KeyInput::Escape);
+}
